@@ -14,12 +14,18 @@ permissions:
 jobs:
   apply:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Checkout feature branch
-        uses: actions/checkout@v4
-        with:
-          ref: feat/feed-publication-stability-20260904
-          fetch-depth: 0
+      - name: Checkout feature branch with git
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git init .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/wsmontes/feedmine-dev.git"
+          git fetch --no-tags --depth=1 origin feat/feed-publication-stability-20260904
+          git checkout -B feat/feed-publication-stability-20260904 FETCH_HEAD
 
       - name: Reassemble verified patch bundle
         shell: bash
