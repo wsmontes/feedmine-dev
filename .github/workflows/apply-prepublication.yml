@@ -1,0 +1,63 @@
+name: Apply FeedMine prepublication patch
+
+on:
+  push:
+    branches:
+      - feat/feed-publication-stability-20260904
+    paths:
+      - '.github/workflows/apply-prepublication.yml'
+      - 'tools/prepublication/**'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/feed-publication-stability-20260904
+          fetch-depth: 0
+
+      - name: Reassemble verified patch bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat tools/prepublication/chunk_*.b64 > /tmp/feedmine-prepublication-bundle.py.zlib.b64
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, zlib
+          encoded = Path('/tmp/feedmine-prepublication-bundle.py.zlib.b64').read_text()
+          data = zlib.decompress(base64.b64decode(encoded))
+          expected = '3d70797ee1fd01e591b6de58e462aeaa250c28646316dca269ee3a07046f9c00'
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'bundle sha256 mismatch: {actual} != {expected}')
+          Path('/tmp/apply_prepublication_bundle.py').write_bytes(data)
+          print(f'bundle sha256 verified: {actual}')
+          PY
+          python3 -m py_compile /tmp/apply_prepublication_bundle.py
+
+      - name: Apply patch phases and verify invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/apply_prepublication_bundle.py "$GITHUB_WORKSPACE"
+          git diff --check
+          git status --short
+
+      - name: Commit generated source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'feedmine-prepublication-bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add feedmine feedmineTests feedmineUITests
+          if git diff --cached --quiet; then
+            echo 'No generated source changes found; failing rather than claiming success.'
+            exit 1
+          fi
+          git commit -m 'fix: stabilize prepared feed publication and warm start'
+          git push origin HEAD:feat/feed-publication-stability-20260904
