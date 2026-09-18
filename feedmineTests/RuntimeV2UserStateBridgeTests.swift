@@ -247,6 +247,10 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             at: fixedDate.addingTimeInterval(2)
         )
 
+        XCTAssertTrue(
+            try await store.bookmarkStore.isBookmarkedAnywhere(itemID: article.id),
+            "the durable authority still has the item in the second box"
+        )
         let projections = UserStateProjectionStore(database: runtimeDatabase)
         XCTAssertEqual(
             try projections.projection(kind: .bookmark, subjectID: article.id)?.wanted,
