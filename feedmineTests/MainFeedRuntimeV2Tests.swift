@@ -157,6 +157,63 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertEqual(value.card.absoluteOrdinal, 3)
     }
 
+    func testSessionLocalMediaDrawsThePrewarmedImage() throws {
+        let presentation = makePresentation()
+        let key = "main-feed|preset=everything|box=-"
+        presentation.beginSession(contextKey: key)
+        let cardID = try PublicationCardID(41)
+        let image = UIImage()
+        let rendered = RenderImage(cacheKey: "digest_r1", image: image)
+        let card = CardPresentation(
+            id: cardID,
+            absoluteOrdinal: 0,
+            title: "Prepared",
+            subtitle: nil,
+            media: .local(assetDigest: "digest"),
+            layout: .hero,
+            isBookmarked: false,
+            isRead: false
+        )
+
+        XCTAssertNotNil(presentation.applySnapshot(
+            makeSnapshot(contextKey: key, sequence: 1, cards: [card]),
+            localMedia: [cardID: rendered]
+        ))
+
+        XCTAssertEqual(
+            presentation.sections.first?.rows.first?.mediaSlot,
+            .local(rendered),
+            "a local publication reaches SwiftUI as the exact prewarmed pixels"
+        )
+    }
+
+    func testMissingPublishedBytesBecomeAPlaceholderNeverAnEmptyFrame() throws {
+        let presentation = makePresentation()
+        let key = "main-feed|preset=everything|box=-"
+        presentation.beginSession(contextKey: key)
+        let card = CardPresentation(
+            id: try PublicationCardID(42),
+            absoluteOrdinal: 0,
+            title: "Evicted",
+            subtitle: nil,
+            media: .local(assetDigest: "missing-digest"),
+            layout: .hero,
+            isBookmarked: false,
+            isRead: false
+        )
+
+        XCTAssertNotNil(presentation.applySnapshot(
+            makeSnapshot(contextKey: key, sequence: 1, cards: [card]),
+            localMedia: [:]
+        ))
+
+        XCTAssertEqual(
+            presentation.sections.first?.rows.first?.mediaSlot,
+            .placeholder(.article),
+            "published identity without local bytes degrades deterministically; the renderer never waits"
+        )
+    }
+
     func testCardIdentityIsStableAcrossPublicationsAndDistinctPerItem() {
         let first = MainFeedCardBridge.cardID(forLegacyItemID: "item-a")
         let again = MainFeedCardBridge.cardID(forLegacyItemID: "item-a")
