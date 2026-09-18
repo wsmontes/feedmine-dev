@@ -602,12 +602,11 @@ final class MainFeedRuntime {
             bookmarks: bookmarks,
             projections: UserStateProjectionStore(database: full.database)
         )
-        // The launch pass for the list membership. It is fired here, at the one moment the bridge and
-        // the loader exist together, and it is fire-and-forget because nothing waits on it: a box that
-        // opens before the pass finishes shows what the save path wrote, and the pass makes it whole.
-        // The whole-set `reconcile()` is *not* wired: it has no caller today, which §8.60 records.
+        // Repair both runtime projections from the durable user authority. This is deliberately
+        // fire-and-forget: current content can render immediately, while a crash that landed the
+        // user.sqlite operation but not one of the runtime projections is repaired idempotently.
         Task { @MainActor in
-            _ = await bridge.reconcileListMemberships()
+            _ = await bridge.reconcileForLaunch()
         }
         return RuntimeCardUserActions(
             cards: full.repository,
