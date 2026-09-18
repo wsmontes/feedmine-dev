@@ -101,6 +101,9 @@ final class MainFeedPresentation {
     let store: FeedScreenStore?
     /// The last snapshot applied to the store. Nil in legacy mode, where no snapshot is published.
     private(set) var snapshot: FeedPresentationSnapshot?
+    /// Decoded local visuals for the session snapshot currently retained. They are presentation cache,
+    /// not editorial state, and are cleared when a new session claims the surface.
+    private var sessionLocalMedia: [PublicationCardID: RenderImage] = [:]
     private(set) var sections: [MainFeedSection] = []
     /// Which source the rows on screen came from. The screen's phase, emptiness and empty-state variant
     /// follow this, not the mode string: a page can only state where it came from.
@@ -207,6 +210,7 @@ final class MainFeedPresentation {
             sessionStamp.rawValue + 1
         ))
         snapshot = nil
+        sessionLocalMedia.removeAll(keepingCapacity: true)
         restoreSessionPage()
     }
 
@@ -386,7 +390,10 @@ final class MainFeedPresentation {
     /// runtime states publication order, and inventing "Today"/"This Week" headers here would be a
     /// second grouping rule beside `FeedLoader`'s.
     @discardableResult
-    func applySnapshot(_ snapshot: FeedPresentationSnapshot) -> FeedPresentationSnapshot? {
+    func applySnapshot(
+        _ snapshot: FeedPresentationSnapshot,
+        localMedia: [PublicationCardID: RenderImage] = [:]
+    ) -> FeedPresentationSnapshot? {
         store?.expect(contextKey: snapshot.contextKey)
         guard let store, store.apply(snapshot) else { return nil }
         // A snapshot that says exactly what the last one said materializes nothing *while it is already
@@ -401,6 +408,7 @@ final class MainFeedPresentation {
             && self.snapshot?.cards == snapshot.cards
             && self.snapshot?.editionID == snapshot.editionID
         self.snapshot = snapshot
+        sessionLocalMedia = localMedia
         currentEdition = snapshot.editionID
         guard selectionContextKey == snapshot.contextKey else { return snapshot }
         if alreadySaysThis {
@@ -418,7 +426,7 @@ final class MainFeedPresentation {
         for card in snapshot.cards {
             rows.append(MainFeedRow(
                 card: card,
-                mediaSlot: Self.mediaSlot(for: card),
+                mediaSlot: Self.mediaSlot(for: card, localMedia: sessionLocalMedia),
                 item: Self.displayItem(for: card)
             ))
         }
@@ -494,19 +502,24 @@ final class MainFeedPresentation {
 
     /// The media slot a snapshot card draws.
     ///
-    /// The runtime's decision is final here: a placeholder slot draws the placeholder kind the card's
-    /// affordances name, and a card with no slot collapses to text. `.local(assetDigest:)` means the
-    /// bytes are published and pinned — resolving a digest to an image is the media slice's job
-    /// (plan §10) and is not wired in this build, so the frame is reserved and left empty rather than
-    /// filled with a stand-in.
-    static func mediaSlot(for card: CardPresentation) -> CardMediaSlot {
+    /// A `.local` publication is exposed as pixels only when the runtime prewarmed those exact
+    /// published bytes. If local materialization failed, the renderer gets the deterministic
+    /// content-type placeholder immediately. There is intentionally no "empty while downloading"
+    /// state on the V2 path and no URL is available here.
+    static func mediaSlot(
+        for card: CardPresentation,
+        localMedia: [PublicationCardID: RenderImage] = [:]
+    ) -> CardMediaSlot {
         switch card.media {
         case .none:
             return .none
         case .placeholder:
             return .placeholder(MainFeedCardBridge.placeholderKind(card.affordances.placeholder))
         case .local:
-            return .empty
+            if let image = localMedia[card.id] {
+                return .local(image)
+            }
+            return .placeholder(MainFeedCardBridge.placeholderKind(card.affordances.placeholder))
         }
     }
 
