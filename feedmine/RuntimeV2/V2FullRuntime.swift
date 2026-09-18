@@ -88,7 +88,9 @@ struct RuntimeCardUserActions: FeedSessionUserActions {
         let read = await readState(subjectID: subject.itemID)
         return FeedSessionUserState(
             cardID: cardID,
-            bookmarked: wanted,
+            // The card-level state is global across bookmark boxes. The action's `wanted` applies to
+            // the list this write targeted; another list may still contain the same durable subject.
+            bookmarked: await bookmarkState(subjectID: subject.itemID),
             read: read,
             operationID: operationID
         )
@@ -155,7 +157,7 @@ struct RuntimeCardUserActions: FeedSessionUserActions {
     /// confirmed state), so a hard `false` would take the bookmark overlay off a card the reader saved —
     /// including one saved by the legacy lane, which the runtime's own projection never saw.
     private func bookmarkState(subjectID: String) async -> Bool {
-        (try? await legacy.bookmarks.isBookmarked(itemID: subjectID)) ?? false
+        (try? await legacy.bookmarks.isBookmarkedAnywhere(itemID: subjectID)) ?? false
     }
 }
 
