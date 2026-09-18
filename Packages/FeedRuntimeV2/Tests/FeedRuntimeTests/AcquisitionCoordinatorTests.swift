@@ -8,6 +8,12 @@ import FeedRuntime
 ///
 /// Every test runs against a real runtime database and the real Admission engine: the point of the
 /// coordinator is that it feeds that write path and does nothing else with canonical state.
+private struct CancellationThrowingAcquisitionSource: AcquisitionSource {
+    func pull(_ request: AcquisitionPull) async throws -> AcquisitionSourceEvent {
+        throw CancellationError()
+    }
+}
+
 final class AcquisitionCoordinatorTests: AcquisitionTestCase {
     private func demand(
         purpose: AcquisitionPurpose = .userInitiated,
@@ -320,6 +326,22 @@ final class AcquisitionCoordinatorTests: AcquisitionTestCase {
         let deliveredAfterCancellation = await connector.delivered.count
         XCTAssertEqual(deliveredAfterCancellation, 1, "the stream emitted the batch anyway")
         XCTAssertEqual(try checkpointRevision(), 0)
+        XCTAssertEqual(try rowCount("origin_record"), 0)
+    }
+
+    /// Structured-concurrency cancellation is not a transport failure. A connector may surface
+    /// cancellation by throwing `CancellationError`; the coordinator must keep that distinct from
+    /// connectivity/transport degradation so cancellation does not poison target health.
+    func testConnectorCancellationErrorIsReportedAsCancellation() async throws {
+        try registerTarget()
+        let target = try acquisitionTarget()
+        let coordinator = makeCoordinator(sources: [target.id: CancellationThrowingAcquisitionSource()])
+
+        let summary = await coordinator.run(demand(), catalogue: [target], in: database)
+
+        XCTAssertEqual(summary.stop, .cancelled)
+        XCTAssertNil(await coordinator.degradationReason)
+        XCTAssertEqual(summary.admittedBatches, 0)
         XCTAssertEqual(try rowCount("origin_record"), 0)
     }
 
