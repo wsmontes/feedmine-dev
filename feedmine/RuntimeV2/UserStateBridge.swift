@@ -353,6 +353,23 @@ struct UserStateBridge: Sendable {
     /// function so the two cannot drift.
     static func listKey(for listID: Int64) -> String { "list:\(listID)" }
 
+    /// Repairs every runtime projection that can be reconstructed from the durable bookmark
+    /// authority. This is the launch entry point: a process may have died after user.sqlite committed
+    /// while either the bookmark projection or the list-membership projection was still owed.
+    ///
+    /// Both component repairs are idempotent on the operation id, so running this on every launch is
+    /// safe and turns the recovery contract into one call site instead of letting callers remember
+    /// only half of it.
+    @discardableResult
+    func reconcileForLaunch(at: Date = Date()) async -> ReplayReport {
+        let bookmarks = await reconcile(at: at)
+        let memberships = await reconcileListMemberships(at: at)
+        return ReplayReport(
+            applied: bookmarks.applied + memberships.applied,
+            failed: bookmarks.failed + memberships.failed
+        )
+    }
+
     /// Projects the authority's list membership for every list the reader has.
     ///
     /// The save path writes one row per save, and a bookmark taken before this projection existed has
