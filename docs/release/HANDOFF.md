@@ -210,9 +210,11 @@ children and the Sources phase, no build-setting/scheme/workspace edits, no UUID
 
 ### Next steps, in order
 
-1. **Re-run the box proof from a clean build** and confirm the three fixes above land it. The UI test skips with the
-   reason instead of failing while they do not: `bash scripts/validation/clean_validation_artifacts.sh --build`, then
-   `xcodebuild test -only-testing:feedmineUITests/RuntimeV2BookmarkWindowTests`.
+1. ~~**Re-run the box proof from a clean build**~~ — **done, and it passes** (2026-09-18, `DerivedData` cleared):
+   the box's page draws `feed-item-und-card:card:243` … `card:246` — the session's own cards, not the legacy page's
+   hashes — each with the box's control, `composition … decision=published cards=4`, every `episode` line
+   `catalogue=32`, and `passed (46.688 seconds)`. The test keeps its `XCTSkip`, which states the failure mode and
+   fires only on a regression.
 2. **Give the composer's failure path a log line** — cheap, and it is what made three of the five defects above cost a
    container dig each.
 3. **Name the catalogue key whose `CatalogIdentity.sourceID` derives 0** and refuse it where the descriptor is built,

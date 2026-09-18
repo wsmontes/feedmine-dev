@@ -2433,3 +2433,22 @@ with the box drawing its saved cards and its own control, and the runs after it 
 The UI test therefore skips with this reason rather than passing on a claim it cannot make or failing on a
 defect it is not about: its surface half is proven and recorded above, and it goes green again when the box's
 own composition keeps its cards.
+
+**And the box's own page is what the screen draws — measured, clean build, 2026-09-18.** After the five fixes
+above (the claim keeping the legacy page until the session delivers, the per-session stamp, the empty-edition
+rule, the exemption for a plan whose cards are the reader's own subjects, and the launch's descriptor set
+being reused), one run from a cleared `DerivedData`:
+
+- the page's rows carry the *session's* cards: `feed-item-und-card:card:243` … `card:246` — the bridge's display
+  id over the runtime's own `PublicationCardID`, where the legacy page had carried legacy item hashes;
+- every row carries the box's own control (8 controls for 4 rows: the text-only spelling and the card-band one);
+- `composition context=…box=1 reason=refresh decision=published edition:26 cards=4` — the successor publishes
+  the box's four saved cards where it had published none — followed by `decision=unchanged`, which is the steady
+  state: the next refresh finds the supply unmoved and says so instead of appending another edition;
+- every `episode` line reads `catalogue=32`, so a session no longer shrinks the launch's acquisition catalogue;
+- `Test Case '…testOpeningABookmarkBoxComposesTheBoxThroughTheRuntime' passed (46.688 seconds)`.
+
+So the box's content path is closed end to end on the surface: the reader's saved cards, composed by the box's
+own session, drawn by the presentation, each with the control that belongs to that surface. The test keeps its
+`XCTSkip` — not as a live failure, but because it states the failure mode this section measured, and it fires
+only if one of those five fixes regresses.
