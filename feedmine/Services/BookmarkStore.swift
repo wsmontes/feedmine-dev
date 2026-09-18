@@ -1,6 +1,11 @@
 import Foundation
 import GRDB
 
+private struct StoredBookmarkOperationPayload: Decodable, Sendable {
+    let listID: Int64
+    let wanted: Bool
+}
+
 @MainActor
 final class BookmarkStore {
     /// Bookmark identity database (user.sqlite). Owns `bookmark_list` and
@@ -418,14 +423,9 @@ final class BookmarkStore {
         "{\"listID\":\(listID),\"wanted\":\(wanted ? "true" : "false")}"
     }
 
-    private struct StoredOperationPayload: Decodable {
-        let listID: Int64
-        let wanted: Bool
-    }
-
     private nonisolated static func operationRecord(from row: Row) -> BookmarkOperationRecord {
         let payload = row["payload_json"] as String
-        let decoded = try? JSONDecoder().decode(StoredOperationPayload.self, from: Data(payload.utf8))
+        let decoded = try? JSONDecoder().decode(StoredBookmarkOperationPayload.self, from: Data(payload.utf8))
         return BookmarkOperationRecord(
             operationID: row["operation_id"],
             kind: row["kind"],
