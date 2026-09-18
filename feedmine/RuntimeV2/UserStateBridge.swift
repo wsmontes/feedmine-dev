@@ -290,10 +290,14 @@ struct UserStateBridge: Sendable {
         }
 
         do {
+            // The card-level bookmark overlay means "saved anywhere", not "member of the box this
+            // action touched". An item may live in several boxes at once, so removing one membership
+            // must not clear the global bookmark while another membership remains.
+            let bookmarkedAnywhere = try await bookmarks.isBookmarkedAnywhere(itemID: itemID)
             try projections.apply(
                 kind: .bookmark,
                 subjectID: itemID,
-                wanted: wanted,
+                wanted: bookmarkedAnywhere,
                 operationID: operationID,
                 at: at
             )
@@ -381,34 +385,36 @@ struct UserStateBridge: Sendable {
     func reconcileListMemberships(at: Date = Date()) async -> ReplayReport {
         var applied = 0
         var failed = 0
-        let operationBySubject = Dictionary(
-            ((try? await bookmarks.newestOperationsBySubject()) ?? []).map { ($0.subjectID, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let lists = (try? await bookmarks.allBookmarkLists()) ?? []
-        for list in lists {
-            let listKey = Self.listKey(for: list.id)
-            let items = (try? await bookmarks.bookmarkedItems(listID: list.id)) ?? []
-            for item in items {
-                // A subject with no bookmark operation has no operation id to key idempotence on, and
-                // inventing one would make every launch a new write. It is skipped, not guessed.
-                guard let operation = operationBySubject[item.id] else { continue }
-                let projected = try? projections.listMembership(listKey: listKey, subjectID: item.id)
-                if projected?.lastOperationID == operation.operationID, projected?.wanted == true {
-                    continue
-                }
-                do {
-                    try projections.applyListMembership(
-                        listKey: listKey,
-                        subjectID: item.id,
-                        wanted: true,
-                        operationID: operation.operationID,
-                        at: at
-                    )
-                    applied += 1
-                } catch {
-                    failed += 1
-                }
+
+        // Recovery follows the operation log, not only the memberships that still exist. Iterating
+        // current bookmark_item rows can restore an interrupted add but can never discover an
+        // interrupted removal, because the authoritative row is already gone at that point.
+        let operations = await bookmarks.newestOperationsBySubjectAndList()
+        let liveLists = Set(((try? await bookmarks.allBookmarkLists()) ?? []).map(\.id))
+
+        for operation in operations where operation.listID > 0 {
+            let listKey = Self.listKey(for: operation.listID)
+            // A deleted list cannot own a runtime membership. Keeping the operation id still makes the
+            // projection idempotent and prevents a stale true row from surviving list deletion.
+            let wanted = liveLists.contains(operation.listID) ? operation.wanted : false
+            let projected = try? projections.listMembership(
+                listKey: listKey,
+                subjectID: operation.subjectID
+            )
+            if projected?.lastOperationID == operation.operationID, projected?.wanted == wanted {
+                continue
+            }
+            do {
+                try projections.applyListMembership(
+                    listKey: listKey,
+                    subjectID: operation.subjectID,
+                    wanted: wanted,
+                    operationID: operation.operationID,
+                    at: at
+                )
+                applied += 1
+            } catch {
+                failed += 1
             }
         }
         return ReplayReport(applied: applied, failed: failed)
@@ -424,7 +430,8 @@ struct UserStateBridge: Sendable {
     /// safe to run on every launch.
     @discardableResult
     func reconcile(at: Date = Date()) async -> ReplayReport {
-        let newest = (try? await bookmarks.newestOperationsBySubject()) ?? []
+        let newest = await bookmarks.newestOperationsBySubject()
+        let bookmarkedAnywhere = (try? await bookmarks.allBookmarkedItemIDs()) ?? []
         var applied = 0
         var failed = 0
         for operation in newest {
@@ -439,7 +446,7 @@ struct UserStateBridge: Sendable {
                 try projections.apply(
                     kind: .bookmark,
                     subjectID: operation.subjectID,
-                    wanted: operation.wanted,
+                    wanted: bookmarkedAnywhere.contains(operation.subjectID),
                     operationID: operation.operationID,
                     at: at
                 )
