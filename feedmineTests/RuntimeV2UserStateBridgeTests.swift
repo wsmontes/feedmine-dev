@@ -196,6 +196,28 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
         )
     }
 
+    func testBookmarkOperationRoundTripsTheListItBelongsTo() async throws {
+        let article = item(id: "item-operation-list")
+        let listID = try await store.bookmarkStore.createBookmarkList(name: "Operation list")
+
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-list-roundtrip",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+
+        let operation = try XCTUnwrap(
+            await store.bookmarkStore.newestOperationsBySubject().first {
+                $0.operationID == "op-list-roundtrip"
+            }
+        )
+        XCTAssertEqual(operation.listID, listID, "the operation payload must round-trip its list identity")
+        XCTAssertTrue(operation.wanted)
+    }
+
     // MARK: - Crash between the two databases
 
     func testCrashBetweenTheDatabasesIsRepairedByReconcile() async throws {
@@ -264,6 +286,48 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1)),
             ReplayReport(applied: 0, failed: 0),
             "the launch repair is idempotent across both projections"
+        )
+    }
+
+    func testLaunchReconcileRemovesAStaleListMembershipAfterCrash() async throws {
+        let article = item(id: "item-stale-membership")
+        let listID = store.bookmarkStore.defaultListID()
+
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-membership-add",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+        XCTAssertEqual(
+            try UserStateProjectionStore(database: runtimeDatabase).listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            true
+        )
+
+        // Simulate the process dying after the authoritative removal committed but before the
+        // runtime projections were updated.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-membership-remove",
+            listID: listID,
+            at: fixedDate.addingTimeInterval(1)
+        )
+
+        _ = await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(2))
+
+        XCTAssertEqual(
+            try UserStateProjectionStore(database: runtimeDatabase).listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            false,
+            "launch recovery must replay removals, not only memberships that still exist"
         )
     }
 
