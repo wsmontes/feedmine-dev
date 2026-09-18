@@ -568,8 +568,8 @@ final class MainFeedRuntime {
                     self.acquisitionReport = report
                     self.sessionState = .acquiring(sources: descriptors.count)
                 },
-                onSnapshot: { [weak self] snapshot in
-                    self?.presentation.applySnapshot(snapshot)
+                onSnapshot: { [weak self] snapshot, localMedia in
+                    self?.presentation.applySnapshot(snapshot, localMedia: localMedia)
                 }
             )
             // A session the runtime *adopts* composes on its own: opening one whose context has no stored
