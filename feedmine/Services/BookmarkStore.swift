@@ -322,7 +322,7 @@ final class BookmarkStore {
                        applied_at, failure_reason
                 FROM user_operation
                 WHERE state != ?
-                ORDER BY created_at ASC, operation_id ASC
+                ORDER BY created_at ASC, rowid ASC
                 """, arguments: [BookmarkOperationState.applied.rawValue]).map(Self.operationRecord(from:))
         }) ?? []
     }
@@ -337,7 +337,7 @@ final class BookmarkStore {
                        applied_at, failure_reason
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (
-                        PARTITION BY subject_id ORDER BY created_at DESC, operation_id DESC
+                        PARTITION BY subject_id ORDER BY created_at DESC, rowid DESC
                     ) AS row_number
                     FROM user_operation WHERE kind = ?
                 ) WHERE row_number = 1
@@ -359,7 +359,7 @@ final class BookmarkStore {
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (
                         PARTITION BY subject_id, json_extract(payload_json, '$.listID')
-                        ORDER BY created_at DESC, operation_id DESC
+                        ORDER BY created_at DESC, rowid DESC
                     ) AS row_number
                     FROM user_operation WHERE kind = ?
                 ) WHERE row_number = 1
