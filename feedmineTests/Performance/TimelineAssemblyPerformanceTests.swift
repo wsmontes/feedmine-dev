@@ -16,7 +16,12 @@ final class TimelineAssemblyPerformanceTests: XCTestCase {
         measure(metrics: [XCTClockMetric()]) {
             let expectation = self.expectation(description: "search query")
             Task {
-                _ = await store.search("Technology", includeSources: true, includeContents: true)
+                _ = await store.search(
+                    "Technology",
+                    includeSources: true,
+                    includeContents: true,
+                    demandOnlineContent: true
+                )
                 let visible = store.visibleItems
                 XCTAssertFalse(visible.isEmpty, "Must produce visible timeline after search")
                 expectation.fulfill()
@@ -36,7 +41,12 @@ final class TimelineAssemblyPerformanceTests: XCTestCase {
                     let items = makeFixtureItems(count: 200, seed: 600 + sourceIdx)
                     _ = await store.persistFetchedItems(items)
                 }
-                _ = await store.search("Technology", includeSources: true, includeContents: true)
+                _ = await store.search(
+                    "Technology",
+                    includeSources: true,
+                    includeContents: true,
+                    demandOnlineContent: true
+                )
                 let visible = store.visibleItems
                 XCTAssertGreaterThan(visible.count, 0, "Must have merged timeline")
                 expectation.fulfill()

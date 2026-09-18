@@ -1,49 +1,47 @@
 {
-  "configurations" : [
+  "configurations": [
     {
-      "defaultConfigurationValues" : {
-        "TESTPLAN_DISABLE_SCREENSHOTS" : "NO"
-      },
-      "id" : "4E3F5A21-9B6C-4D12-A8E7-123456789ABC",
-      "name" : "Default"
+      "id": "47250621-BF2B-47A9-A287-638EB0D8D45C",
+      "name": "Default",
+      "options": {}
     }
   ],
-  "defaultOptions" : {
-    "codeCoverage" : false,
-    "defaultTestExecutionTimeAllowance" : 120,
-    "maximumTestExecutionTimeAllowance" : 300,
-    "targetForVariableExpansion" : {
-      "containerPath" : "container:feedmine.xcodeproj",
-      "identifier" : "com.feedmine.app",
-      "name" : "feedmine"
+  "defaultOptions": {
+    "codeCoverage": false,
+    "defaultTestExecutionTimeAllowance": 120,
+    "maximumTestExecutionTimeAllowance": 300,
+    "targetForVariableExpansion": {
+      "containerPath": "container:feedmine.xcodeproj",
+      "identifier": "057DBDD4C964DDBA254C0BA5",
+      "name": "feedmine"
     }
   },
-  "testTargets" : [
+  "testTargets": [
     {
-      "enabled" : true,
-      "skippedTests" : [
+      "parallelizable": false,
+      "skippedTests": [
         "DatabasePerformanceTests",
         "FilterPerformanceTests",
         "TestInfrastructureValidationTests"
       ],
-      "target" : {
-        "containerPath" : "container:feedmine.xcodeproj",
-        "identifier" : "com.feedmine.app.tests",
-        "name" : "feedmineTests"
+      "target": {
+        "containerPath": "container:feedmine.xcodeproj",
+        "identifier": "58CAC5F0FAA8580D56CC16D4",
+        "name": "feedmineTests"
       }
     },
     {
-      "enabled" : true,
-      "skippedTests" : [
+      "parallelizable": false,
+      "skippedTests": [
         "FeedmineFilterUITests",
         "PersonaExplorationUITests"
       ],
-      "target" : {
-        "containerPath" : "container:feedmine.xcodeproj",
-        "identifier" : "com.feedmine.uitests",
-        "name" : "feedmineUITests"
+      "target": {
+        "containerPath": "container:feedmine.xcodeproj",
+        "identifier": "326B36774B30230143C88777",
+        "name": "feedmineUITests"
       }
     }
   ],
-  "testPlanFormatVersion" : 3
+  "version": 1
 }

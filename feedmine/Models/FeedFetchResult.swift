@@ -23,6 +23,7 @@ struct FeedFetchResult: Sendable {
         case .notModified: return .success  // not a failure
         case .failed: return .failed
         case .throttled: return .failed     // temporary block → treat as failed
+        case .legacyProducerClosed: return .empty  // no request was made and nothing came back
         }
     }
 }

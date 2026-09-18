@@ -63,33 +63,21 @@ final class ReadyCardQueueTests: XCTestCase {
 @MainActor
 final class ZeroAsyncImageInvariantTests: XCTestCase {
 
-    // MARK: - PreparedCardImage is pure
+    // MARK: - The slot is terminal
 
-    func test_preparedCardImage_acceptsAllMediaCases() {
-        // Every ResolvedCardMedia case must produce a valid View without
-        // crashing or starting async work.
-        let img = UIImage()
-        let cases: [ResolvedCardMedia] = [.image(img), .placeholder, .none]
-        for media in cases {
-            let view = PreparedCardImage(media: media)
-            XCTAssertNotNil(view, "PreparedCardImage must handle \(media)")
-        }
-    }
-
-    // MARK: - Terminal states
-
-    func test_resolvedCardMedia_onlyThreeCases() {
-        let img = UIImage()
-        let media: ResolvedCardMedia = .image(img)
-        switch media {
-        case .image: break
+    func test_cardMediaSlot_onlyTerminalCases() {
+        let image = RenderImage(cacheKey: "k", image: UIImage())
+        let slot = CardMediaSlot.local(image)
+        switch slot {
+        case .local: break
         case .placeholder: break
+        case .empty: break
         case .none: break
         }
-        // Compile-time check: if a 4th case is added, this switch becomes
-        // non-exhaustive and the compiler will error — forcing the developer
-        // to update this test and reconsider whether the new case is terminal.
-        XCTAssertTrue(true, "ResolvedCardMedia has exactly 3 terminal cases")
+        // Compile-time check: if a case that is not terminal is added (a loading state, or a slot
+        // holding a URL), this switch becomes non-exhaustive and the compiler will error — forcing the
+        // developer to reconsider whether the renderer can now start work.
+        XCTAssertTrue(true, "CardMediaSlot has exactly 4 terminal cases")
     }
 
     // MARK: - FeedCardPresentation immutability
@@ -110,49 +98,56 @@ final class ZeroAsyncImageInvariantTests: XCTestCase {
         // All properties are `let` — the compiler prevents mutation after init
     }
 
-    // MARK: - Critical invariant: nil presentation = no image
+    // MARK: - Critical invariant: the slot is the only gate
 
-    func test_cardWithoutPresentation_noImageSlot() {
-        // An item with hasPotentialImage=true but NO presentation must
-        // NOT render an image slot. This is the gate that prevents
-        // CachedAsyncImage from triggering a download after the card appears.
+    func test_cardWithoutSlot_noImageSlot() {
+        // An item with hasPotentialImage=true and NO slot must not render an
+        // image slot. This is the gate that prevents a download after the card
+        // appears: the item never decides it.
         let item = makeItem(id: "no-pres", imageURL: "https://x.com/photo.jpg")
         XCTAssertTrue(item.hasPotentialImage, "Item has potential for image")
 
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: nil)
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .none
+        )
         XCTAssertFalse(view.hasImageTest,
-            "CRITICAL: nil presentation → no image slot, regardless of hasPotentialImage")
+            "CRITICAL: no slot -> no image slot, regardless of hasPotentialImage")
     }
 
     func test_cardWithPlaceholder_noImageSlot() {
         let item = makeItem(id: "ph", imageURL: "https://x.com/img.jpg")
-        let pres = FeedCardPresentation(item: item, media: .placeholder,
-                                         layout: .textOnly, isRead: false,
-                                         isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertFalse(view.hasImageTest, ".placeholder must not activate image slot")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .placeholder(.podcast)
+        )
+        XCTAssertFalse(view.hasImageTest, "a placeholder must not activate the image slot")
     }
 
-    func test_cardWithNoneMedia_noImageSlot() {
-        let item = makeItem(id: "no", imageURL: "https://x.com/img.jpg")
-        let pres = FeedCardPresentation(item: item, media: .none,
-                                         layout: .textOnly, isRead: false,
-                                         isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertFalse(view.hasImageTest, ".none must not activate image slot")
+    func test_cardWithEmptySlot_noImageSlot() {
+        let item = makeItem(id: "empty", imageURL: "https://x.com/img.jpg")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .empty
+        )
+        XCTAssertFalse(view.hasImageTest, "a reserved empty frame must not activate the image slot")
     }
 
-    func test_cardWithImageMedia_hasImageSlot() {
+    func test_cardWithLocalBytes_hasImageSlot() {
         let item = makeItem(id: "yes", imageURL: "https://x.com/img.jpg")
-        let pres = FeedCardPresentation(item: item, media: .image(UIImage()),
-                                         layout: .hero, isRead: false,
-                                         isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertTrue(view.hasImageTest, "Only .image activates the image slot")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .local(RenderImage(cacheKey: "yes", image: UIImage()))
+        )
+        XCTAssertTrue(view.hasImageTest, "only local bytes activate the image slot")
     }
 
     // MARK: - Helpers
@@ -168,12 +163,5 @@ final class ZeroAsyncImageInvariantTests: XCTestCase {
             attribution: nil, enclosures: nil, languageFromFeed: nil,
             alternateLinks: nil
         )
-    }
-}
-
-extension FeedItemCardView {
-    var hasImageTest: Bool {
-        if let pres = presentation, case .image = pres.media { return true }
-        return false
     }
 }

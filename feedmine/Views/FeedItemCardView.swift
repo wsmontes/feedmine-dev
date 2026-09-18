@@ -1,12 +1,18 @@
 import SwiftUI
 import UIKit
+import FeedDomain
 
 struct FeedItemCardView: View, Equatable {
     /// Skips action closures (not Equatable) and @State/@AppStorage/
     /// @Environment properties (tracked independently by SwiftUI).
+    ///
+    /// The media slot and the chrome are part of the comparison: they are what decides whether this
+    /// card's structure changes at all, and a presentation change that does not move them must not
+    /// invalidate the row.
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.item == rhs.item
-        && lhs.presentation?.media == rhs.presentation?.media
+        && lhs.mediaSlot == rhs.mediaSlot
+        && lhs.affordances == rhs.affordances
         && lhs.isRead == rhs.isRead
         && lhs.isBookmarked == rhs.isBookmarked
         && lhs.isInBookmarkBox == rhs.isInBookmarkBox
@@ -14,11 +20,14 @@ struct FeedItemCardView: View, Equatable {
     let item: FeedItem
     let isRead: Bool
     let isBookmarked: Bool
-    /// Pre-resolved card presentation from the pipeline. When non-nil and
-    /// media is .image, the card renders the UIImage directly via
-    /// PreparedCardImage — no async work, no network. When nil (search,
-    /// onboarding, non-pipeline paths), falls back to CachedAsyncImage.
-    var presentation: FeedCardPresentation? = nil
+    /// The media decision for this card: local bytes, a deterministic placeholder, a reserved empty
+    /// frame, or no slot at all (PR-13). There is no `.loading` and no URL, so this view cannot start
+    /// a download, and it never inspects `item` to decide what a slot holds.
+    var mediaSlot: CardMediaSlot = .none
+    /// The chrome the runtime decided: placeholder kind, overlay glyph, badges, duration and what a
+    /// tap means. Defaulted for callers that have not stated one (`.undecided` draws nothing
+    /// protocol-specific), never filled in by guessing from the data.
+    var affordances: CardPresentation.Affordances = .undecided
     var onBookmark: (() -> Void)? = nil
     var onViewSource: (() -> Void)? = nil
     var onAddSourceToCollection: (() -> Void)? = nil
@@ -34,20 +43,15 @@ struct FeedItemCardView: View, Equatable {
 
     private var isLandscape: Bool { horizontalSizeClass == .regular }
     /// Structural: does this card have a resolved image to display?
-    /// Only `.image` reserves the hero slot. `.placeholder` and `.none`
-    /// both collapse to text-only — a card without its real image must not
-    /// show a fake image slot.
+    /// Only `.local` reserves the hero slot with bytes. `.placeholder`, `.empty` and `.none`
+    /// never become a fake image here.
     ///
     /// Because this slot is the card's only height difference between a
     /// text-only card and a hero card, a published card can never gain it: a
     /// late image would grow the card and shift every card below it. The store
     /// serves late images through the next publication instead
     /// (`FeedDisplayState` has no in-place card swap).
-    private var hasImage: Bool {
-        guard let pres = presentation else { return false }
-        if case .image = pres.media { return true }
-        return false
-    }
+    private var hasImage: Bool { mediaSlot.localImage != nil }
 
     /// Test-facing property — mirrors hasImage so tests can verify that
     /// presentation-driven image decisions are correct without rendering.
@@ -82,12 +86,15 @@ struct FeedItemCardView: View, Equatable {
 
     /// Base hero view — the placeholder itself defines the 16:9 frame so it
     /// always fills the slot completely. The real image sits on top as an overlay.
+    ///
+    /// Which placeholder this is comes from the presentation, not from the item: `.podcast` draws the
+    /// episode artwork surface, every other kind draws its deterministic asset.
     @ViewBuilder
     private var heroBase: some View {
-        if item.isPodcast && !hasImage {
+        if case .placeholder(.podcast) = mediaSlot, mediaSlot.localImage == nil {
             podcastPlaceholder
         } else {
-            contentTypePlaceholderImage
+            placeholderImage(MainFeedCardBridge.placeholderKind(affordances.placeholder))
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .opacity(0.5)
@@ -99,7 +106,7 @@ struct FeedItemCardView: View, Equatable {
     private var portraitCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Hero image — native media or a bounded article-page candidate.
-            if hasImage || item.isPodcast {
+            if mediaSlot.reservesFrame {
                 // Use a transparent 16:9 mold as the layout container. Applying
                 // `.aspectRatio(..., .fill)` directly to `heroBase` lets the
                 // square placeholder's intrinsic ratio drive the proposed size.
@@ -110,8 +117,9 @@ struct FeedItemCardView: View, Equatable {
 
                         // Render resolved image directly from the presentation.
                         // Zero async work — the pipeline already resolved it.
-                        if let pres = presentation, case .image = pres.media {
-                            PreparedCardImage(media: pres.media)
+                        if let local = mediaSlot.localImage {
+                            Image(uiImage: local.image)
+                                .resizable()
                                 .scaledToFill()
                                 .frame(width: geometry.size.width, height: geometry.size.height)
                                 .overlay(isRead ? Color.black.opacity(0.15) : nil)
@@ -196,12 +204,12 @@ struct FeedItemCardView: View, Equatable {
     private var landscapeCard: some View {
         HStack(spacing: 12) {
             // Thumb — show for images or podcasts (audio placeholder)
-            if hasImage || item.isPodcast {
+            if mediaSlot.reservesFrame {
                 Group {
-                    if item.isPodcast && !hasImage {
+                    if case .placeholder(.podcast) = mediaSlot, mediaSlot.localImage == nil {
                         podcastPlaceholder
                     } else {
-                        contentTypePlaceholderImage
+                        placeholderImage(MainFeedCardBridge.placeholderKind(affordances.placeholder))
                             .resizable()
                             .scaledToFill()
                     }
@@ -209,8 +217,9 @@ struct FeedItemCardView: View, Equatable {
                 .frame(width: 90, height: 90)
                 .clipped()
                 .overlay {
-                    if let pres = presentation, case .image = pres.media {
-                        PreparedCardImage(media: pres.media)
+                    if let local = mediaSlot.localImage {
+                        Image(uiImage: local.image)
+                            .resizable()
                             .scaledToFill()
                     }
                 }
@@ -272,28 +281,16 @@ struct FeedItemCardView: View, Equatable {
         .contextMenu { cardContextMenu }
     }
 
-    /// Placeholder shown when an article/video/forum image fails to load.
-    /// Picks a decorative asset based on content type so the empty slot still
-    /// feels intentional rather than a generic gray rectangle.
-    private var imageFailurePlaceholder: some View {
-        contentTypePlaceholderImage
-            .resizable()
-            .scaledToFill()
-            .opacity(0.5)
-    }
-
-    /// Decorative placeholder asset keyed to the item's content type and the
-    /// active circadian palette, e.g. "Placeholder-Video-amber".
-    private var contentTypePlaceholderImage: Image {
+    /// Decorative placeholder asset for one content kind and the active circadian palette, e.g.
+    /// "Placeholder-Video-amber". The kind is the presentation's decision (PR-13); this only turns it
+    /// into an asset name.
+    private func placeholderImage(_ kind: PlaceholderKind) -> Image {
         let suffix = CircadianEngine.shared.paletteFamily.placeholderSuffix
-        if item.isYouTube {
-            return Image("Placeholder-Video-\(suffix)")
-        } else if item.isPodcast {
-            return Image("Placeholder-Podcast-\(suffix)")
-        } else if item.isForum {
-            return Image("Placeholder-Forum-\(suffix)")
-        } else {
-            return Image("Placeholder-Article-\(suffix)")
+        switch kind {
+        case .video: return Image("Placeholder-Video-\(suffix)")
+        case .podcast: return Image("Placeholder-Podcast-\(suffix)")
+        case .forum: return Image("Placeholder-Forum-\(suffix)")
+        case .article: return Image("Placeholder-Article-\(suffix)")
         }
     }
 
@@ -345,16 +342,20 @@ struct FeedItemCardView: View, Equatable {
                 .foregroundStyle(.primary)
                 .lineLimit(1)
 
-            if item.isPodcast {
-                mediaBadge(String(localized: "Podcast"), color: .purple)
-                if let dur = item.durationFormatted {
-                    Text(dur).font(.caption2).foregroundStyle(.secondary)
+            // Badges are the presentation's decision (PR-13): this only chooses the label, the colour
+            // and the order, which is the same order the runtime stated.
+            ForEach(Array(affordances.badges.enumerated()), id: \.offset) { _, badge in
+                switch badge {
+                case .podcast:
+                    mediaBadge(String(localized: "Podcast"), color: .purple)
+                    if let duration = affordances.durationLabel {
+                        Text(duration).font(.caption2).foregroundStyle(.secondary)
+                    }
+                case .video:
+                    mediaBadge(String(localized: "Video"), color: .red)
+                case .new:
+                    mediaBadge(String(localized: "New"), color: .blue)
                 }
-            }
-            if item.isYouTube {
-                mediaBadge(String(localized: "Video"), color: .red)
-            } else if isNew && !item.isPodcast {
-                mediaBadge(String(localized: "New"), color: .blue)
             }
 
             Spacer()
@@ -376,6 +377,12 @@ struct FeedItemCardView: View, Equatable {
                             .foregroundStyle(.yellow)
                     }
                     .buttonStyle(.plain)
+                    // Inside a box the control is this menu, not the button below: the identifier and
+                    // the value are one contract, and the contract has two spellings because the box's
+                    // action is different (`card.bookmark` toggles, `card.bookmarkBox` moves or removes).
+                    // Without it a box's page had no observable control at all - measured 2026-09-18,
+                    // baseline §8.62.
+                    .accessibilityIdentifier("card.bookmarkBox")
                 } else {
                     Button {
                         let impact = UIImpactFeedbackGenerator(style: .light)
@@ -388,6 +395,14 @@ struct FeedItemCardView: View, Equatable {
                             .contentTransition(.symbolEffect(.replace))
                     }
                     .buttonStyle(.plain)
+                    // The identifier and the value are one contract: `card.bookmark` is what a test
+                    // targets (`ScreenID.cardBookmark`), and the value is the only way the state is
+                    // observable from outside — the label is an SF Symbol image, so the filled and
+                    // empty states are otherwise indistinguishable to XCUITest. Added for the
+                    // reverse half of the ADR-004 D12 window (plan §14 PR-17 item 2): a bookmark
+                    // taken while `v2Full` owns the feed must hydrate after a rollback to build 17.
+                    .accessibilityIdentifier("card.bookmark")
+                    .accessibilityValue(isBookmarked ? "bookmarked" : "not bookmarked")
                     .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isBookmarked)
                 }
             }
@@ -417,6 +432,9 @@ struct FeedItemCardView: View, Equatable {
                     .padding(12)
             }
             .buttonStyle(.plain)
+            // The card-band spelling of the same contract (`card.bookmarkBox`); the button below is
+            // `card.bookmark`. Both identifiers are what a test targets and what the value states.
+            .accessibilityIdentifier("card.bookmarkBox")
         } else {
             Button {
                 let impact = UIImpactFeedbackGenerator(style: .light)
@@ -433,20 +451,19 @@ struct FeedItemCardView: View, Equatable {
                     .contentTransition(.symbolEffect(.replace))
             }
             .buttonStyle(.plain)
+            // Same contract as the text-only button above: `card.bookmark` plus the value, because
+            // the label is a symbol image and the two states are otherwise indistinguishable from
+            // outside the app.
+            .accessibilityIdentifier("card.bookmark")
+            .accessibilityValue(isBookmarked ? "bookmarked" : "not bookmarked")
             .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isBookmarked)
         }
     }
 
     @ViewBuilder
     private var mediaOverlay: some View {
-        if item.isYouTube {
-            Image(systemName: "play.fill")
-                .font(.system(size: 20, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: 40, height: 40)
-                .background(.black.opacity(0.35), in: Circle())
-        } else if item.isPodcast {
-            Image(systemName: "headphones")
+        if let overlay = affordances.overlay {
+            Image(systemName: overlay == .play ? "play.fill" : "headphones")
                 .font(.system(size: 20, weight: .bold))
                 .foregroundStyle(.white)
                 .frame(width: 40, height: 40)
@@ -506,8 +523,6 @@ struct FeedItemCardView: View, Equatable {
     }
 
     // MARK: - Helpers
-
-    private var isNew: Bool { item.sectionDayOffset == 0 }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()

@@ -531,6 +531,26 @@ final class RSSFetcherTextSanitizerTests: XCTestCase {
         XCTAssertEqual(text.trimmingCharacters(in: .whitespacesAndNewlines), "A short & useful summary.")
     }
 
+    func testDisplayExcerptStripsMarkupAndCapsAtAWordBoundary() {
+        // One owner for "canonical text becomes display text": a payload's `primaryText` keeps the
+        // publisher's HTML by design (an immutable payload is what publication protects), so the display
+        // side strips it — for a session card, for the bookmark snapshot the user-state projection writes
+        // into `feedmine.sqlite`, and for a canonical search row.
+        XCTAssertEqual(
+            FeedTextSanitizer.displayExcerpt(
+                "<p>The 2026 edition of the ICC Framework for <strong>Responsible</strong> Alcohol"
+                    + " Marketing &amp; more</p>"
+            ),
+            "The 2026 edition of the ICC Framework for Responsible Alcohol Marketing & more"
+        )
+
+        let long = "<p>" + Array(repeating: "word", count: 80).joined(separator: " ") + "</p>"
+        let capped = FeedTextSanitizer.displayExcerpt(long)
+        XCTAssertLessThanOrEqual(capped.count, 200)
+        XCTAssertFalse(capped.hasSuffix(" "), "the cap lands on a word boundary")
+        XCTAssertFalse(capped.contains("<"), "no markup survives the cap either")
+    }
+
     func testSanitizedHTMLTextKeepsEscapedCDATAHeadline() {
         let text = RSSFetcher.sanitizedHTMLText("&lt;![CDATA[一条完整的中文标题]]&gt;")
 

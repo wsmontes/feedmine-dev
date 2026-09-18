@@ -1,5 +1,16 @@
 import Foundation
 
+/// The one HTTP call a feed fetch makes. `RSSFetcher` sends through this rather than through a
+/// concrete `FeedHTTPSync`, so a test can script and count requests without a network — `URLProtocol`
+/// registration does not reach the fetcher's sessions (`docs/runtime-v2/baseline.md` §8.8.3).
+protocol FeedHTTPTransport: Sendable {
+    func fetch(_ source: FeedSource, validators: HTTPValidators) async -> FetchHTTPResult
+}
+
+/// The shipping transport. Its `fetch` is actor-isolated, which is what the protocol's `async`
+/// requirement admits: the call hops to the actor rather than running on the caller.
+extension FeedHTTPSync: FeedHTTPTransport {}
+
 /// Actor responsible for all HTTP-level feed fetching semantics:
 /// conditional GET (ETag/If-None-Match, Last-Modified/If-Modified-Since),
 /// 304 Not Modified handling, Cache-Control/Expires extraction,

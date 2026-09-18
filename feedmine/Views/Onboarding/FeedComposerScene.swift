@@ -79,11 +79,17 @@ struct FeedComposerScene: View {
     private var previewCardsView: some View {
         VStack(spacing: 8) {
             ForEach(previewCards) { card in
+                let render = MainFeedCardBridge.card(
+                    item: card.item,
+                    presentation: card,
+                    band: .card
+                )
                 FeedItemCardView(
                     item: card.item,
                     isRead: card.isRead,
                     isBookmarked: card.isBookmarked,
-                    presentation: card
+                    mediaSlot: render.mediaSlot,
+                    affordances: render.card.affordances
                 )
                 .padding(.horizontal, 16)
             }

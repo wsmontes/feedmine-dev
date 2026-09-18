@@ -25,6 +25,15 @@ enum FeedFetchOutcome: Sendable, Equatable {
     case modifiedWithoutNewItems(validators: HTTPValidators)
     case failed(Error)
     case throttled(until: Date)
+    /// The request was never made: this process's mode owns acquisition, so the legacy producers are
+    /// closed (`LegacyAcquisitionGate`).
+    ///
+    /// It is deliberately not `.failed`: nothing went wrong, no endpoint was contacted, and a failure
+    /// here would write a source-health penalty and move the adaptive backoff for a request that does
+    /// not exist. It is deliberately not `.notModified` either, which would claim the endpoint
+    /// confirmed a baseline nobody asked about. It is its own state, and every consumer either ignores
+    /// it or counts it as a closed producer.
+    case legacyProducerClosed
 
     /// True if the outcome is a failure (network/parse error).
     var isFailed: Bool {
@@ -41,6 +50,7 @@ enum FeedFetchOutcome: Sendable, Equatable {
         case (.modifiedWithoutNewItems, .modifiedWithoutNewItems): return true
         case (.failed, .failed): return true  // approximate — errors aren't Equatable
         case (.throttled(let lDate), .throttled(let rDate)): return lDate == rDate
+        case (.legacyProducerClosed, .legacyProducerClosed): return true
         default: return false
         }
     }

@@ -1,32 +1,30 @@
 {
-  "configurations" : [
+  "configurations": [
     {
-      "defaultConfigurationValues" : {
-        "TESTPLAN_DISABLE_SCREENSHOTS" : "YES"
-      },
-      "id" : "C9A3D782-BF56-4E34-A012-345678901FGH",
-      "name" : "Default"
+      "id": "3B0DEA13-991E-4CFD-A283-6135A35DF97C",
+      "name": "Default",
+      "options": {}
     }
   ],
-  "defaultOptions" : {
-    "codeCoverage" : false,
-    "defaultTestExecutionTimeAllowance" : 300,
-    "maximumTestExecutionTimeAllowance" : 900,
-    "targetForVariableExpansion" : {
-      "containerPath" : "container:feedmine.xcodeproj",
-      "identifier" : "com.feedmine.app",
-      "name" : "feedmine"
+  "defaultOptions": {
+    "codeCoverage": false,
+    "defaultTestExecutionTimeAllowance": 300,
+    "maximumTestExecutionTimeAllowance": 900,
+    "targetForVariableExpansion": {
+      "containerPath": "container:feedmine.xcodeproj",
+      "identifier": "057DBDD4C964DDBA254C0BA5",
+      "name": "feedmine"
     }
   },
-  "testTargets" : [
+  "testTargets": [
     {
-      "enabled" : true,
-      "target" : {
-        "containerPath" : "container:feedmine.xcodeproj",
-        "identifier" : "com.feedmine.uitests",
-        "name" : "feedmineUITests"
+      "parallelizable": false,
+      "target": {
+        "containerPath": "container:feedmine.xcodeproj",
+        "identifier": "326B36774B30230143C88777",
+        "name": "feedmineUITests"
       }
     }
   ],
-  "testPlanFormatVersion" : 3
+  "version": 1
 }

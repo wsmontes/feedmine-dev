@@ -51,6 +51,12 @@ final class TaxonomyStore {
     /// generation at start and only applies its result if no newer build has
     /// begun since — so builds apply in call order, not task-completion order.
     @ObservationIgnored private var buildGeneration: UInt64 = 0
+    /// The build currently running, so a `build()` with identical inputs awaits it
+    /// instead of computing the same tree again.
+    @ObservationIgnored private var inFlightBuild: InFlightBuild?
+    /// Builds actually performed. A caller that coalesced onto an in-flight build does
+    /// not count: this is the coalescing observable.
+    @ObservationIgnored private(set) var buildRunCount = 0
     /// Most recent cache write, so a newer one can wait for an older one instead of the
     /// two racing for the same file.
     @ObservationIgnored private var pendingCacheWrite: Task<Void, Never>?
@@ -89,6 +95,16 @@ final class TaxonomyStore {
         let coverageGroups: [CoverageGroup]
     }
 
+    /// One `build()` in progress: its inputs (so an identical caller can coalesce onto it),
+    /// its generation (so the finisher can tell whether it is still the current one) and the
+    /// task running compute + apply + cache write.
+    private struct InFlightBuild {
+        let sources: [FeedSource]
+        let sharedCountrySourceURLs: Set<String>
+        let generation: UInt64
+        let task: Task<Void, Never>
+    }
+
     /// Build the taxonomy tree from all feed sources.
     /// Single pass, O(n). Caches result to disk for warm starts.
     ///
@@ -102,56 +118,81 @@ final class TaxonomyStore {
         from sources: [FeedSource],
         sharedCountrySourceURLs: Set<String> = []
     ) async {
+        // Coalesce: while a build for identical inputs is in flight a second caller awaits
+        // that build instead of computing the same tree again. Different inputs do not
+        // coalesce — the newer inputs win, so the new build starts right away and the
+        // earlier one applies only if no newer build began in the meantime.
+        if let inFlight = inFlightBuild,
+           inFlight.sources == sources,
+           inFlight.sharedCountrySourceURLs == sharedCountrySourceURLs {
+            await inFlight.task.value
+            return
+        }
+
         // Capture a generation. build() is main-actor isolated, so this bump
         // is atomic relative to any other build() call — but the await below
         // releases the main actor, letting a newer build start (and finish)
         // first. The generation guard makes the stale build's apply a no-op.
         let gen = buildGeneration + 1
         buildGeneration = gen
+        buildRunCount += 1
 
-        let built = await Task.detached(priority: .userInitiated) {
-            Self.computeTaxonomy(
-                from: sources,
-                sharedCountrySourceURLs: sharedCountrySourceURLs
-            )
-        }.value
+        // One task per build, so every coalescing caller awaits the same work.
+        let task = Task { @MainActor in
+            let built = await Task.detached(priority: .userInitiated) {
+                Self.computeTaxonomy(
+                    from: sources,
+                    sharedCountrySourceURLs: sharedCountrySourceURLs
+                )
+            }.value
 
-        // Apply on the main actor — only the final assignment of the
-        // rebuilt indexes touches shared state.
-        guard buildGeneration == gen else { return }
+            // Apply on the main actor — only the final assignment of the
+            // rebuilt indexes touches shared state.
+            guard buildGeneration == gen else { return }
 
-        feedToNodeID = built.feedToNodeID
-        childrenIndex = built.childrenIndex
-        sortedChildrenCache.removeAll()
-        nodeToFeedURLs = built.nodeToFeedURLs
-        flatIndex = built.flatIndex
-        // A rebuild can finish while a topic is being chosen. Keep the
-        // *current* selection (including any made during the build window),
-        // dropping only IDs that no longer exist in the refreshed catalogue.
-        selectedNodeIDs = selectedNodeIDs.filter { built.flatIndex[$0] != nil }
-        root = built.root
-        coverageGroups = built.coverageGroups
+            feedToNodeID = built.feedToNodeID
+            childrenIndex = built.childrenIndex
+            sortedChildrenCache.removeAll()
+            nodeToFeedURLs = built.nodeToFeedURLs
+            flatIndex = built.flatIndex
+            // A rebuild can finish while a topic is being chosen. Keep the
+            // *current* selection (including any made during the build window),
+            // dropping only IDs that no longer exist in the refreshed catalogue.
+            selectedNodeIDs = selectedNodeIDs.filter { built.flatIndex[$0] != nil }
+            root = built.root
+            coverageGroups = built.coverageGroups
 
-        // Persist off main — encoding ~10K nodes is expensive too — and *ordered*, not
-        // blocking: each write waits for the previous one, so the file always ends up
-        // holding the newest snapshot instead of whichever detached encode finished last
-        // (finding 8: "serializar gravações e rejeitar snapshots obsoletos"). `build()`
-        // itself does not wait: its callers are startup and background refresh, and the
-        // ordering guarantee is about the writes, not about every builder. Tests that
-        // need the file to be on disk call `awaitCacheWrite()`.
-        let previousWrite = pendingCacheWrite
-        let write = Task.detached(priority: .background) {
-            await previousWrite?.value
-            Self.persistCache(
-                root: built.root,
-                flatIndex: built.flatIndex,
-                feedToNodeID: built.feedToNodeID,
-                sources: sources,
-                sharedCountrySourceURLs: sharedCountrySourceURLs,
-                cacheURL: self.cacheURL
-            )
+            // Persist off main — encoding ~10K nodes is expensive too — and *ordered*, not
+            // blocking: each write waits for the previous one, so the file always ends up
+            // holding the newest snapshot instead of whichever detached encode finished last
+            // (finding 8: "serializar gravações e rejeitar snapshots obsoletos"). `build()`
+            // itself does not wait: its callers are startup and background refresh, and the
+            // ordering guarantee is about the writes, not about every builder. Tests that
+            // need the file to be on disk call `awaitCacheWrite()`.
+            let previousWrite = pendingCacheWrite
+            let write = Task.detached(priority: .background) {
+                await previousWrite?.value
+                Self.persistCache(
+                    root: built.root,
+                    flatIndex: built.flatIndex,
+                    feedToNodeID: built.feedToNodeID,
+                    sources: sources,
+                    sharedCountrySourceURLs: sharedCountrySourceURLs,
+                    cacheURL: self.cacheURL
+                )
+            }
+            pendingCacheWrite = write
         }
-        pendingCacheWrite = write
+        inFlightBuild = InFlightBuild(
+            sources: sources,
+            sharedCountrySourceURLs: sharedCountrySourceURLs,
+            generation: gen,
+            task: task
+        )
+        await task.value
+        if inFlightBuild?.generation == gen {
+            inFlightBuild = nil
+        }
     }
 
     /// Wait for the cache writes queued so far. Exists so a warm-cache reader can know the

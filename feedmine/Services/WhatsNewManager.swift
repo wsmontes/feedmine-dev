@@ -75,8 +75,9 @@ final class WhatsNewManager {
     /// cold start. Runs alongside the DB seed — if the database has nothing,
     /// this fetches fresh content from the network immediately.
     func fetchWhatsNewBooster(
-        enabledSources: [FeedSource],
+        grantedSources: [FeedSource],
         fetcher: RSSFetcher,
+        finishDemand: @escaping ([FeedSource], FeedFetchBatch) -> Void,
         persistFetchedItems: @escaping ([FeedItem]) async -> [FeedItem],
         throttledReservoirAppend: @escaping ([FeedItem]) -> Void,
         collectCandidates: @escaping ([FeedItem]) -> Void,
@@ -86,12 +87,30 @@ final class WhatsNewManager {
         // A cancelled task may already be inside GRDB's transactional write.
         // Let that short write finish and reuse it for the current filters:
         // candidate matching is evaluated when the results arrive.
-        guard whatsNewBoosterTask == nil else { return }
+        let declinedBatch = FeedFetchBatch(
+            items: [], fetchedSourceCount: 0, failedSourceCount: 0,
+            emptySourceCount: 0, notModifiedCount: 0, throttledCount: 0,
+            sourceOutcomes: [:]
+        )
+        guard whatsNewBoosterTask == nil else {
+            // The store claimed these endpoints before calling in; a declined boost still releases them.
+            finishDemand(grantedSources, declinedBatch)
+            return
+        }
         whatsNewBoosterTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                finishDemand(grantedSources, declinedBatch)
+                return
+            }
             defer { self.whatsNewBoosterTask = nil }
-            let sources = enabledSources.shuffled().prefix(30)
-            let result = await fetcher.fetchAll(Array(sources), maxConcurrent: 5)
+            let sources = Array(grantedSources.shuffled().prefix(30))
+            guard !sources.isEmpty else {
+                finishDemand(sources, declinedBatch)
+                return
+            }
+            let result = await fetcher.fetchAll(sources, maxConcurrent: 5)
+            // Every remaining exit path releases the claim here, including cancellation, and only once.
+            finishDemand(sources, result)
             guard !Task.isCancelled else { return }
             await Task.yield()
             let actualNew = await persistFetchedItems(result.items)

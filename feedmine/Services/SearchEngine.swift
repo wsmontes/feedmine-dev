@@ -158,6 +158,18 @@ final class SearchEngine {
     private let userDB: DatabaseQueue?
     private var catalogDB: DatabaseQueue?
 
+    /// The canonical content index, present exactly when the launch's runtime owns acquisition
+    /// (`v2Full`), installed through `FeedStore.useCanonicalContentSearch`. Nil in every other mode:
+    /// the runtime database is then either not populated (`legacy`) or not the search's authority
+    /// (`mirroredShadow`), and the legacy `feed_item_fts` stays the index with content in it.
+    var canonicalContentSearch: CanonicalContentSearch?
+
+    /// The result bound of the canonical read, matching the legacy read's own bound so switching
+    /// source cannot silently change how many local results a search can show.
+    static let localContentLimit = 180
+    /// How many of them the search list shows.
+    static let localContentResultCount = 100
+
     init(db: DatabaseQueue, userDB: DatabaseQueue? = nil, catalogURL: URL? = nil) {
         self.db = db
         self.userDB = userDB
@@ -186,8 +198,9 @@ final class SearchEngine {
     /// Search is intentionally tiered by user value:
     /// 1. content-analyzed sources and their tags;
     /// 2. items explicitly saved by the user;
-    /// 3. everything still present in the local content database, including
-    ///    previously opened items, without the old 30-day search cutoff.
+    /// 3. everything still present in the local content index — the canonical `origin_search` in a
+    ///    launch whose runtime owns acquisition, the legacy `feed_item_fts` in every other mode —
+    ///    including previously opened items, without the old 30-day search cutoff.
     func unifiedSearch(
         _ query: String,
         includeSources: Bool = true,
@@ -214,8 +227,9 @@ final class SearchEngine {
         let savedRecords = includeContents
             ? await searchSavedRecords(expression, itemIDs: savedIDs)
             : []
-        let contentRecords = includeContents ? await searchLocalRecords(expression) : []
-        let localRecords = contentRecords.filter { !savedIDs.contains($0.id) }
+        let localItems = includeContents
+            ? await localContentItems(expression, excluding: savedIDs)
+            : []
         return UnifiedSearchResults(
             sources: sourceResults,
             savedItems: savedRecords.prefix(40).map {
@@ -224,12 +238,40 @@ final class SearchEngine {
                     bookmarkItemIDs: [$0.id]
                 )
             },
-            localItems: localRecords.prefix(100).map {
-                $0.toFeedItem().stamped(
-                    readItemIDs: $0.isRead ? [$0.id] : [],
-                    bookmarkItemIDs: []
-                )
-            }
+            localItems: localItems
+        )
+    }
+
+    /// The local content half of a search: the canonical index when the launch's runtime owns
+    /// acquisition, the legacy `feed_item_fts` otherwise.
+    ///
+    /// The two are an either/or by construction, not a fallback. `canonicalContentSearch` is installed
+    /// by the composition that also closes the legacy producers (plan §14 PR-14 clause two), so the mode
+    /// that reads `origin_search` is exactly the mode that fills it; `legacy` never populates a runtime
+    /// database, and a shadow launch has no authority to search. Falling back on an empty canonical
+    /// index would answer from a database no producer in that mode is refreshing.
+    private func localContentItems(
+        _ expression: SearchExpression,
+        excluding savedIDs: Set<String>
+    ) async -> [FeedItem] {
+        if let canonicalContentSearch {
+            let items = await canonicalContentSearch.items(
+                matching: Self.canonicalContentFTSQuery(for: expression),
+                limit: Self.localContentLimit
+            )
+            return Array(items.filter { !savedIDs.contains($0.id) }.prefix(Self.localContentResultCount))
+        }
+        let records = await searchLocalRecords(expression)
+        return Array(
+            records
+                .filter { !savedIDs.contains($0.id) }
+                .prefix(Self.localContentResultCount)
+                .map {
+                    $0.toFeedItem().stamped(
+                        readItemIDs: $0.isRead ? [$0.id] : [],
+                        bookmarkItemIDs: []
+                    )
+                }
         )
     }
 
@@ -373,6 +415,16 @@ final class SearchEngine {
             excludedTerms: expression.excludedTerms
         )
         return "{title excerpt} : (\(query))"
+    }
+
+    /// The `MATCH` string for the canonical content index (plan §14 PR-14 clause two).
+    ///
+    /// `origin_search` has a single column — the current revision's `search_projection`, which
+    /// Admission builds from the headline, the summary and the body — so the query needs no scope
+    /// prefix. That is the whole difference from `contentFTSQuery`: one physical table carrying several
+    /// scopes needs the filter, one column holding one scope must not have it.
+    static func canonicalContentFTSQuery(for expression: SearchExpression) -> String {
+        ftsQuery(requiredTerms: expression.requiredTerms, excludedTerms: expression.excludedTerms)
     }
 
     // Legacy entry points remain for persistent-search callers and tests.

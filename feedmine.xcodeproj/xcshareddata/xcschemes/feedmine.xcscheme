@@ -66,30 +66,27 @@
             ReferencedContainer = "container:feedmine.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
-      <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "58CAC5F0FAA8580D56CC16D4"
-               BuildableName = "feedmineTests.xctest"
-               BlueprintName = "feedmineTests"
-               ReferencedContainer = "container:feedmine.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "326B36774B30230143C88777"
-               BuildableName = "feedmineUITests.xctest"
-               BlueprintName = "feedmineUITests"
-               ReferencedContainer = "container:feedmine.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-      </Testables>
+      <TestPlans>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-ReleaseValidation.xctestplan"
+            default = "YES">
+         </TestPlanReference>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-Smoke.xctestplan">
+         </TestPlanReference>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-RuntimeV2.xctestplan">
+         </TestPlanReference>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-Accessibility.xctestplan">
+         </TestPlanReference>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-Performance.xctestplan">
+         </TestPlanReference>
+         <TestPlanReference
+            reference = "container:TestPlans/FeedMine-Usability.xctestplan">
+         </TestPlanReference>
+      </TestPlans>
       <CommandLineArguments>
       </CommandLineArguments>
    </TestAction>

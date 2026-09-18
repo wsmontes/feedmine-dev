@@ -13,10 +13,30 @@ actor RSSFetcher {
         return times
     }
 
-    private let session: URLSession
-    private let starterSession: URLSession
-    private let httpSync: FeedHTTPSync
-    private let starterHTTPSync: FeedHTTPSync
+    /// How many feed fetches this fetcher has attempted since the process started: one per
+    /// `performFetch`, whether the transport succeeded or failed.
+    ///
+    /// Counted here rather than derived from the demand ledger because the two answer different
+    /// questions: the ledger counts *decisions* (an endpoint was `shared`, so no request was made),
+    /// and this counts *requests actually made*. "No double acquisition" is a claim about requests.
+    private(set) var attemptedFetchCount = 0
+
+    /// The number of fetches attempted so far. A demand that issues no request leaves this unchanged.
+    func fetchAttemptCount() -> Int { attemptedFetchCount }
+
+    /// Where fetches go. Injected so a test can script and count them: `URLProtocol` registration does
+    /// not reach these sessions (`docs/runtime-v2/baseline.md` §8.8.3 measured `blockedRequests` at 0),
+    /// which left a real `fetchAll`'s interleaving unexercised.
+    private let transport: any FeedHTTPTransport
+    private let starterTransport: any FeedHTTPTransport
+
+    /// PR-12: the shadow observes what this fetcher already fetched. It is resolved per call rather
+    /// than captured at init, because a fetcher built before the shadow is installed must still
+    /// observe — a silent no-op would look exactly like perfect agreement.
+    private let injectedMirrorSink: (any ShadowMirrorSink)?
+    private var mirrorSink: (any ShadowMirrorSink)? {
+        injectedMirrorSink ?? ShadowMirrorRegistry.current
+    }
 
     /// Cache of audio-URL → playable? so repeat fetches never re-probe the same
     /// enclosure (podcast episode URLs are stable).
@@ -24,63 +44,102 @@ actor RSSFetcher {
 
     private static let playabilityCacheKey = "audio_playability_cache"
 
-    init() {
+    /// The session the audio playability probe uses. It asks whether a podcast enclosure is playable,
+    /// which is not feed acquisition, so it is not the feed transport. Built on first use: a fetcher
+    /// given its transports allocates no session at all.
+    private lazy var probeSession: URLSession = Self.makeSession(
+        cache: URLCache(memoryCapacity: 4_194_304, diskCapacity: 20_971_520),
+        fastLane: false
+    )
+
+    init(
+        shadow: (any ShadowMirrorSink)? = nil,
+        transport: (any FeedHTTPTransport)? = nil,
+        starterTransport: (any FeedHTTPTransport)? = nil
+    ) {
+        self.injectedMirrorSink = shadow
         // Restore persisted playability cache (#34) so probes survive restart
         if let saved = UserDefaults.standard.dictionary(forKey: Self.playabilityCacheKey) as? [String: Bool] {
             audioPlayability = saved
         }
-        let cache = URLCache(
-            memoryCapacity: 4_194_304,
-            diskCapacity: 20_971_520
-        )
-        let headers = [
-            "User-Agent": "Feedmine/1.0",
-            "Accept": "application/rss+xml, application/atom+xml, application/json, text/xml"
-        ]
 
+        // Both feed sessions share one cache, so a fast-lane response is also available to the regular
+        // refresh pipeline. Nothing is built when both transports are supplied.
+        if let injected = transport {
+            self.transport = injected
+            self.starterTransport = starterTransport ?? injected
+        } else {
+            let cache = URLCache(memoryCapacity: 4_194_304, diskCapacity: 20_971_520)
+            self.transport = transport ?? FeedHTTPSync(session: Self.makeSession(cache: cache, fastLane: false))
+            self.starterTransport = starterTransport ?? transport
+                ?? FeedHTTPSync(session: Self.makeSession(cache: cache, fastLane: true))
+        }
+    }
+
+    /// The two session shapes this fetcher has always used: a normal one, and a fast lane with a real
+    /// wall-clock ceiling so one unresponsive publisher cannot stretch a starter deadline to the
+    /// normal resource timeout.
+    private static func makeSession(cache: URLCache, fastLane: Bool) -> URLSession {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 30
+        config.timeoutIntervalForRequest = fastLane ? 5 : 15
+        config.timeoutIntervalForResource = fastLane ? 7 : 30
         config.waitsForConnectivity = false      // let timeouts fire; app gates on its own reachability
         config.allowsCellularAccess = true
         config.httpMaximumConnectionsPerHost = 2 // be a good citizen
         config.urlCache = cache
-        config.httpAdditionalHeaders = headers
-        self.session = URLSession(configuration: config)
-
-        // First-run surfaces need a real wall-clock ceiling. A separate
-        // session prevents one unresponsive publisher from stretching a
-        // nominal starter deadline to the normal 30-second resource timeout.
-        // Both sessions share the same cache, so a fast-lane response is also
-        // available to the regular refresh pipeline.
-        let starterConfig = URLSessionConfiguration.default
-        starterConfig.timeoutIntervalForRequest = 5
-        starterConfig.timeoutIntervalForResource = 7
-        starterConfig.waitsForConnectivity = false
-        starterConfig.allowsCellularAccess = true
-        starterConfig.httpMaximumConnectionsPerHost = 2
-        starterConfig.urlCache = cache
-        starterConfig.httpAdditionalHeaders = headers
-        self.starterSession = URLSession(configuration: starterConfig)
-
-        self.httpSync = FeedHTTPSync(session: session)
-        self.starterHTTPSync = FeedHTTPSync(session: starterSession)
+        config.httpAdditionalHeaders = [
+            "User-Agent": "Feedmine/1.0",
+            "Accept": "application/rss+xml, application/atom+xml, application/json, text/xml"
+        ]
+        return URLSession(configuration: config)
     }
 
     /// Fetch and parse a single feed with conditional GET support.
     /// - Parameters:
     ///   - source: The feed source to fetch.
     ///   - validators: Previously-stored HTTP validators for conditional GET.
-    ///   - httpSync: HTTP transport to use (defaults to the normal-timout session).
+    ///   - transport: HTTP transport to use (defaults to this fetcher's regular transport).
+    ///
+    /// PR-12 hook (level 1): this is the convergence point where the items, the source and the
+    /// outcome exist together, so the shadow is told what the legacy path produced — including a 304,
+    /// an empty response and a failure, which mirroring only "new items" would lose. The shadow
+    /// observes and never fetches: nothing below it can start network work.
     func fetch(_ source: FeedSource,
                validators: HTTPValidators = HTTPValidators(),
-               httpSync: FeedHTTPSync? = nil) async -> FeedFetchResult {
+               transport: (any FeedHTTPTransport)? = nil) async -> FeedFetchResult {
+        let result = await performFetch(source, validators: validators, transport: transport)
+        // A fetch the mode's gate refused is not legacy behaviour to mirror: nothing was fetched, so
+        // there is nothing to observe, and `ShadowOutcomeKind` maps it to no kind at all.
+        if let kind = ShadowOutcomeKind(result.outcome) {
+            mirrorSink?.mirrorFetch(ShadowFetchMirror(
+                sourceURL: source.url,
+                sourceTitle: source.title,
+                outcome: kind,
+                items: result.items
+            ))
+        }
+        return result
+    }
+
+    private func performFetch(_ source: FeedSource,
+                              validators: HTTPValidators,
+                              transport: (any FeedHTTPTransport)?) async -> FeedFetchResult {
+        // The one place the mode closes the legacy producers (plan §13). It is checked before the
+        // attempt is counted, so `fetchAttemptCount()` stays 0 in a launch whose runtime owns
+        // acquisition: a request that was never meant to happen is not an attempt, and the
+        // no-double-acquisition proof reads this counter.
+        guard LegacyAcquisitionGate.allowsFeedRequest() else {
+            return FeedFetchResult(source: source, items: [], outcome: .legacyProducerClosed)
+        }
+        // One attempt, counted before the transport is asked: a request this fetcher meant to make is
+        // what the no-double-acquisition proof counts, whether or not the network answered.
+        attemptedFetchCount += 1
         guard !Task.isCancelled else {
             return FeedFetchResult(source: source, items: [], outcome: .failed(CancellationError()))
         }
 
         let startedAt = ContinuousClock().now
-        let transport = httpSync ?? self.httpSync
+        let transport = transport ?? self.transport
         let httpResult = await transport.fetch(source, validators: validators)
         let elapsed = ContinuousClock().now - startedAt
 
@@ -158,7 +217,7 @@ actor RSSFetcher {
     /// timeout session so a slow publisher can't stretch the cold-start
     /// deadline past the ~2.25s per-feed window.
     private func fetchStarterSource(_ source: FeedSource) async -> FeedFetchResult {
-        await fetch(source, validators: HTTPValidators(), httpSync: starterHTTPSync)
+        await fetch(source, validators: HTTPValidators(), transport: starterTransport)
     }
 
     /// Fetch multiple feeds concurrently with a real concurrency cap.
@@ -169,6 +228,7 @@ actor RSSFetcher {
         var emptySourceCount = 0
         var notModifiedCount = 0
         var throttledCount = 0
+        var gatedSourceCount = 0
         var sourceOutcomes: [String: FeedFetchOutcome] = [:]
 
         // Sliding-window concurrency: keep up to `maxConcurrent` fetches in
@@ -192,7 +252,14 @@ actor RSSFetcher {
 
             // Drain as results arrive, refilling each freed slot.
             while let result = await group.next() {
-                sourceOutcomes[result.source.url] = result.outcome
+                // A request the gate refused produced no outcome: it stays out of `sourceOutcomes`, so
+                // the caller's demand ledger cannot count it as a refill that happened and the adaptive
+                // scheduler cannot read it as a failure.
+                if case .legacyProducerClosed = result.outcome {
+                    gatedSourceCount += 1
+                } else {
+                    sourceOutcomes[result.source.url] = result.outcome
+                }
                 switch result.outcome {
                 case .modifiedWithNewItems:
                     fetchedSourceCount += 1
@@ -205,6 +272,8 @@ actor RSSFetcher {
                     failedSourceCount += 1
                 case .throttled:
                     throttledCount += 1
+                case .legacyProducerClosed:
+                    break
                 }
 
                 if Task.isCancelled {
@@ -224,6 +293,7 @@ actor RSSFetcher {
             emptySourceCount: emptySourceCount,
             notModifiedCount: notModifiedCount,
             throttledCount: throttledCount,
+            gatedSourceCount: gatedSourceCount,
             sourceOutcomes: sourceOutcomes
         )
     }
@@ -251,6 +321,7 @@ actor RSSFetcher {
         var emptySourceCount = 0
         var notModifiedCount = 0
         var throttledCount = 0
+        var gatedSourceCount = 0
         var sourceOutcomes: [String: FeedFetchOutcome] = [:]
         let cap = max(1, maxConcurrent)
 
@@ -284,7 +355,11 @@ actor RSSFetcher {
                     break eventLoop
                 case .result(let result):
                     activeFetches -= 1
-                    sourceOutcomes[result.source.url] = result.outcome
+                    if case .legacyProducerClosed = result.outcome {
+                        gatedSourceCount += 1
+                    } else {
+                        sourceOutcomes[result.source.url] = result.outcome
+                    }
                     switch result.outcome {
                     case .modifiedWithNewItems:
                         fetchedSourceCount += 1
@@ -297,6 +372,8 @@ actor RSSFetcher {
                         failedSourceCount += 1
                     case .throttled:
                         throttledCount += 1
+                    case .legacyProducerClosed:
+                        break
                     }
                     await onProgress?(result)
 
@@ -325,6 +402,7 @@ actor RSSFetcher {
             emptySourceCount: emptySourceCount,
             notModifiedCount: notModifiedCount,
             throttledCount: throttledCount,
+            gatedSourceCount: gatedSourceCount,
             sourceOutcomes: sourceOutcomes
         )
     }
@@ -500,7 +578,7 @@ actor RSSFetcher {
         head.httpMethod = "HEAD"
         head.timeoutInterval = 6
         do {
-            let (_, response) = try await session.data(for: head)
+            let (_, response) = try await probeSession.data(for: head)
             guard let http = response as? HTTPURLResponse else { return .unknown }
             // Some servers reject HEAD — retry with a 1-byte ranged GET.
             if http.statusCode == 405 || http.statusCode == 501 {
@@ -520,7 +598,7 @@ actor RSSFetcher {
             // Use bytes(for:) to avoid downloading full episode bodies from
             // servers that ignore Range requests. Stream at most 64 KB and
             // classify based on headers alone — we don't need the body for audio probes.
-            let (asyncBytes, response) = try await session.bytes(for: req)
+            let (asyncBytes, response) = try await probeSession.bytes(for: req)
             guard let http = response as? HTTPURLResponse else { return .unknown }
             // Drain body bytes (capped at 64 KB) to avoid leaking the connection.
             // asyncBytes iterates individual UInt8 values — count them to cap.
@@ -982,6 +1060,22 @@ actor RSSFetcher {
             content: rawContent
         )
 
+        // PR-12 hook (level 2): the parsed entry still holds the GUID/Atom id here, and the
+        // `FeedItem` built below keeps only a hash of it (`Models/FeedItem.swift:394-402`). The
+        // shadow gets the wire identity verbatim, plus the legacy alias, so the two mirror levels
+        // refer to one item without either re-deriving an identity.
+        mirrorSink?.mirrorParsedEntry(ShadowParsedEntry(
+            legacyItemID: id,
+            sourceURL: source.url,
+            guid: guid,
+            link: resolvedLink,
+            title: truncatedTitle,
+            publishedAt: itemPubDate,
+            updatedAt: metadata.updatedAt,
+            excerpt: excerpt,
+            audioURL: audioURL
+        ))
+
         // Resolve relative image URLs against the article URL
         let resolvedImageURL = resolveImageURL(imageURL, baseURL: link ?? source.url)
 
@@ -1286,17 +1380,10 @@ actor RSSFetcher {
 
     /// Extract excerpt from available fields in priority order.
     private func extractExcerpt(description: String?, content: String?) -> String {
-        let raw = description ?? content ?? ""
-        let stripped = Self.sanitizedHTMLText(raw)
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if stripped.isEmpty { return "No description" }
-        // Find last full word within 200 char limit
-        let capped = String(stripped.prefix(200))
-        if let lastSpace = capped.lastIndex(of: " "), lastSpace > capped.startIndex {
-            return String(capped[..<lastSpace]).trimmingCharacters(in: .whitespaces)
-        }
-        return capped
+        // The same rule every runtime path now uses (`FeedTextSanitizer.displayExcerpt`), so the legacy
+        // and the runtime feed strip markup the same way instead of each keeping its own copy of it.
+        let excerpt = FeedTextSanitizer.displayExcerpt(description ?? content ?? "")
+        return excerpt.isEmpty ? "No description" : excerpt
     }
 
     private static let imgTagRegex = try! NSRegularExpression(pattern: #"<img\b[^>]*>"#, options: .caseInsensitive)
@@ -1325,6 +1412,34 @@ enum FeedTextSanitizer {
         let range = NSRange(decodedMarkup.startIndex..., in: decodedMarkup)
         let stripped = htmlTagRegex.stringByReplacingMatches(in: decodedMarkup, range: range, withTemplate: " ")
         return decodeHTMLEntities(in: stripped)
+    }
+
+    private static let whitespaceRunRegex = try! NSRegularExpression(pattern: #"\s+"#)
+
+    /// The text a card shows for a payload's primary text — the one owner of "canonical text becomes
+    /// display text".
+    ///
+    /// The frozen payload keeps what the publisher published: `PublishedCardPayload.primaryText` carries
+    /// the publisher's HTML by design, because an immutable payload is what publication protects. The
+    /// stripping therefore belongs on the display side, and every runtime path that shows that text has
+    /// to come through here — the session card the presentation pipeline materializes, the bookmark
+    /// snapshot the user-state projection writes into `feedmine.sqlite`, and a canonical search row.
+    /// Until this existed, the legacy ingestion stripped markup (`extractExcerpt`) while every runtime
+    /// path forwarded it, so the same feed showed `<p>…` in `v2Full` and clean text in `legacy`.
+    /// Measured on screen on 2026-09-18 (`docs/runtime-v2/contract-matrix.md`'s screenshot note).
+    ///
+    /// Whitespace is collapsed and the result is cut to `limit` characters at a word boundary, which is
+    /// what `extractExcerpt` has always done for the legacy path.
+    static func displayExcerpt(_ raw: String, limit: Int = 200) -> String {
+        let sanitized = sanitizedHTMLText(raw)
+        let range = NSRange(sanitized.startIndex..., in: sanitized)
+        let collapsed = whitespaceRunRegex
+            .stringByReplacingMatches(in: sanitized, range: range, withTemplate: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > limit else { return collapsed }
+        let capped = String(collapsed.prefix(limit))
+        guard let lastSpace = capped.lastIndex(of: " "), lastSpace > capped.startIndex else { return capped }
+        return String(capped[..<lastSpace]).trimmingCharacters(in: .whitespaces)
     }
 
     /// A few publishers write an escaped CDATA wrapper inside an XML element

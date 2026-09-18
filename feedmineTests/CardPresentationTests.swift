@@ -64,84 +64,68 @@ final class CardPresentationTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
-    // MARK: - FeedItemCardView hasImage logic
+    // MARK: - Card media slot drives the image decision
 
-    func test_cardView_hasImage_true_whenPresentationHasImage() {
+    func test_cardView_hasImage_true_whenSlotHoldsLocalBytes() {
         let item = makeItem(id: "img", imageURL: "https://example.com/img.jpg")
-        let img = UIImage()
-        let pres = FeedCardPresentation(item: item, media: .image(img), layout: .hero,
-                                         isRead: false, isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertTrue(view.hasImageTest, "hasImage should be true with .image media")
-    }
-
-    func test_cardView_hasImage_false_whenPresentationIsPlaceholder() {
-        let item = makeItem(id: "ph", imageURL: "https://example.com/img.jpg")
-        let pres = FeedCardPresentation(item: item, media: .placeholder, layout: .textOnly,
-                                         isRead: false, isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertFalse(view.hasImageTest, "hasImage should be false with .placeholder media")
-    }
-
-    func test_cardView_hasImage_false_whenPresentationIsNone() {
-        let item = makeItem(id: "no", imageURL: "https://example.com/img.jpg")
-        let pres = FeedCardPresentation(item: item, media: .none, layout: .textOnly,
-                                         isRead: false, isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertFalse(view.hasImageTest, "hasImage should be false with .none media")
-    }
-
-    func test_cardView_hasImage_false_whenNoPresentation() {
-        // Even though the item has hasPotentialImage=true, without a presentation
-        // the card must not attempt to render an image — no download trigger.
-        let item = makeItem(id: "nopres", imageURL: "https://example.com/img.jpg")
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: nil)
-        XCTAssertFalse(view.hasImageTest, "hasImage must be false when presentation is nil — no speculative image slots")
-    }
-
-    func test_cardView_hasImage_false_whenItemHasNoPotentialImage() {
-        // Text-only item with no image URL and no resolvable article page
-        let item = FeedItem(
-            id: "textonly",
-            sourceTitle: "Test",
-            sourceURL: "https://example.com",
-            category: "News",
-            title: "Title",
-            excerpt: "Excerpt",
-            url: "https://example.com/article",
-            imageURL: nil,
-            publishedAt: Date(),
-            audioURL: nil,
-            duration: nil,
-            region: "imported",
-            language: nil,
-            updatedAt: nil,
-            authors: nil,
-            itemCategories: nil,
-            rights: nil,
-            attribution: nil,
-            enclosures: nil,
-            languageFromFeed: nil,
-            alternateLinks: nil
+        let image = RenderImage(cacheKey: "img", image: UIImage())
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .local(image)
         )
-        let pres = FeedCardPresentation(item: item, media: .none, layout: .textOnly,
-                                         isRead: false, isBookmarked: false)
-        let view = FeedItemCardView(item: item, isRead: false, isBookmarked: false,
-                                     presentation: pres)
-        XCTAssertFalse(view.hasImageTest, "Text-only items should never have an image slot")
+        XCTAssertTrue(view.hasImageTest, "hasImage should be true with local bytes")
+    }
+
+    func test_cardView_hasImage_false_whenSlotIsPlaceholder() {
+        let item = makeItem(id: "ph", imageURL: "https://example.com/img.jpg")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .placeholder(.podcast)
+        )
+        XCTAssertFalse(view.hasImageTest, "a placeholder must not activate the image slot")
+    }
+
+    func test_cardView_hasImage_false_whenSlotIsEmpty() {
+        let item = makeItem(id: "empty", imageURL: "https://example.com/img.jpg")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .empty
+        )
+        XCTAssertFalse(view.hasImageTest, "a reserved empty frame must not draw a stand-in image")
+    }
+
+    func test_cardView_hasImage_false_whenSlotIsAbsent() {
+        // Even though the item has an image URL, a card with no slot must not
+        // render an image — the slot is the only gate, never the item.
+        let item = makeItem(id: "nopres", imageURL: "https://example.com/img.jpg")
+        let view = FeedItemCardView(
+            item: item,
+            isRead: false,
+            isBookmarked: false,
+            mediaSlot: .none
+        )
+        XCTAssertFalse(view.hasImageTest, "no slot means no image, regardless of the item")
     }
 
     // MARK: - Terminal states: no .loading path
 
-    func test_resolvedCardMedia_hasNoLoadingState() {
-        // The ResolvedCardMedia enum must not have a .loading case —
-        // cards are published only when media is terminal.
-        let cases: [ResolvedCardMedia] = [.image(UIImage()), .placeholder, .none]
-        XCTAssertEqual(cases.count, 3, "ResolvedCardMedia has exactly 3 terminal states; no .loading")
+    func test_cardMediaSlot_hasNoLoadingStateAndOnlyLocalBytesAreAnImage() {
+        // The slot is terminal by construction: there is no `.loading`, and no case can start a
+        // download because none of them holds a URL. Only `.local` places bytes in the image slot.
+        let cases: [CardMediaSlot] = [
+            .local(RenderImage(cacheKey: "k", image: UIImage())),
+            .placeholder(.podcast),
+            .empty,
+            .none,
+        ]
+        XCTAssertEqual(cases.count, 4, "CardMediaSlot has exactly 4 terminal states; no .loading")
+        XCTAssertEqual(cases.filter { $0.localImage != nil }.count, 1, "only .local carries bytes")
     }
 
     // MARK: - FeedCardLayout terminal states

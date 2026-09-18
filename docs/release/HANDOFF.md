@@ -1,5 +1,19 @@
 # FeedMine 1.0 — handoff (start here in a fresh session)
 
+> **Read this first — dated 2026-09-18: this handoff describes the 1.0 / build-16 state and is two deliveries stale.**
+> Since it was written, build **17** was archived, uploaded and recorded (`b5c2f59c` on `fix/release-1.0-final-hardening`,
+> "docs(release): record the build 17 delivery and the main push"), and the tree now carries a large **uncommitted** body
+> of work — **Runtime V2** — that this document does not mention. Its OPEN items below (build 16's upload credentials, the
+> archive lane) are superseded; the credential recipe is kept because it is still the working one.
+>
+> **Where to start for the runtime work:** the plan
+> (`docs/superpowers/plans/2026-09-17-feedmine-runtime-v2-revised.md`), the measured record
+> (`docs/runtime-v2/baseline.md`, §8.50–§8.61 for 2026-09-18), the surfaces and the owner's four decisions
+> (`docs/runtime-v2/rollout.md` §2.5 and §7), and the contract matrix (`docs/runtime-v2/contract-matrix.md`). Its state:
+> **78 plan items marked, 5 open** (one owner decision plus four environment-gated), package gate **501 / 0**, app plan
+> **608 / 0**, boundary gate **PASS at 77 source files / 156 imports**, and **nothing committed** — the same standing
+> instruction the 1.0 session worked under.
+
 Repo: `/Users/wagnermontes/Documents/GitHub/feedmine`
 Branch: `fix/release-1.0-final-hardening`. The hardening tree was measured all session uncommitted; it is now committed as a
 single baseline (see §Baseline) — **every green below carries the commit it belongs to**.
@@ -145,9 +159,63 @@ children and the Sources phase, no build-setting/scheme/workspace edits, no UUID
   test-side (fixed `Task.sleep(200ms)` sampling, a process-wide `taxonomy_cache.json`, and now the shared filter state —
   see `normalizeSharedFilterStateForTests()`).
 
-## First actions in the new session, in order
+## Runtime V2 — where this stands (2026-09-18)
 
-1. **Upload build 16** (archive + export, `destination: upload`) and confirm `Upload succeeded` + `VALID` on App Store
-   Connect.
-2. Then Latency case A (item 2 above) — classification is done; the page-clear semantics are the target, not the query.
-3. Empty the backlog: the reload-drop question (item 3), then the nine suites (item 4/5) if the patch is to land at all.
+**This is not the 1.0 release line; it is the local runtime that replaces the legacy orchestration.** The plan is
+`docs/superpowers/plans/2026-09-17-feedmine-runtime-v2-revised.md`, the evidence is `docs/runtime-v2/baseline.md`
+(§8.1–§8.62 — every claim measured on a device or in a container, never argued), the per-surface remainder is
+`docs/runtime-v2/rollout.md`, and the gate is `bash scripts/validation/run_runtime_v2_tests.sh` — **package 501/0 and app
+608/0, green after every change below** — with `feedmineUITests/RuntimeV2BookmarkWindowTests` as the surface proof.
+
+### Proven, with where the evidence lives
+
+- **The Main Feed's composition, acquisition, publication, exposure, bookmarks and read state run on V2** — §8.17–§8.61.
+- **A bookmark's save path is end to end** (§8.60): the authority row in `user.sqlite`, the projection in
+  `feedmine.sqlite`, and the runtime's own `user_list_membership` + `legacy_item_map`, read out of the device's container.
+- **A bookmark box's content path is complete** (§8.59–§8.61): `SubjectSelection.savedSubjects(kind:listKey:)`, the app's
+  write of the list key, the plan field that carries it, and a session of the box's own.
+- **The box's surface draws its saved cards with its own control** (§8.62, run 9): `card.bookmarkBox` — inside a box the
+  control is a menu, not the feed's toggle, and it had no identifier at all until this slice.
+
+### What this session found, each with the measurement that found it (§8.62)
+
+1. **A session that claimed a selection before it could start blanked the screen** and removed the legacy page for that
+   selection — the failure mode was *no* page, not today's behaviour. Fixed: `beginSession(drawingLegacyUntilSnapshot:)`,
+   passed by the adoption and by a re-attach while a box the reader opened is on screen.
+2. **A session reused the runtime's `sessionStamp`.** `FeedScreenStore.apply` accepts by stamp and only breaks ties inside
+   one stamp by sequence, so a second session's first snapshot (sequence 1) was refused as older than the first's (4+).
+   Fixed: the stamp is minted per session, in `V2FullRuntime.start`.
+3. **A successor composition on a box published nothing.** The repetition window sequences a refresh against what the
+   context already published — and a box's content *is* that set, so it came back `decision=empty` and replaced four cards
+   with none. Fixed: a plan whose cards are the reader's own subjects is exempt from that window (ADR-007 D12 already
+   says a bookmark scope may not exclude).
+4. **A session's `watch` replaced the shared acquisition catalogue.** `startSession` re-read the loader's enabled set, so a
+   box's session registered 1 target over the launch's 32 and every later episode ran against that one. Fixed: the
+   launch's descriptor set is stated once and reused.
+5. **A stored edition with no cards counted as "something compatible to show"**, so it short-circuited every later
+   composition. Fixed in the reducer: an empty restored edition asks for a composition.
+
+### Open
+
+- **`compose` throws into a counter with no log.** `RuntimeFeedSessionComposer.compose` throws `planUnavailable` /
+   `planContextMismatch`, and `FeedSession.performCompose` catches into `statistics.compositionFailures` — the one path
+   that would state "I could not compose" is the one the log cannot show. Three of the five defects above needed a
+  database and a log dig partly because of it.
+- **`runtime-v2 source-bridge-write-failed catalogSourceID=0`.** A catalogue key whose identity derives to 0 is refused by
+  `legacy_source_map`'s `CHECK (catalog_source_id > 0)`, and the source is refused with it: that source is never acquired
+  in such a launch. The refusal is by design; the derivation is not, and the key that derives 0 is not yet named.
+- **The plan's own open DoD items** (`docs/superpowers/plans/2026-09-17-feedmine-runtime-v2-revised.md` §17), whose
+  per-surface remainder is `rollout.md` §2.5, with two named decisions: `source`'s runtime identity, and the
+  canonical-hit overlay.
+
+### Next steps, in order
+
+1. **Re-run the box proof from a clean build** and confirm the three fixes above land it. The UI test skips with the
+   reason instead of failing while they do not: `bash scripts/validation/clean_validation_artifacts.sh --build`, then
+   `xcodebuild test -only-testing:feedmineUITests/RuntimeV2BookmarkWindowTests`.
+2. **Give the composer's failure path a log line** — cheap, and it is what made three of the five defects above cost a
+   container dig each.
+3. **Name the catalogue key whose `CatalogIdentity.sourceID` derives 0** and refuse it where the descriptor is built,
+   rather than where the row is written.
+4. **Then the plan's remaining DoD items**, per `rollout.md` §2.5.
+

@@ -65,22 +65,19 @@ final class BookmarkStore {
         }
     }
 
+    /// Legacy entry point. The user-visible action is still a toggle, but the write goes through the
+    /// idempotent primitive so every change is logged as an operation with an id (plan §5.2 step 4).
+    /// PR-13 replaces this call site with an explicit `wanted` computed by the session, at which point a
+    /// retry can be a replay instead of a fresh toggle.
     func toggleBookmark(itemID: String, listID: Int64? = nil) async throws {
         let targetListID = listID ?? defaultListID()
-        try await userDB.write { db in
-            let existing = try BookmarkItemRecord
-                .filter(Column("list_id") == targetListID && Column("item_id") == itemID)
-                .fetchCount(db)
-            if existing > 0 {
-                try db.execute(sql: "DELETE FROM bookmark_item WHERE list_id = ? AND item_id = ?",
-                              arguments: [targetListID, itemID])
-            } else {
-                try db.execute(sql: """
-                    INSERT INTO bookmark_item (list_id, item_id, added_at) VALUES (?, ?, ?)
-                """, arguments: [targetListID, itemID, Int(Date().timeIntervalSince1970)])
-            }
-        }
-        try await synchronizeRetentionPin(itemID: itemID)
+        let currentlySaved = try await isBookmarked(itemID: itemID, listID: targetListID)
+        _ = try await setBookmarked(
+            itemID: itemID,
+            wanted: !currentlySaved,
+            operationID: UUID().uuidString,
+            listID: targetListID
+        )
     }
 
     func isBookmarked(itemID: String, listID: Int64? = nil) async throws -> Bool {
@@ -186,6 +183,235 @@ final class BookmarkStore {
         }
     }
 
+    // MARK: - Idempotent operations and durable snapshots (Runtime V2, plan §5.2)
+
+    /// Writes a bookmark intention idempotently.
+    ///
+    /// `wanted` is absolute (`true` = save, `false` = remove): a retry with the same `operationID` is a
+    /// no-op, which is what makes recovery safe — there is no toggle to repeat. The intention, the
+    /// authoritative `bookmark_item` row and the snapshot commit together in `user.sqlite`; projections
+    /// (the legacy retention pin) run afterwards and their failure is recorded, not swallowed.
+    @discardableResult
+    func setBookmarked(
+        itemID: String,
+        wanted: Bool,
+        operationID: String,
+        listID: Int64? = nil,
+        snapshot: BookmarkSnapshot? = nil,
+        kind: String = "bookmark.set",
+        at: Date = Date()
+    ) async throws -> BookmarkOperationState {
+        let targetListID = listID ?? defaultListID()
+        let timestamp = Int(at.timeIntervalSince1970)
+
+        let alreadyApplied = try await userDB.write { db -> Bool in
+            let existing = try String.fetchOne(
+                db,
+                sql: "SELECT state FROM user_operation WHERE operation_id = ?",
+                arguments: [operationID]
+            )
+            if existing == BookmarkOperationState.applied.rawValue { return true }
+
+            try db.execute(sql: """
+                INSERT INTO user_operation
+                    (operation_id, kind, subject_id, payload_json, state, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(operation_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    state = excluded.state,
+                    failure_reason = NULL
+                """, arguments: [
+                    operationID, kind, itemID,
+                    Self.operationPayload(wanted: wanted, listID: targetListID),
+                    BookmarkOperationState.pending.rawValue, timestamp
+                ])
+
+            if wanted {
+                try db.execute(sql: """
+                    INSERT OR IGNORE INTO bookmark_item (list_id, item_id, added_at)
+                    VALUES (?, ?, ?)
+                    """, arguments: [targetListID, itemID, timestamp])
+                if let snapshot {
+                    try db.execute(sql: """
+                        INSERT INTO bookmark_snapshot
+                            (list_id, item_id, title, url, source_title, source_url,
+                             excerpt, media_url, authored_at, captured_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(list_id, item_id) DO UPDATE SET
+                            title = excluded.title,
+                            url = excluded.url,
+                            source_title = excluded.source_title,
+                            source_url = excluded.source_url,
+                            excerpt = excluded.excerpt,
+                            media_url = excluded.media_url,
+                            authored_at = excluded.authored_at
+                        """, arguments: [
+                            targetListID, itemID, snapshot.title, snapshot.url,
+                            snapshot.sourceTitle, snapshot.sourceURL, snapshot.excerpt,
+                            snapshot.mediaURL,
+                            snapshot.authoredAt.map { Int($0.timeIntervalSince1970) },
+                            timestamp
+                        ])
+                }
+            } else {
+                try db.execute(sql: "DELETE FROM bookmark_item WHERE list_id = ? AND item_id = ?",
+                              arguments: [targetListID, itemID])
+                try db.execute(sql: "DELETE FROM bookmark_snapshot WHERE list_id = ? AND item_id = ?",
+                              arguments: [targetListID, itemID])
+            }
+            return false
+        }
+
+        if alreadyApplied { return .applied }
+
+        do {
+            try await synchronizeRetentionPin(itemID: itemID)
+        } catch {
+            let reason = "retention projection failed: \(error.localizedDescription)"
+            try? await markOperation(operationID, state: .failed, reason: reason, at: at)
+            return .failed
+        }
+
+        try await markOperation(operationID, state: .applied, reason: nil, at: at)
+        return .applied
+    }
+
+    func markOperation(
+        _ operationID: String,
+        state: BookmarkOperationState,
+        reason: String?,
+        at: Date
+    ) async throws {
+        try await userDB.write { db in
+            try db.execute(sql: """
+                UPDATE user_operation SET state = ?, failure_reason = ?, applied_at = ?
+                WHERE operation_id = ?
+                """, arguments: [
+                    state.rawValue, reason,
+                    state == .applied ? Int(at.timeIntervalSince1970) : nil,
+                    operationID
+                ])
+        }
+    }
+
+    /// Every stored operation the runtime has not applied yet, oldest first.
+    func unappliedOperations() async -> [BookmarkOperationRecord] {
+        (try? await userDB.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT operation_id, kind, subject_id, payload_json, state, created_at,
+                       applied_at, failure_reason
+                FROM user_operation
+                WHERE state != ?
+                ORDER BY created_at ASC, operation_id ASC
+                """, arguments: [BookmarkOperationState.applied.rawValue]).map(Self.operationRecord(from:))
+        }) ?? []
+    }
+
+    /// The newest operation per subject, which is the only one that decides the current state. Used by
+    /// the bridge's reconciliation instead of a "was this projected?" flag, because a crash between the
+    /// two databases leaves no such flag behind.
+    func newestOperationsBySubject(kind: String = "bookmark.set") async -> [BookmarkOperationRecord] {
+        (try? await userDB.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT operation_id, kind, subject_id, payload_json, state, created_at,
+                       applied_at, failure_reason
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY subject_id ORDER BY created_at DESC, operation_id DESC
+                    ) AS row_number
+                    FROM user_operation WHERE kind = ?
+                ) WHERE row_number = 1
+                """, arguments: [kind]).map(Self.operationRecord(from:))
+        }) ?? []
+    }
+
+    func bookmarkSnapshots(listID: Int64? = nil) async throws -> [BookmarkSnapshot] {
+        let targetListID = listID ?? defaultListID()
+        return try await userDB.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT list_id, item_id, title, url, source_title, source_url,
+                       excerpt, media_url, authored_at, captured_at
+                FROM bookmark_snapshot WHERE list_id = ?
+                ORDER BY captured_at DESC
+                """, arguments: [targetListID]).map(Self.snapshot(from:))
+        }
+    }
+
+    func bookmarkSnapshot(itemID: String, listID: Int64? = nil) async throws -> BookmarkSnapshot? {
+        let targetListID = listID ?? defaultListID()
+        return try await userDB.read { db in
+            try Row.fetchOne(db, sql: """
+                SELECT list_id, item_id, title, url, source_title, source_url,
+                       excerpt, media_url, authored_at, captured_at
+                FROM bookmark_snapshot WHERE list_id = ? AND item_id = ?
+                """, arguments: [targetListID, itemID]).map(Self.snapshot(from:))
+        }
+    }
+
+    /// What a bookmark list looks like right now: items the content database can still hydrate, plus the
+    /// ones whose content row is gone and whose snapshot must stand in for it.
+    func hydration(listID: Int64? = nil) async throws -> BookmarkHydration {
+        let targetListID = listID ?? defaultListID()
+        let itemIDs: [String] = try await userDB.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT item_id FROM bookmark_item WHERE list_id = ? ORDER BY added_at DESC
+            """, arguments: [targetListID])
+        }
+        guard !itemIDs.isEmpty else { return BookmarkHydration(items: [], snapshotOnly: []) }
+
+        let hydrated = try await contentDB.read { db in
+            try FeedItemRecord
+                .filter(itemIDs.contains(Column("id")))
+                .fetchAll(db)
+                .map { $0.toFeedItem() }
+        }
+        let itemByID = Dictionary(uniqueKeysWithValues: hydrated.map { ($0.id, $0) })
+        let snapshots = try await bookmarkSnapshots(listID: targetListID)
+        let snapshotByID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.itemID, $0) })
+
+        return BookmarkHydration(
+            items: itemIDs.compactMap { itemByID[$0] },
+            snapshotOnly: itemIDs.filter { itemByID[$0] == nil }.compactMap { snapshotByID[$0] }
+        )
+    }
+
+    private nonisolated static func operationPayload(wanted: Bool, listID: Int64) -> String {
+        // Small, explicit and stable: replay compares the operation id, not this payload.
+        "{\"listID\":\(listID),\"wanted\":\(wanted ? "true" : "false")}"
+    }
+
+    private nonisolated static func operationRecord(from row: Row) -> BookmarkOperationRecord {
+        let payload = row["payload_json"] as String
+        let wanted = payload.contains("\"wanted\":true")
+        let listID = Int64(payload.split(separator: ":").last?.prefix(while: { $0.isNumber }) ?? "") ?? 0
+        return BookmarkOperationRecord(
+            operationID: row["operation_id"],
+            kind: row["kind"],
+            subjectID: row["subject_id"],
+            wanted: wanted,
+            listID: listID,
+            state: BookmarkOperationState(rawValue: row["state"]) ?? .pending,
+            createdAt: Date(timeIntervalSince1970: row["created_at"]),
+            appliedAt: (row["applied_at"] as Int64?).map { Date(timeIntervalSince1970: Double($0)) },
+            failureReason: row["failure_reason"]
+        )
+    }
+
+    private nonisolated static func snapshot(from row: Row) -> BookmarkSnapshot {
+        BookmarkSnapshot(
+            itemID: row["item_id"],
+            listID: row["list_id"],
+            title: row["title"],
+            url: row["url"],
+            sourceTitle: row["source_title"],
+            sourceURL: row["source_url"],
+            excerpt: row["excerpt"],
+            mediaURL: row["media_url"],
+            authoredAt: (row["authored_at"] as Int64?).map { Date(timeIntervalSince1970: Double($0)) },
+            capturedAt: Date(timeIntervalSince1970: row["captured_at"])
+        )
+    }
+
     // MARK: - Retention bridge
 
     /// `user.sqlite` owns bookmark identity.  The legacy content database still
@@ -211,7 +437,14 @@ final class BookmarkStore {
         }
     }
 
-    private func synchronizeRetentionPin(itemID: String) async throws {
+    /// Mirrors one bookmark into the content database's own pin table, and removes it again when the
+    /// bookmark is gone. The pin is what keeps the legacy retention pass from evicting a saved article.
+    ///
+    /// The insert selects the `feed_item` row, so it pins nothing while that row is absent — which is
+    /// the normal state for content only the runtime ever acquired. A caller that projects such a row
+    /// calls this again after writing it (`RuntimeCardUserActions`) and gets the pin then; the call is
+    /// idempotent, so it is safe on every path.
+    func synchronizeRetentionPin(itemID: String) async throws {
         let isPinned = try await userDB.read { db in
             try Int.fetchOne(
                 db,

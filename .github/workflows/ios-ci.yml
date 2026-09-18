@@ -6,13 +6,46 @@ on:
     paths:
       - 'feedmine/**'
       - 'feedmineTests/**'
+      - 'feedmineUITests/**'
+      - 'Packages/**'
+      - 'feedmine.xcodeproj/**'
+      - 'TestPlans/**'
+      - 'scripts/**'
+      - 'project.yml'
       - '.github/workflows/ios-ci.yml'
   pull_request:
     paths:
       - 'feedmine/**'
       - 'feedmineTests/**'
+      - 'feedmineUITests/**'
+      - 'Packages/**'
+      - 'feedmine.xcodeproj/**'
+      - 'TestPlans/**'
+      - 'scripts/**'
+      - 'project.yml'
+      - '.github/workflows/ios-ci.yml'
 
 jobs:
+  runtime-v2:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # The architecture gate is a build gate: a violation must fail the PR, not be reviewed.
+      - name: Runtime V2 module boundaries
+        run: |
+          bash scripts/verify-runtime-v2-boundaries.sh
+          bash scripts/validation/test_runtime_v2_boundaries.sh
+
+      # Declared macOS host suite for the core plus the iOS app suite, with a floor on executed
+      # tests: `swift test` does not replace the iOS run, and neither half may pass empty.
+      # The destination is discovered by the runner itself (it prefers an iPhone simulator and
+      # accepts FEEDMINE_DESTINATION to pin one), so this job presumes no device name.
+      - name: Runtime V2 tests (package host suite + app plan)
+        run: bash scripts/validation/run_runtime_v2_tests.sh
+
   identity-contract:
     runs-on: macos-15
     steps:
@@ -20,13 +53,37 @@ jobs:
         with:
           lfs: true
 
+      # Plan §15: discover a destination instead of presuming one. `resolve_destination.py` exists
+      # because `-showdestinations` prints the brace form while `-destination` wants `key=value`, and a
+      # YAML `run: |` block cannot hold the extraction inline.
+      - name: Resolve an iOS simulator destination
+        run: |
+          set -o pipefail
+          DEST=$(xcodebuild -showdestinations -project feedmine.xcodeproj -scheme feedmine 2>/dev/null \
+            | python3 scripts/validation/resolve_destination.py)
+          if [ -z "$DEST" ]; then
+            echo "::error::no iOS Simulator destination is available on this runner"
+            exit 1
+          fi
+          echo "resolved destination: $DEST"
+          echo "FEEDMINE_DESTINATION=$DEST" >> "$GITHUB_ENV"
+
       - name: Fast identity contract test
         run: |
+          set -o pipefail
           xcodebuild test \
             -project feedmine.xcodeproj \
             -scheme feedmine \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
-            -only-testing:feedmineTests/CatalogIdentityContractTests
+            -destination "$FEEDMINE_DESTINATION" \
+            -only-testing:feedmineTests/CatalogIdentityContractTests 2>&1 | tee identity.log
+          # Plan §15: a green run that selected zero tests fails the gate. The class holds 19 tests
+          # today; the floor is a floor, not a target.
+          executed=$(grep -Eo "Executed [0-9]+ tests" identity.log | grep -Eo "[0-9]+" | sort -n | tail -1 || true)
+          if [ -z "${executed:-}" ] || [ "$executed" -lt "${FEEDMINE_MIN_IDENTITY_TESTS:-15}" ]; then
+            echo "::error::the run executed ${executed:-0} tests, below the floor of ${FEEDMINE_MIN_IDENTITY_TESTS:-15}"
+            exit 1
+          fi
+          echo "executed $executed tests"
 
   full-suite:
     runs-on: macos-15
@@ -35,16 +92,38 @@ jobs:
         with:
           lfs: true
 
+      - name: Resolve an iOS simulator destination
+        run: |
+          set -o pipefail
+          DEST=$(xcodebuild -showdestinations -project feedmine.xcodeproj -scheme feedmine 2>/dev/null \
+            | python3 scripts/validation/resolve_destination.py)
+          if [ -z "$DEST" ]; then
+            echo "::error::no iOS Simulator destination is available on this runner"
+            exit 1
+          fi
+          echo "resolved destination: $DEST"
+          echo "FEEDMINE_DESTINATION=$DEST" >> "$GITHUB_ENV"
+
       - name: Run full unit test suite
         run: |
           set -o pipefail
           xcodebuild test \
             -project feedmine.xcodeproj \
             -scheme feedmine \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination "$FEEDMINE_DESTINATION" \
             -testPlan FeedMine-ReleaseValidation 2>&1 | tee xcodebuild.log
           # Fail on build or test failures
           if grep -qE "BUILD FAILED|Testing failed|xcodebuild: error:" xcodebuild.log; then
             echo "::error::Build or test failures detected"
             exit 1
           fi
+          # Plan §15, the other half of the same rule: a green run that selected zero tests is a
+          # failure too, which is how "BUILD SUCCEEDED" once reported a gate that ran nothing. The
+          # largest count is the all-tests total (each suite's own line is a partition of it); the
+          # app's unit half alone is 590 today, so 400 is a floor, not a target.
+          executed=$(grep -Eo "Executed [0-9]+ tests" xcodebuild.log | grep -Eo "[0-9]+" | sort -n | tail -1 || true)
+          if [ -z "${executed:-}" ] || [ "$executed" -lt "${FEEDMINE_MIN_FULL_SUITE_TESTS:-400}" ]; then
+            echo "::error::the run executed ${executed:-0} tests, below the floor of ${FEEDMINE_MIN_FULL_SUITE_TESTS:-400}"
+            exit 1
+          fi
+          echo "executed $executed tests"

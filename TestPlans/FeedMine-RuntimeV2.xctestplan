@@ -1,0 +1,30 @@
+{
+  "configurations": [
+    {
+      "id": "32422D39-9B2D-450C-AE98-38BDFD751B8D",
+      "name": "Default",
+      "options": {}
+    }
+  ],
+  "defaultOptions": {
+    "codeCoverage": false,
+    "defaultTestExecutionTimeAllowance": 300,
+    "maximumTestExecutionTimeAllowance": 1200,
+    "targetForVariableExpansion": {
+      "containerPath": "container:feedmine.xcodeproj",
+      "identifier": "057DBDD4C964DDBA254C0BA5",
+      "name": "feedmine"
+    }
+  },
+  "testTargets": [
+    {
+      "parallelizable": false,
+      "target": {
+        "containerPath": "container:feedmine.xcodeproj",
+        "identifier": "58CAC5F0FAA8580D56CC16D4",
+        "name": "feedmineTests"
+      }
+    }
+  ],
+  "version": 1
+}

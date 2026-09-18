@@ -73,7 +73,12 @@ final class CatalogPerformanceTests: XCTestCase {
             let expectation = self.expectation(description: "paginate")
             Task {
                 // This triggers actual SQLite query and Reservoir interleave
-                _ = await store.search("Technology", includeSources: true, includeContents: true)
+                _ = await store.search(
+                    "Technology",
+                    includeSources: true,
+                    includeContents: true,
+                    demandOnlineContent: true
+                )
                 let visible = store.visibleItems
                 XCTAssertFalse(visible.isEmpty, "Timeline must have content after recomposition")
                 expectation.fulfill()

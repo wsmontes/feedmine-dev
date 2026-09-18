@@ -1,20 +1,29 @@
 import SwiftUI
+import FeedDomain
 
 struct FeedItemRowView: View {
     let item: FeedItem
     let isRead: Bool
     let isBookmarked: Bool
-    /// Pre-resolved card presentation from the pipeline. When non-nil and
-    /// media is .image, renders via PreparedCardImage instead of CachedAsyncImage.
-    var presentation: FeedCardPresentation? = nil
+    /// The media decision for this row: local bytes, a deterministic placeholder, a reserved empty
+    /// frame, or no slot at all (PR-13). The row never inspects `item` to decide what the thumbnail
+    /// holds, and there is no `.loading` state and no URL, so it cannot start a download.
+    var mediaSlot: CardMediaSlot = .none
+    /// The chrome the runtime decided: placeholder kind and what the media slot does on a tap.
+    var affordances: CardPresentation.Affordances = .undecided
     var onImageTap: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            // Thumbnail — real image, podcast placeholder, or nothing
-            if item.hasPotentialImage || item.isPodcast {
+            // Thumbnail — local bytes, the compact podcast surface, or a reserved empty frame
+            if mediaSlot.reservesFrame {
                 Group {
-                    if item.isPodcast && !item.hasPotentialImage {
+                    switch mediaSlot {
+                    case .local(let image):
+                        Image(uiImage: image.image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    case .placeholder(.podcast):
                         RoundedRectangle(cornerRadius: 8)
                             .fill(Color.purple.opacity(0.15))
                             .overlay {
@@ -23,20 +32,16 @@ struct FeedItemRowView: View {
                                     .foregroundStyle(Color.purple.opacity(0.5))
                                     .offset(x: 1)
                             }
-                    } else if let pres = presentation, case .image = pres.media {
-                        PreparedCardImage(media: pres.media)
-                            .aspectRatio(contentMode: .fill)
-                    } else if presentation == nil {
-                        // No presentation yet — show content-type placeholder
-                        // while the pipeline resolves. Once resolved, the card
-                        // will be .image (rendered above) or .none (no slot).
-                        contentTypePlaceholderImage
+                    case .placeholder(let kind):
+                        placeholderImage(kind)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                             .opacity(0.5)
+                    // A reserved frame with nothing to draw keeps the surface stable and shows no
+                    // stand-in asset: a fake thumbnail is worse than an empty one.
+                    case .empty, .none:
+                        Color.clear
                     }
-                    // If presentation exists but media is .placeholder/.none:
-                    // don't render a fake thumbnail — the card isn't ready.
                 }
                 .frame(width: 56, height: 56)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -88,18 +93,16 @@ struct FeedItemRowView: View {
         .opacity(isRead ? 0.7 : 1)
     }
 
-    /// Decorative placeholder asset keyed to the item's content type and the
-    /// active circadian palette, e.g. "Placeholder-Video-amber".
-    private var contentTypePlaceholderImage: Image {
+    /// Decorative placeholder asset for one content kind and the active circadian palette, e.g.
+    /// "Placeholder-Video-amber". The kind is the presentation's decision (PR-13); this only turns it
+    /// into an asset name.
+    private func placeholderImage(_ kind: PlaceholderKind) -> Image {
         let suffix = CircadianEngine.shared.paletteFamily.placeholderSuffix
-        if item.isYouTube {
-            return Image("Placeholder-Video-\(suffix)")
-        } else if item.isPodcast {
-            return Image("Placeholder-Podcast-\(suffix)")
-        } else if item.isForum {
-            return Image("Placeholder-Forum-\(suffix)")
-        } else {
-            return Image("Placeholder-Article-\(suffix)")
+        switch kind {
+        case .video: return Image("Placeholder-Video-\(suffix)")
+        case .podcast: return Image("Placeholder-Podcast-\(suffix)")
+        case .forum: return Image("Placeholder-Forum-\(suffix)")
+        case .article: return Image("Placeholder-Article-\(suffix)")
         }
     }
 

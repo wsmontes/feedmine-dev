@@ -5,8 +5,14 @@ struct FeedScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(FeedLoader.self) private var loader
+    /// The launch's runtime: which mode is running, and the observations/intents this screen may
+    /// produce (PR-13). The mode is fixed at launch, so nothing here re-decides it.
+    @Environment(MainFeedRuntime.self) private var runtime
     @State private var articleItem: FeedItem?
-    @State private var lastScrollIndex: Int = 0
+    /// The last item the viewport observation saw, in the page's own order. It is what the persisted
+    /// scroll position is written from (the card identity of ADR-001 is carried by the legacy id until
+    /// the runtime allocates one — PR-14).
+    @State private var lastVisibleItemID: String?
     /// Uncommitted text in the field. It does not trigger a search until Return
     /// or the add button turns it into a tag.
     @State private var searchText = ""
@@ -61,6 +67,11 @@ struct FeedScreen: View {
     @State private var didRecordFirstUsefulContent = false
     @State private var player = AudioPlayerManager.shared
 
+    /// The empty surface for a selection the runtime does not own, from the legacy page's own state:
+    /// preset and taxonomy filters, whether a filtered composition is in flight, and what the page has
+    /// actually fetched so far. It is only read by `legacyFeedContent`; the surface the session owns
+    /// states its empty variant itself (`MainFeedSessionSurface.empty`), because the snapshot carries no
+    /// filters and the runtime's own acquisition counters are not part of it.
     private var emptyMode: FeedEmptyMode {
         let activeTopic = (loader.activePreset.isSmartFeed || loader.activePreset.isCuratedFeed)
             ? loader.activePreset.displayName
@@ -93,6 +104,17 @@ struct FeedScreen: View {
         return .generic
     }
 
+    /// The number of cards the page the reader is on is drawing, in that page's own terms: the session's
+    /// published cards for the surface the session owns, the legacy page's items everywhere else.
+    ///
+    /// It is the subject of the "first useful content" metric, which used to read the legacy page in
+    /// every mode — in `v2Full` that page is the cached one, so the interval it measured was not the one
+    /// the reader saw.
+    private var surfaceContentCount: Int {
+        guard let surface = runtime.sessionSurface else { return loader.items.count }
+        return surface == .content ? runtime.presentation.ordinalCount : 0
+    }
+
     var body: some View {
         screenWithSheets
     }
@@ -109,27 +131,10 @@ struct FeedScreen: View {
 
             if isSearching && hasCommittedSearch {
                 unifiedSearchPanel
+            } else if let session = runtime.sessionSurface {
+                sessionFeedContent(session)
             } else {
-                switch loader.feedDisplayPhase {
-                case .preparing where !loader.items.isEmpty:
-                    // The store keeps the displayed page while a rebuild runs, and setFilter /
-                    // manualRefresh both enter `.preparing`. Swapping to the loading screen here
-                    // would blank a feed the user is already reading; the page stays until the new
-                    // composition lands.
-                    feedScrollView
-                case .preparing:
-                    InitialFeedLoadingView()
-                case .ready where loader.items.isEmpty:
-                    FeedEmptyStateView(mode: emptyMode)
-                case .ready:
-                    feedScrollView
-                case .empty where loader.items.isEmpty:
-                    FeedEmptyStateView(mode: emptyMode)
-                case .empty:
-                    feedScrollView
-                case .failed:
-                    FeedEmptyStateView(mode: .generic)
-                }
+                legacyFeedContent
             }
 
             // Floating compact header
@@ -139,10 +144,18 @@ struct FeedScreen: View {
                 Spacer()
             }
 
-            // Shake detector
-            ShakeDetector { loader.shakeToRefresh() }
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
+            // Shake detector. On the surface the session owns, the refresh is the session's: the legacy
+            // store's own refresh is refused by `LegacyAcquisitionGate` in that mode, so the gesture
+            // would otherwise do nothing at all.
+            ShakeDetector {
+                if runtime.sessionSurface != nil {
+                    Task { await runtime.refresh() }
+                } else {
+                    loader.shakeToRefresh()
+                }
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
 
             // Mini player bar — full-width bottom bar, always on top
             VStack {
@@ -157,13 +170,76 @@ struct FeedScreen: View {
         }
     }
 
+    /// The feed's content for a selection this launch's runtime owns (plan §17, DoD2).
+    ///
+    /// Everything the surface says about itself — whether there is a page, whether it is empty, which
+    /// empty surface to show — is the session boundary's own statement, and the rows are the session's
+    /// snapshots. Nothing here reads the legacy loader: it keeps running in this mode (hydration,
+    /// filters, taxonomy, the cached page) but it is not this surface's source of truth, and the page it
+    /// holds for this selection is the cached one.
+    @ViewBuilder
+    private func sessionFeedContent(_ surface: MainFeedSessionSurface) -> some View {
+        switch surface {
+        case .preparing:
+            // The loading chrome on this surface is the runtime's own statement. The legacy startup
+            // runway's counters are not read here at all — in this mode the legacy engine's requests are
+            // refused by the gate, so those counters are not this launch's acquisition.
+            InitialFeedLoadingView(session: runtime.sessionLoadingStatement)
+        case .content:
+            // A refresh in flight does not empty this surface: the session keeps its last snapshot until
+            // the next one lands, so the page the reader is on stays until there is a new one.
+            feedScrollView(legacyPageFallback: false)
+        case .empty(let mode):
+            // The empty surface on this selection is the runtime's own statement — the variant the
+            // session states plus its acquisition where the legacy wording owed a source count. The
+            // legacy loader's counters are not read here at all: in this mode its page is the cached
+            // one and its fetches are refused by the gate.
+            FeedEmptyStateView(
+                mode: mode,
+                onRefresh: { await runtime.refresh() },
+                session: runtime.sessionEmptyStatement
+            )
+        }
+    }
+
+    /// The feed's content for a selection the runtime does not own — and for every mode but the
+    /// acquiring one, unchanged from before this slice.
+    ///
+    /// The phase, the emptiness and the empty-state variant come from the legacy loader's own page,
+    /// which is the page that selection actually has. In `v2Full` too: the gate refuses *fetches*
+    /// (`RSSFetcher.performFetch`), and the store's local content, filters and taxonomy keep working, so
+    /// a bookmark box or a Smart Feed still draws its own articles.
+    @ViewBuilder
+    private var legacyFeedContent: some View {
+        switch loader.feedDisplayPhase {
+        case .preparing where !loader.items.isEmpty:
+            // The store keeps the displayed page while a rebuild runs, and setFilter /
+            // manualRefresh both enter `.preparing`. Swapping to the loading screen here
+            // would blank a feed the user is already reading; the page stays until the new
+            // composition lands.
+            feedScrollView(legacyPageFallback: !loader.items.isEmpty)
+        case .preparing:
+            InitialFeedLoadingView()
+        case .ready where loader.items.isEmpty:
+            FeedEmptyStateView(mode: emptyMode)
+        case .ready:
+            feedScrollView(legacyPageFallback: !loader.items.isEmpty)
+        case .empty where loader.items.isEmpty:
+            FeedEmptyStateView(mode: emptyMode)
+        case .empty:
+            feedScrollView(legacyPageFallback: !loader.items.isEmpty)
+        case .failed:
+            FeedEmptyStateView(mode: .generic)
+        }
+    }
+
     private var lifecycleObservedScreen: some View {
         screenContent
         .task {
             await startScreen()
         }
         .onAppear { recordFirstScreenMetric() }
-        .onChange(of: loader.items.count) { _, count in recordFirstUsefulContentMetric(count: count) }
+        .onChange(of: surfaceContentCount) { _, count in recordFirstUsefulContentMetric(count: count) }
         .onChange(of: scenePhase) { _, phase in handleScenePhase(phase) }
         .onReceive(NotificationCenter.default.publisher(for: .onboardingDidSaveCuratedFeed)) { notification in
             let name = notification.userInfo?["feedName"] as? String ?? "Your mix"
@@ -189,6 +265,10 @@ struct FeedScreen: View {
         }
         .onChange(of: searchIncludesContents) { _, value in
             loader.searchIncludesContents = value
+            // The online sweep is a separate demand (PR-14 item 2): it follows the reader's switch
+            // that already meant "walk the live endpoints", and it is never implied by the local FTS
+            // running. `FeedStore.search` takes it as its own parameter.
+            loader.searchDemandsOnlineContent = value
             if !searchTerms.isEmpty {
                 loader.submitSearchTerms(searchTerms)
             }
@@ -412,7 +492,9 @@ struct FeedScreen: View {
                 if showDebugBar {
                     CompactDebugInfo()
                 } else {
-                    CompactFeedStatus()
+                    // The chip is drawn for the whole screen, so on the page the session owns it is the
+                    // session's in every state of that surface — preparing, content and empty.
+                    CompactFeedStatus(session: runtime.sessionChipStatement)
                 }
 
                 Spacer()
@@ -422,8 +504,7 @@ struct FeedScreen: View {
                         if isSearching {
                             closeSearch()
                         } else {
-                            loader.searchIncludesSources = searchIncludesSources
-                            loader.searchIncludesContents = searchIncludesContents
+                            applySearchScopeToLoader()
                             withAnimation(.easeInOut(duration: 0.3)) { isSearching = true }
                             searchFocused = true
                         }
@@ -441,6 +522,7 @@ struct FeedScreen: View {
                         Image(systemName: loader.selectedBookmarkListID != nil ? "bookmark.fill" : "bookmark")
                             .headerButtonStyle(accent: engine.accent)
                     }
+                    .accessibilityIdentifier("bookmark-boxes-button")
                     .overlay(alignment: .topTrailing) {
                         if loader.selectedBookmarkListID != nil {
                             Circle().fill(engine.accent).frame(width: 6, height: 6)
@@ -837,7 +919,16 @@ struct FeedScreen: View {
 
     // MARK: - Feed Scroll
 
-    private var feedScrollView: some View {
+    /// The scrollable feed: the runtime's presentation, already ordered, one row contract for every
+    /// source of truth.
+    ///
+    /// - Parameter legacyPageFallback: whether the legacy page may justify the "this category has
+    ///   articles, they may have been trimmed" guidance (`!loader.items.isEmpty`, unchanged). It is the
+    ///   legacy branch's rule, and only its: a surface drawn from session snapshots passes `false`,
+    ///   because in that mode the legacy page is not a second page to fall back to. This is the site the
+    ///   DoD item names — the screen could draw from two sources — and it is now a value its own
+    ///   surface state supplies.
+    private func feedScrollView(legacyPageFallback: Bool) -> some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottom) {
                 ScrollView {
@@ -856,21 +947,21 @@ struct FeedScreen: View {
                             .padding(.horizontal, 16)
                             .padding(.top, 8)
                         }
-                        ForEach(loader.dateSections) { section in
+                        ForEach(runtime.presentation.sections) { section in
                             Section {
-                                // Pre-built lookup keyed by section ID, cached
-                                // across render passes to avoid O(n) rebuilds
-                                // during scroll-driven body evaluations.
-                                let cardsByID = loader.cardsByID(for: section)
-                                ForEach(section.items) { item in
-                                    FeedItemView(item: item,
-                                        presentation: cardsByID[item.id],
+                                // Rows are the runtime's presentation, already ordered: the card
+                                // carries identity, media and chrome, and the media slot the current
+                                // band draws. Nothing here inspects the item to decide either.
+                                ForEach(section.rows) { row in
+                                    FeedItemView(item: row.item,
+                                        card: row.card,
+                                        mediaSlot: row.mediaSlot,
                                         onOpen: {
                                             guard !searchFocused else {
                                                 searchFocused = false
                                                 return
                                             }
-                                            articleItem = item
+                                            articleItem = row.item
                                         },
                                         onCopy: { toastMessage = "Link copied"; toastIcon = "doc.on.doc"; withAnimation { showToast = true } },
                                         onPlaybackFailed: {
@@ -878,21 +969,34 @@ struct FeedScreen: View {
                                             toastIcon = "exclamationmark.triangle"
                                             withAnimation { showToast = true }
                                         },
-                                        onViewSource: { selectedSource = loader.sourceReference(for: item) },
-                                        onAddSourceToCollection: { sourceToCollect = loader.sourceReference(for: item) }
+                                        onViewSource: { selectedSource = loader.sourceReference(for: row.item) },
+                                        onAddSourceToCollection: { sourceToCollect = loader.sourceReference(for: row.item) }
                                     )
-                                    .id(item.id)
+                                    .id(row.id)
                                     .padding(.horizontal, 6)
                                     .contentShape(Rectangle())
-                                    .onScrollVisibilityChange(threshold: 0.5) { visible in
+                                    .onScrollVisibilityChange(
+                                        threshold: MainFeedRuntime.cardVisibilityThreshold
+                                    ) { visible in
+                                        // The visibility transition, in the vocabulary this file already
+                                        // uses for the scroll surface: `true` is the row crossing above the
+                                        // threshold, and the callback fires on that transition rather than on
+                                        // a render. The view states the crossing and no fraction — it has
+                                        // none — so the runtime declares the policy's own number, which is
+                                        // the one this callback fires under.
+                                        //
+                                        // Who hears it is the runtime's decision, per page: on the surface
+                                        // the session owns the row's visibility is an exposure observation
+                                        // (`FeedSessionIntent.cardVisibility`), and on the legacy page — and
+                                        // in every other mode — it is the read-state write it always was. A
+                                        // runtime row's id is the bridge's display id, which names no
+                                        // `feed_item` row, so it is never the id that write receives.
+                                        //
+                                        // `false` writes nothing, as it wrote nothing before: the read state
+                                        // records that a card was shown, never that it scrolled away.
                                         if visible {
-                                            loader.markAsSeen(item.id)
+                                            runtime.cardBecameVisible(itemID: row.item.id)
                                         }
-                                    }
-                                    .onAppear {
-                                        loader.noteVisibleIndex(for: item)
-                                        lastScrollIndex = loader.currentVisibleIndex
-                                        Task { await loader.loadMoreIfNeeded(currentItem: item) }
                                     }
                                 }
                             } header: {
@@ -904,16 +1008,25 @@ struct FeedScreen: View {
 
                         // Filters/search matched nothing, but the feed itself
                         // has content — show guidance instead of a blank screen.
-                        if loader.dateSections.isEmpty && !loader.items.isEmpty {
+                        if legacyPageFallback && runtime.presentation.sections.isEmpty {
                             EmptyFilterView(category: loader.selectedNodeNames.joined(separator: ", "))
                         }
                     }
                     .padding(.top, feedTopPadding)
+                    .scrollTargetLayout()
                 }
                 .refreshable {
-                    await loader.pullToRefresh()
+                    await runtime.refresh()
                 }
                 .scrollDismissesKeyboard(.interactively)
+                // The viewport observation (PR-13). It replaces the per-card `onAppear` that used to
+                // call `loadMoreIfNeeded`: a callback on appearance cannot tell a fling from a settle,
+                // and the demand signal it produced was "a card exists" rather than "the viewport is
+                // here". This reports identities only, does no work, and the runtime decides what the
+                // position costs.
+                .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.5) { visibleIDs in
+                    handleViewportChanged(visibleIDs)
+                }
                 .onScrollGeometryChange(for: CGFloat.self, of: { geo in
                     geo.contentOffset.y
                 }, action: { _, newOffset in
@@ -981,11 +1094,15 @@ struct FeedScreen: View {
     // MARK: - Helpers
 
     private func startScreen() async {
-        loader.searchIncludesSources = searchIncludesSources
-        loader.searchIncludesContents = searchIncludesContents
+        // The runtime follows this loader's published page from here: acquisition lifetime is tied to
+        // the screen (PR-13), and the mode decided at launch is what it follows it with.
+        runtime.attach(loader: loader)
+        applySearchScopeToLoader()
         searchTerms = loader.submittedSearchTerms
         await loader.start()
-        await loader.refreshBookmarkState()
+        // `FeedLoader.start()` already awaited `refreshBookmarkState()`; the second call here was the
+        // duplicate demand P10 in the acquisition map: two full bookmark hydrations on every cold
+        // start, the second one 10 lines after the first.
         updateBadge()
         engine.refresh()
         // Restore scroll position once on cold start, but never if the user
@@ -1202,10 +1319,28 @@ struct FeedScreen: View {
         searchFocused = true
     }
 
+    /// The viewport observation behind the feed's replenishment (PR-13).
+    ///
+    /// It records where the reader is and hands the identities to the runtime; it does not fetch,
+    /// decode or select. `visibleIDs` is every row the scroll surface currently has on screen, which is
+    /// the same signal the session's window wants (`viewportChanged`), and the runtime turns it into
+    /// ordinals plus the anchor it currently holds.
+    private func handleViewportChanged(_ visibleIDs: [String]) {
+        guard !visibleIDs.isEmpty else { return }
+        runtime.viewportChanged(visibleItemIDs: visibleIDs)
+        var last: (id: String, ordinal: Int)?
+        for id in visibleIDs {
+            guard let ordinal = runtime.presentation.ordinalByItemID[id] else { continue }
+            if last == nil || ordinal > last!.ordinal { last = (id, ordinal) }
+        }
+        guard let last else { return }
+        lastVisibleItemID = last.id
+        loader.noteViewport(lastVisibleOrdinal: last.ordinal)
+    }
+
     /// Scroll offset (points) beyond which the scroll-to-top button appears.
     private func handleScrollOffset(_ newOffset: CGFloat) {
         if newOffset > 40 { userHasScrolled = true }
-
         let delta = newOffset - lastScrollOffset
         lastScrollOffset = newOffset
 
@@ -1312,14 +1447,24 @@ struct FeedScreen: View {
             loader.setActivityState(.background)
             SmartFeedBackgroundScheduler.shared.schedule()
             AudioPlayerManager.shared.savePosition()
-            let allItems = loader.dateSections.flatMap(\.items)
-            let idx = min(lastScrollIndex, allItems.count - 1)
-            if idx >= 0, idx < allItems.count {
-                lastScrollItemID = allItems[idx].id
-            }
+            // The persisted position is the card the viewport last saw, not an index into a page that
+            // may have been rebuilt since (PR-13).
+            if let lastVisibleItemID { lastScrollItemID = lastVisibleItemID }
         @unknown default:
             break
         }
+    }
+
+    /// The reader's search switches, stated to the loader in one place.
+    ///
+    /// Three scopes, three statements: source search is the catalogue query, contents search is the
+    /// canonical FTS, and the live-endpoint sweep is the explicit online demand that follows the
+    /// Contents switch. Before PR-14 the sweep was a side effect of `includeContents` inside
+    /// `FeedStore.search`, so a reader who asked for local content also started an online walk.
+    private func applySearchScopeToLoader() {
+        loader.searchIncludesSources = searchIncludesSources
+        loader.searchIncludesContents = searchIncludesContents
+        loader.searchDemandsOnlineContent = searchIncludesContents
     }
 
     private func handleWillEnterForeground() {
@@ -1463,18 +1608,170 @@ private extension View {
     }
 }
 
+// MARK: - Compact header chip
+
+/// The legacy chip's own inputs: every `FeedLoader` property the header chip read before the surface a
+/// launch's runtime owns existed.
+///
+/// They are values, materialized once by `CompactFeedDisplay.forSurface`, so the layout below reads no
+/// loader at all and the session's lane cannot reach one of them.
+struct CompactFeedLegacyFacts: Equatable {
+    /// Whether the legacy startup runway is still building the first page (`isPreparingInitialRunway`).
+    let isPreparingRunway: Bool
+    /// How many of its own source fetches the legacy engine has completed (`startupFetchedSourceCount`).
+    let fetchedSourceCount: Int
+    /// The runway's denominator: `startupTotalSourceCount` floored by the catalogue the registry has
+    /// counted — the chip's own fold (`max(startupTotalSourceCount, sourceCount)`), kept verbatim.
+    let totalSourceCount: Int
+    /// Articles the legacy ingest has ready for the first screen (`startupItemsReady`) against the count
+    /// that makes one (`startupItemsTarget`).
+    let itemsReady: Int
+    let itemsTarget: Int
+    /// The legacy catalogue: its enabled sources against all of them (`activeSourceCount`/`sourceCount`).
+    let activeSourceCount: Int
+    let sourceCount: Int
+    /// Whether the legacy runway finished its wave (`startupRunwayReady`), which raises the chip's
+    /// completion cue.
+    let runwayReady: Bool
+}
+
+/// What the header chip draws, in the two shapes it has always drawn.
+enum CompactFeedContent: Equatable {
+    /// The startup-figures element: the counter where the runway prints `fetched/total`, the first-screen
+    /// clause beside it and the completion cue. Both lanes draw this shape — only the legacy lane's
+    /// figures are the runway's.
+    case figures(counter: String, articles: String?, isComplete: Bool, label: String)
+    /// The bare catalogue line (`·enabled/total sources`): the legacy chip's shape once its runway is
+    /// done and the registry has counted the catalogue.
+    case catalogueLine(String)
+
+    /// The figure this content states, for the chip's own diagnostic line.
+    var diagnosticValue: String {
+        switch self {
+        case .figures(let counter, _, _, _): return counter
+        case .catalogueLine(let text): return text
+        }
+    }
+}
+
+/// What the header chip states, and which owner it states it from.
+///
+/// A launch's session owns exactly one selection, and the chip is drawn for the whole screen rather than
+/// for one of its content branches: on that selection it states the runtime's own statement in **every**
+/// state of the surface the session owns — preparing, content and empty. Everywhere else it is the legacy
+/// chip, verbatim: the legacy startup runway's counters, which a launch whose runtime acquires for never
+/// advances, because `LegacyAcquisitionGate` refuses that engine's requests
+/// (`docs/runtime-v2/baseline.md` §8.26) — measured on the chip as `· 71,234/77,443 sources` while the
+/// runtime watched 32 (`loading-progress-report.md` §6 item 1).
+///
+/// The lane is a value so the choice is assertable without a rendering, and it is the structural half of
+/// "the legacy runway's counters are not read there": the session's case carries none of them, so the
+/// layout has nothing of the runway to interpolate. It is the third surface with this shape, after
+/// `FeedLoadingDisplay` and `FeedEmptyDisplay`.
+enum CompactFeedDisplay: Equatable {
+    /// The runtime's own statement — the value the loading chrome and the empty surface state too, so one
+    /// launch cannot be described two ways.
+    case session(MainFeedLoadingStatement)
+    /// The legacy startup runway, verbatim: the counters this chip read before this slice.
+    case legacy(CompactFeedLegacyFacts)
+
+    /// The lane for one screen.
+    ///
+    /// `session` is non-nil exactly on the surface a launch's runtime owns
+    /// (`MainFeedRuntime.sessionChipStatement`), and then the loader is not read at all: the guard below
+    /// is the whole of the separation. It is `@MainActor` — rather than the whole value type, which is
+    /// pure — because the legacy lane reads the loader, and its only call site is a view body.
+    @MainActor
+    static func forSurface(
+        session: MainFeedLoadingStatement?,
+        loader: FeedLoader
+    ) -> CompactFeedDisplay {
+        guard let session else {
+            return .legacy(
+                CompactFeedLegacyFacts(
+                    isPreparingRunway: loader.isPreparingInitialRunway,
+                    fetchedSourceCount: loader.startupFetchedSourceCount,
+                    totalSourceCount: max(loader.startupTotalSourceCount, loader.sourceCount),
+                    itemsReady: loader.startupItemsReady,
+                    itemsTarget: loader.startupItemsTarget,
+                    activeSourceCount: loader.activeSourceCount,
+                    sourceCount: loader.sourceCount,
+                    runwayReady: loader.startupRunwayReady
+                )
+            )
+        }
+        return .session(session)
+    }
+
+    /// Which lane drew this chip: `session` or `legacy`. It is what makes the choice a production
+    /// observable rather than a test-only one (the chip's own log line).
+    var source: String {
+        switch self {
+        case .session: return "session"
+        case .legacy: return "legacy"
+        }
+    }
+
+    /// The legacy runway's readiness, the value the chip's completion cue watches. Nil on the session's
+    /// lane: the runtime's statement carries counts, not a completion, so its lane watches nothing rather
+    /// than borrowing the runway's cue.
+    var runwayReady: Bool? {
+        guard case .legacy(let facts) = self else { return nil }
+        return facts.runwayReady
+    }
+
+    /// What this lane draws, given the view's own transient cue (`readyPulse`).
+    ///
+    /// Nil when the lane states no figure at all: the legacy chip before its runway or its catalogue has
+    /// anything to say, and the session's lane when the session has nothing to acquire from — the page's
+    /// own empty surface states "No sources enabled", and the legacy chip is silent in that condition too.
+    func content(readyPulse: Bool) -> CompactFeedContent? {
+        switch self {
+        case .session(let statement):
+            // `readyPulse` is not read on this lane: the cue marks the runway's wave, and the runtime
+            // states no completion of its own to raise it for.
+            guard statement != .noCatalogue else { return nil }
+            let sentence = FeedLoadingDisplay.session(statement).detail
+            return .figures(counter: "· " + sentence, articles: nil, isComplete: false, label: sentence)
+        case .legacy(let facts):
+            if facts.isPreparingRunway || readyPulse {
+                return .figures(
+                    counter: "· \(facts.fetchedSourceCount)/\(facts.totalSourceCount)",
+                    articles: "· \(facts.itemsReady) of \(facts.itemsTarget) articles for your first screen",
+                    isComplete: readyPulse,
+                    label: "\(facts.fetchedSourceCount) of \(facts.totalSourceCount) sources verified"
+                )
+            }
+            // The local first page is published before the catalogue is loaded, so the runway flag
+            // clears while the total is still unknown. "0/0 sources" is a claim the app cannot make yet;
+            // stay silent until the registry has actually counted them.
+            guard facts.sourceCount > 0 else { return nil }
+            return .catalogueLine("·\(facts.activeSourceCount)/\(facts.sourceCount) sources")
+        }
+    }
+
+    /// The figure this lane states right now, for the chip's own diagnostic line.
+    var diagnosticValue: String {
+        content(readyPulse: false)?.diagnosticValue ?? "none"
+    }
+}
+
 struct CompactFeedStatus: View {
     @Environment(FeedLoader.self) private var loader
     @State private var engine = CircadianEngine.shared
     @State private var showReadyPulse = false
     @AppStorage("showDebugBar") private var showDebugBar = false
 
-    private var isShowingStartupProgress: Bool {
-        loader.isPreparingInitialRunway || showReadyPulse
-    }
+    /// The runtime's own statement, on the one surface a launch's runtime owns (plan §17, DoD2). Nil
+    /// everywhere else — `CompactFeedStatus()` is the legacy chip — and then this chip reads the loader's
+    /// startup runway exactly as it did before this entry point existed: `CompactFeedDisplay.forSurface`
+    /// is where the two lanes split.
+    var session: MainFeedLoadingStatement? = nil
 
-    private var startupTotal: Int {
-        max(loader.startupTotalSourceCount, loader.sourceCount)
+    /// What this chip draws. It is the only thing the body reads, so the legacy counters are read on
+    /// exactly one lane and the session's lane cannot read them at all.
+    private var display: CompactFeedDisplay {
+        CompactFeedDisplay.forSurface(session: session, loader: loader)
     }
 
     var body: some View {
@@ -1484,35 +1781,44 @@ struct CompactFeedStatus: View {
                 .scaledToFit()
                 .frame(width: 16, height: 16)
             Text("Feedmine").font(.caption).fontWeight(.bold)
-            if isShowingStartupProgress {
-                HStack(spacing: 3) {
-                    Text("· \(loader.startupFetchedSourceCount)/\(startupTotal)")
-                    // What actually gates the first screen, stated as such. The source count above is
-                    // the catalogue-scope figure (the chip's own denominator); this is the content one,
-                    // so the two never have to be the same number or agree by coincidence.
-                    Text("· \(loader.startupItemsReady) of \(loader.startupItemsTarget) articles for your first screen")
-                        .contentTransition(.numericText())
-                    if showReadyPulse {
-                        Image(systemName: "checkmark.circle.fill")
-                            .symbolEffect(.pulse, value: showReadyPulse)
+            if let content = display.content(readyPulse: showReadyPulse) {
+                switch content {
+                case .figures(let counter, let articles, let isComplete, let label):
+                    HStack(spacing: 3) {
+                        Text(counter)
+                        // What actually gates the first screen, stated as such. The source count above is
+                        // the catalogue-scope figure (the chip's own denominator); this is the content one,
+                        // so the two never have to be the same number or agree by coincidence.
+                        if let articles {
+                            Text(articles)
+                                .contentTransition(.numericText())
+                        }
+                        if isComplete {
+                            Image(systemName: "checkmark.circle.fill")
+                                .symbolEffect(.pulse, value: showReadyPulse)
+                        }
                     }
-                }
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(showReadyPulse ? Color.green : Color.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .accessibilityLabel(
-                    "\(loader.startupFetchedSourceCount) of \(startupTotal) sources verified"
-                )
-            } else if loader.sourceCount > 0 {
-                // The local first page is published before the catalogue is
-                // loaded, so the runway flag clears while the total is still
-                // unknown. "0/0 sources" is a claim the app cannot make yet;
-                // stay silent until the registry has actually counted them.
-                Text("·\(loader.activeSourceCount)/\(loader.sourceCount) sources")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isComplete ? Color.green : Color.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .accessibilityLabel(label)
+                case .catalogueLine(let text):
+                    Text(text)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
+        }
+        .onAppear {
+            Log.ui.info("surface[header-chip] appear source=\(display.source) value=\(display.diagnosticValue)")
+        }
+        // The chip appears once and its figure then changes in place — the runway's counters on the legacy
+        // lane, the session's statement on the surface the runtime owns — so the line above states only the
+        // first one. This is the rest of them, beside `surface[initial-loading]`'s own, so "which lane, and
+        // what does it say" is readable after the fact.
+        .onChange(of: display) { _, next in
+            Log.ui.info("surface[header-chip] statement source=\(next.source) value=\(next.diagnosticValue)")
         }
         // Secret gesture: triple-tap the feed status to toggle debug bar.
         // Not exposed in Settings — intentional, for development use only.
@@ -1523,8 +1829,8 @@ struct CompactFeedStatus: View {
                 showDebugBar.toggle()
             }
         }
-        .task(id: loader.startupRunwayReady) {
-            guard loader.startupRunwayReady else { return }
+        .task(id: display.runwayReady) {
+            guard display.runwayReady == true else { return }
             withAnimation(.easeInOut(duration: 0.2)) {
                 showReadyPulse = true
             }
@@ -1713,6 +2019,156 @@ private struct SourceSearchDetailView: View {
 
 // MARK: - Initial Feed Loading
 
+/// What the loading surface draws, and which owner it draws it from.
+///
+/// A launch has exactly one owner of this surface: the runtime's own statement on the surface its
+/// session owns (`MainFeedLoadingStatement`, plan §17 DoD2), the legacy startup runway's counters
+/// everywhere else — every other mode, and every selection this launch's session was not built for. The
+/// lane is a value so the choice is assertable without a rendering, and it is the structural half of "the
+/// legacy counters are not read there": the session's lane carries no fetched count, no target and no
+/// percentage, so the layout has nothing of the runway to interpolate.
+enum FeedLoadingDisplay: Equatable {
+    /// The runtime's own statement. It has no fraction in it and the surface prints none: the runtime has
+    /// no measurement for how much of the feed is loaded (plan §16).
+    case session(MainFeedLoadingStatement)
+    /// The legacy startup runway, verbatim: the counters this surface read before this slice.
+    case runway(
+        fetched: Int,
+        target: Int,
+        isReady: Bool,
+        recentlyFetchedSourceNames: [String],
+        hasPreviouslyLoadedContent: Bool
+    )
+
+    /// The lane for one launch.
+    ///
+    /// `session` is non-nil exactly on the surface a launch's runtime owns while its session has not
+    /// published (`MainFeedRuntime.sessionLoadingStatement`), and then the loader is not read at all: the
+    /// guard below is the whole of the separation. It is `@MainActor` — rather than the whole value type,
+    /// which is pure — because the legacy lane reads the loader, and every call site is a view body.
+    @MainActor
+    static func forSurface(
+        session: MainFeedLoadingStatement?,
+        loader: FeedLoader
+    ) -> FeedLoadingDisplay {
+        guard let session else {
+            return .runway(
+                fetched: loader.startupFetchedSourceCount,
+                target: loader.startupTargetSourceCount,
+                isReady: loader.startupRunwayReady,
+                recentlyFetchedSourceNames: loader.startupRecentSourceNames,
+                hasPreviouslyLoadedContent: loader.hasPreviouslyLoadedContent
+            )
+        }
+        return .session(session)
+    }
+
+    /// Whether the wave renders as complete. The legacy runway states its own `startupRunwayReady`; the
+    /// session's surface exists only while no edition has been published, so it states that it is not
+    /// ready rather than borrowing a readiness it does not have.
+    var isReady: Bool {
+        switch self {
+        case .runway(_, _, let isReady, _, _): return isReady
+        case .session: return false
+        }
+    }
+
+    /// Whether this lane has a fraction to draw a bar with: the legacy runway does, the session's
+    /// statement does not, and no bar is drawn without one (an empty bar is a 0% claim).
+    var hasProgressBar: Bool {
+        if case .runway = self { return true }
+        return false
+    }
+
+    /// The fraction the bar fills with, in the runway's own terms. Zero on the session's lane, which
+    /// draws no bar (`hasProgressBar`).
+    var progressFraction: Double {
+        guard case .runway(let fetched, let target, _, _, _) = self, target > 0 else { return 0 }
+        return min(1, Double(fetched) / Double(target))
+    }
+
+    /// The runway's own percentage. Nil on the session's lane: there is no measurement behind one.
+    var percentage: String? {
+        guard hasProgressBar else { return nil }
+        return "\(Int((progressFraction * 100).rounded()))%"
+    }
+
+    /// The number the title and the counter line interpolate with `.numericText()`: the runway's fetched
+    /// count, or how many sources the session's acquisition owner took on.
+    var displayedCount: Int {
+        switch self {
+        case .runway(let fetched, _, _, _, _): return fetched
+        case .session(.acquiring(_, let watched)): return watched.count
+        case .session: return 0
+        }
+    }
+
+    /// The title. The runway's three cases are the ones this surface had before the slice, in the same
+    /// order; the session's cases state the session's own answer.
+    var title: String {
+        switch self {
+        case .runway(let fetched, _, _, _, let hasPreviouslyLoadedContent):
+            if fetched > 0 { return String(localized: "Loading \(fetched) sources...") }
+            if hasPreviouslyLoadedContent { return String(localized: "Loading your feed...") }
+            return String(localized: "Preparing your feed...")
+        case .session(.readingCatalogue):
+            return String(localized: "Preparing your feed...")
+        case .session(.acquiring(_, let watched)):
+            // The sources this launch's acquisition owner actually took on — not the catalogue's size,
+            // which is what the session is *offered* and is thousands of feeds larger. The catalogue is
+            // the detail line's own number, so the two never have to agree by coincidence.
+            return String(localized: "Acquiring \(watched.count) sources...")
+        case .session(.noCatalogue):
+            return String(localized: "No sources enabled")
+        }
+    }
+
+    /// The line where the runway prints `fetched/target`: on the session's lane, the statement's own
+    /// facts — never a fraction the runtime cannot know.
+    var detail: String {
+        switch self {
+        case .runway(let fetched, let target, _, _, _):
+            return "\(fetched)/\(target)"
+        case .session(.readingCatalogue):
+            return String(localized: "Waiting for the source catalogue")
+        case .session(.acquiring(let sources, let watched)):
+            var line = String(localized: "\(watched.count) of \(sources) sources watched")
+            if watched.refused > 0 {
+                line += " · " + String(localized: "\(watched.refused) refused")
+            }
+            return line
+        case .session(.noCatalogue):
+            return String(localized: "Nothing to acquire from")
+        }
+    }
+
+    /// The source names rotated under "Loading articles": the runway's own recently fetched sources, and
+    /// none on the session's lane, whose statement carries counts and not titles.
+    var rotatingSourceTitles: [String] {
+        guard case .runway(_, _, _, let names, _) = self else { return [] }
+        return names
+    }
+
+    /// The value the surface states where the runway states `fetched/target`.
+    var accessibilityValue: String {
+        switch self {
+        case .runway(let fetched, let target, _, _, _):
+            return "\(fetched)/\(target)"
+        case .session:
+            return detail
+        }
+    }
+
+    /// Which lane drew this surface, for the surface's own log line: `session` or `runway`. It is what
+    /// makes the choice a production observable rather than a test-only one.
+    var source: String {
+        switch self {
+        case .session: return "session"
+        case .runway: return "runway"
+        }
+    }
+}
+
 struct InitialFeedLoadingView: View {
     @Environment(FeedLoader.self) private var loader
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1720,22 +2176,16 @@ struct InitialFeedLoadingView: View {
     @State private var displayedSourceName = ""
     @State private var nextSourceNameIndex = 0
 
-    private var progressFraction: Double {
-        guard loader.startupTargetSourceCount > 0 else { return 0 }
-        return min(
-            1,
-            Double(loader.startupFetchedSourceCount) / Double(loader.startupTargetSourceCount)
-        )
-    }
+    /// The runtime's own statement, on the one surface a launch's runtime owns while its session has not
+    /// published (plan §17, DoD2). Nil everywhere else — `InitialFeedLoadingView()` is the legacy lane —
+    /// and then this view is the legacy surface it was before the slice: `FeedLoadingDisplay.forSurface`
+    /// is where the two lanes split.
+    var session: MainFeedLoadingStatement? = nil
 
-    private var loadingTitle: String {
-        if loader.startupFetchedSourceCount > 0 {
-            return String(localized: "Loading \(loader.startupFetchedSourceCount) sources...")
-        } else if loader.hasPreviouslyLoadedContent {
-            return String(localized: "Loading your feed...")
-        } else {
-            return String(localized: "Preparing your feed...")
-        }
+    /// What this surface draws. It is the only thing the body reads, so the legacy counters are read on
+    /// exactly one lane and the session's lane cannot read them at all.
+    private var display: FeedLoadingDisplay {
+        FeedLoadingDisplay.forSurface(session: session, loader: loader)
     }
 
     var body: some View {
@@ -1745,17 +2195,17 @@ struct InitialFeedLoadingView: View {
 
                 StartupSignalView(
                     accent: engine.accent,
-                    isReady: loader.startupRunwayReady,
+                    isReady: display.isReady,
                     reduceMotion: reduceMotion
                 )
                 .frame(width: 152, height: 72)
                 .drawingGroup()  // Offload wave rendering to GPU/Metal, keeps main thread free
 
-                Text(loadingTitle)
+                Text(display.title)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.primary)
                     .contentTransition(.numericText())
-                    .animation(.smooth, value: loader.startupFetchedSourceCount)
+                    .animation(.smooth, value: display.displayedCount)
                     .padding(.top, 22)
 
                 Text(String(localized: "We are keeping you entertained while the content arrives."))
@@ -1766,24 +2216,30 @@ struct InitialFeedLoadingView: View {
                     .padding(.top, 8)
 
                 VStack(spacing: 8) {
-                    GeometryReader { bar in
-                        ZStack(alignment: .leading) {
-                            Capsule()
-                                .fill(Color.secondary.opacity(0.14))
-                            Capsule()
-                                .fill(loader.startupRunwayReady ? Color.green : engine.accent)
-                                .frame(width: max(4, bar.size.width * progressFraction))
+                    // The bar is the runway's own instrument: it fills with `fetched/target`. The
+                    // session's lane has no such fraction, so it draws no bar rather than an empty one.
+                    if display.hasProgressBar {
+                        GeometryReader { bar in
+                            ZStack(alignment: .leading) {
+                                Capsule()
+                                    .fill(Color.secondary.opacity(0.14))
+                                Capsule()
+                                    .fill(display.isReady ? Color.green : engine.accent)
+                                    .frame(width: max(4, bar.size.width * display.progressFraction))
+                            }
                         }
+                        .frame(height: 5)
+                        .animation(.smooth(duration: 0.3), value: display.progressFraction)
                     }
-                    .frame(height: 5)
-                    .animation(.smooth(duration: 0.3), value: progressFraction)
 
                     HStack {
-                        Text(verbatim: "\(loader.startupFetchedSourceCount)/\(loader.startupTargetSourceCount)")
+                        Text(verbatim: display.detail)
                             .contentTransition(.numericText())
-                            .animation(.smooth, value: loader.startupFetchedSourceCount)
+                            .animation(.smooth, value: display.displayedCount)
                         Spacer()
-                        Text(verbatim: "\(Int((progressFraction * 100).rounded()))%")
+                        if let percentage = display.percentage {
+                            Text(verbatim: percentage)
+                        }
                     }
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -1797,7 +2253,7 @@ struct InitialFeedLoadingView: View {
                         .foregroundStyle(.tertiary)
 
                     ZStack {
-                        Text(displayedSourceName.isEmpty ? loadingTitle : displayedSourceName)
+                        Text(displayedSourceName.isEmpty ? display.title : displayedSourceName)
                             .id(displayedSourceName)
                             .transition(.opacity)
                     }
@@ -1818,20 +2274,32 @@ struct InitialFeedLoadingView: View {
         .disabled(true)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("initial-feed-loading")
-        .accessibilityLabel(loadingTitle)
-        .accessibilityValue(
-            "\(loader.startupFetchedSourceCount)/\(loader.startupTargetSourceCount)"
-        )
+        .accessibilityLabel(display.title)
+        .accessibilityValue(display.accessibilityValue)
         // The doctrine's headline case ("close and reopen … no loading screen") is not measurable from the test side:
         // `XCUIApplication.launch()` returns only when the app is idle, which on a warm relaunch is ~2.2 s in, so the
         // test can only sample from there onward and the earlier window is unobserved. These lines timestamp the
         // surface in the *app's* log — where `page[restore]` and `publishCards firstPaint` already live — so the whole
         // window is covered by instruments the harness cannot block.
-        .onAppear { Log.ui.info("surface[initial-loading] appear label=\(loadingTitle)") }
+        .onAppear {
+            Log.ui.info(
+                "surface[initial-loading] appear source=\(display.source) label=\(display.title) value=\(display.accessibilityValue)"
+            )
+        }
         .onDisappear { Log.ui.info("surface[initial-loading] disappear") }
+        // The surface appears once and the statement then changes in place, so the line above states
+        // only the first one. This is the rest of them, in the app's own log beside `page-source=`: it is
+        // where "which lane, and what does it say" is readable after the fact.
+        .onChange(of: display) { _, next in
+            Log.ui.info(
+                "surface[initial-loading] statement source=\(next.source) label=\(next.title) value=\(next.accessibilityValue)"
+            )
+        }
         .task {
             while !Task.isCancelled {
-                let names = loader.startupRecentSourceNames
+                // The rotation is the runway's own chrome (the sources it just fetched). The session's
+                // lane states counts and not titles, so it rotates nothing and the title stands.
+                let names = display.rotatingSourceTitles
                 if nextSourceNameIndex < names.count {
                     let backlog = names.count - nextSourceNameIndex
                     let step = max(1, backlog / 8)

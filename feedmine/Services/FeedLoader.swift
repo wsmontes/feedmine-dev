@@ -48,7 +48,6 @@ enum DeferredToggleState: Equatable {
 @Observable
 final class FeedLoader {
     private let store: FeedStore
-    let prefetcher = ImagePrefetcher()
     private var pendingRegionToggleStates: [String: DeferredToggleState] = [:]
 
     // MARK: - UI State (from store)
@@ -323,6 +322,9 @@ final class FeedLoader {
     private(set) var submittedSearchTerms: [SearchTerm] = []
     var searchIncludesSources = true
     var searchIncludesContents = false
+    /// The reader's explicit online-content demand. The local FTS query and the network sweep are
+    /// separate decisions: this is what asks `FeedStore` for the sweep, at the reader's request.
+    var searchDemandsOnlineContent = false
     var isSearching: Bool { store.isSearching }
     var isSearchLoading: Bool { store.isSearchLoading }
     var isSearchScanning: Bool { store.isSearchScanning }
@@ -332,6 +334,15 @@ final class FeedLoader {
     var searchFailedSourceCount: Int { store.searchFailedSourceCount }
     var searchScanCompleted: Bool { store.searchScanCompleted }
     var unifiedSearchResults: UnifiedSearchResults { store.unifiedSearchResults }
+
+    /// Installs the canonical content index the local content search reads, or removes it.
+    ///
+    /// Forwarded because `FeedStore` owns the search: the composition that authorizes the read path is
+    /// the one that closes the legacy producers (plan §14 PR-14 clause two), and it reaches the store
+    /// through the loader it already holds.
+    func useCanonicalContentSearch(_ source: CanonicalContentSearch?) {
+        store.useCanonicalContentSearch(source)
+    }
 
     // MARK: - Filtered Items (reads from FeedStore as single source)
 
@@ -536,6 +547,9 @@ final class FeedLoader {
     }
     var enabledSources: [FeedSource] { store.registry.enabledSources }
     var sources: [FeedSource] { store.registry.sources }
+    /// The registry the launch's search reads source metadata from for canonical hits — language,
+    /// region, title and category — which is where the legacy reader takes the same fields from.
+    var sourceRegistry: SourceRegistry { store.registry }
     var disabledSourceIDs: Set<String> {
         Set(store.registry.sources.filter { !store.registry.isSourceEnabled($0.url) }.map(\.url))
     }
@@ -609,25 +623,12 @@ final class FeedLoader {
     var networkMonitor: NetworkMonitor { store.networkMonitor }
     var currentVisibleIndex: Int = 0
 
-    /// Direct index setter — caller already knows the position from ForEach
-    /// enumeration, so we skip the O(n) firstIndex(where:) scan.
-    func noteVisibleIndex(_ index: Int) {
-        currentVisibleIndex = index
+    /// Records where the viewport is, for the trimming pass. The value is the last ordinal the
+    /// renderer can see, in the published page's own order (PR-13): the per-card `onAppear` that used
+    /// to report this could not tell a fling from a settle.
+    func noteViewport(lastVisibleOrdinal: Int) {
+        currentVisibleIndex = lastVisibleOrdinal
     }
-
-    /// O(n) fallback kept for any caller that only has an item reference.
-    /// Uses a simple cache — during scroll the same item triggers onAppear
-    /// repeatedly, and filteredItems don't change between scroll events.
-    func noteVisibleIndex(for item: FeedItem) {
-        if item.id == _lastNoteVisibleID { return }  // already recorded this item
-        _lastNoteVisibleID = item.id
-        // Skip items not in filteredItems (e.g. search results, bookmark-box
-        // items) — recording index 0 would snap the trim/load-more anchor to
-        // the top and cause premature trimming (review finding).
-        guard let idx = filteredItems.firstIndex(where: { $0.id == item.id }) else { return }
-        noteVisibleIndex(idx)
-    }
-    private var _lastNoteVisibleID: String = ""
     var loadedIDsCount: Int { store.loadedIDsCount }
 
     // MARK: - What's New
@@ -782,12 +783,39 @@ final class FeedLoader {
         }
     }
     #endif
-    func loadMoreIfNeeded(currentItem: FeedItem) async {
-        await store.loadMoreIfNeeded(currentItem: currentItem)
+    /// Replenishment driven by the viewport instead of by a card appearing (PR-13).
+    ///
+    /// The view reports the last ordinal it can see and how many ordinals the page holds; neither the
+    /// scroll callback nor this call performs selection, decode or a fetch of its own — the store
+    /// decides whether the observation is close enough to the tail to schedule one.
+    func loadMoreIfNeeded(viewportLastVisibleOrdinal: Int, publishedOrdinalCount: Int) async {
+        await store.loadMoreIfNeeded(
+            viewportLastVisibleOrdinal: viewportLastVisibleOrdinal,
+            publishedOrdinalCount: publishedOrdinalCount
+        )
     }
+    /// P5: two independent triggers call this — returning to the foreground and recovering the network —
+    /// and coming back on a recovered network fires both. While a run is in flight, a second caller awaits
+    /// that run instead of starting another; only a run that actually performs the work counts.
+    private var staleRefreshTask: Task<Void, Never>?
+    private(set) var staleRefreshRunCount = 0
+
     func refreshIfStale() async {
-        await store.refreshIfStale()
-        await loadWhatsNew()
+        if let inFlight = staleRefreshTask {
+            await inFlight.value
+            return
+        }
+        // The run clears its own slot so a caller arriving after the last await starts a fresh run
+        // rather than awaiting a finished task.
+        let run = Task { @MainActor [weak self] in
+            defer { self?.staleRefreshTask = nil }
+            guard let self else { return }
+            await self.store.refreshIfStale()
+            await self.loadWhatsNew()
+        }
+        staleRefreshTask = run
+        staleRefreshRunCount += 1
+        await run.value
     }
     func refresh() async {
         await store.refreshNow()
@@ -932,7 +960,8 @@ final class FeedLoader {
             store.search(
                 expression,
                 includeSources: searchIncludesSources,
-                includeContents: searchIncludesContents
+                includeContents: searchIncludesContents,
+                demandOnlineContent: searchDemandsOnlineContent
             )
         } else {
             store.clearSearch()
@@ -1243,15 +1272,11 @@ final class FeedLoader {
         store.setActivityState(state)
     }
 
-    func performSmartFeedBackgroundRefresh() async -> Bool {
-        await store.prepareForBackgroundSmartFeedRefresh()
-        if restoreImportedSources() {
-            await TaxonomyStore.shared.build(
-                from: store.registry.sources,
-                sharedCountrySourceURLs: store.registry.sharedCountrySourceURLs
-            )
-        }
-        return await store.performSmartFeedBackgroundRefresh()
+    /// One bounded background demand, served by the store that owns acquisition in this process
+    /// (plan §14 PR-15). The loader is the scheduler's owner, not a builder: nothing here constructs a
+    /// second store or fetcher, which is what closes P9.
+    func runBackgroundRefresh(_ demand: BackgroundRefreshDemand) async -> BackgroundRefreshDemandReport {
+        await store.runBackgroundRefreshDemand(demand)
     }
 
     // MARK: - Legacy Global Feeds (kept for backward compat)
@@ -1312,6 +1337,13 @@ final class FeedLoader {
     func isRead(_ itemID: String) -> Bool { store.readItemIDs.contains(itemID) }
 
     // MARK: - Bookmark Lists
+
+    /// The legacy store that owns `user.sqlite` and the content database a bookmark is read from.
+    ///
+    /// Exposed for the runtime's durable user-state port: a bookmark taken on a runtime card has to land
+    /// in the same two databases the app's own bookmark surface reads, and those databases are this
+    /// store's (`RuntimeCardUserActions`). Nothing else about the store becomes public here.
+    var bookmarkStore: BookmarkStore { store.bookmarkStore }
 
     func loadBookmarkLists() async throws -> [BookmarkList] {
         try await store.allBookmarkLists()
@@ -1622,11 +1654,20 @@ final class FeedLoader {
     /// After importing new sources: fetch their content immediately and reload the feed.
     private func fetchAndReloadAfterImport(_ sources: [FeedSource]) async {
         let batch = Array(sources.prefix(20))  // Cap first fetch to 20 sources
-        let result = await store.fetcher.fetchAll(batch, maxConcurrent: 5)
-        let actualNew = await store.persistFetchedItems(result.items)
-        if !actualNew.isEmpty {
-            store.throttledReservoirAppend(actualNew)
-            store.collectWhatsNewCandidates(actualNew)
+        // P5: imported endpoints are a demand like any other; the reload below still runs unconditionally.
+        let grant = store.claimSourceDemand(batch.map(\.url), purpose: .importRefresh)
+        let grantedURLs = Set(grant.led)
+        let grantedBatch = batch.filter {
+            grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+        }
+        if !grantedBatch.isEmpty {
+            let result = await store.fetcher.fetchAll(grantedBatch, maxConcurrent: 5)
+            store.finishSourceDemand(grant, outcomes: result.sourceOutcomes)
+            let actualNew = await store.persistFetchedItems(result.items)
+            if !actualNew.isEmpty {
+                store.throttledReservoirAppend(actualNew)
+                store.collectWhatsNewCandidates(actualNew)
+            }
         }
         // Force reload to show new content
         store.setFilter(

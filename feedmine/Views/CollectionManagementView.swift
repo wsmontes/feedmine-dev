@@ -370,11 +370,22 @@ struct SourceFeedView: View {
                         .padding(.top, 30)
                     }
                     ForEach(items) { item in
-                        FeedItemView(
+                        let render = MainFeedCardBridge.card(
                             item: item,
                             presentation: cards.first { $0.id == item.id },
+                            band: loader.layout
+                        )
+                        FeedItemView(
+                            item: item,
+                            card: render.card,
+                            mediaSlot: render.mediaSlot,
                             onOpen: { articleItem = item },
-                            onAddSourceToCollection: { sourceToCollect = source }
+                            onAddSourceToCollection: { sourceToCollect = source },
+                            actionSurface: .source,
+                            // The surface's materialization scope. A source's *history* scope is
+                            // `.source(SourceID)`, a runtime identity ADR-003 D2/D18 forbids deriving
+                            // from a URL, so this names the materialization and never claims history.
+                            actionScopeKey: source.feedURL
                         )
                         .padding(.horizontal, 6)
                     }
@@ -654,11 +665,20 @@ private struct SourceCollectionFeedView: View {
                         .padding(.top, 40)
                     }
                     ForEach(items) { item in
+                        let render = MainFeedCardBridge.card(
+                            item: item,
+                            presentation: nil,
+                            band: loader.layout
+                        )
                         FeedItemView(
                             item: item,
+                            card: render.card,
+                            mediaSlot: render.mediaSlot,
                             onOpen: { articleItem = item },
                             onViewSource: { selectedSource = loader.sourceReference(for: item) },
-                            onAddSourceToCollection: { sourceToCollect = loader.sourceReference(for: item) }
+                            onAddSourceToCollection: { sourceToCollect = loader.sourceReference(for: item) },
+                            actionSurface: .sourceCollection,
+                            actionScopeKey: String(collection.id)
                         )
                         .padding(.horizontal, 6)
                     }

@@ -45,6 +45,7 @@ struct BookmarkBoxesView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("bookmarkBox.row")
                     .swipeActions(edge: .leading, allowsFullSwipe: false) {
                         Button {
                             loader.preferredBookmarkListID = box.id

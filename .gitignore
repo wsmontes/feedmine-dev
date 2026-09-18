@@ -36,6 +36,7 @@ AuthKey_*.p8
 .loop_progress.json
 .superpowers/
 logs/*.log
+Artifacts/
 *.zip
 .build-device/
 .build-dd-device/

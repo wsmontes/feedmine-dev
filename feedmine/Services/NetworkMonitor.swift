@@ -20,6 +20,15 @@ final class NetworkMonitor {
     private(set) var hasReceivedFirstPath = false
     var wasDisconnected = false
 
+    /// The system's Low Data Mode, which iOS reports as a constrained path.
+    ///
+    /// Read for the acquisition budget (plan §14 PR-15): a constrained path may ship less, which is a
+    /// different quantity from a metered path, which may spend less.
+    private(set) var isConstrained = false
+
+    /// True on a metered path the user pays for.
+    private(set) var isExpensive = false
+
     /// `true` only when connectivity is KNOWN to be unavailable. Gates that
     /// skip work when offline must use this instead of `!isConnected` — before
     /// the first path callback fires, `isConnected == false` means "unknown",
@@ -44,6 +53,8 @@ final class NetworkMonitor {
                     self.wasDisconnected = true
                 }
                 self.isConnected = connected
+                self.isConstrained = path.isConstrained
+                self.isExpensive = path.isExpensive
                 self.hasReceivedFirstPath = true
             }
         }

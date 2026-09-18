@@ -288,6 +288,10 @@ final class AdaptiveScheduler {
     }
 
     func recordFetch(sourceURL: String, outcome: FeedFetchOutcome) {
+        // A producer this process closed issued no request, so nothing about the source changes: not
+        // its last-fetch time, not its cadence, not its validators and not its failure count. The
+        // time is recorded after the check for exactly that reason.
+        if case .legacyProducerClosed = outcome { return }
         lastFetchedAt[sourceURL] = Date()
 
         switch outcome {
@@ -308,6 +312,11 @@ final class AdaptiveScheduler {
             consecutiveFailures[sourceURL, default: 0] += 1
         case .throttled(let until):
             validators[sourceURL, default: HTTPValidators()].retryAfter = until
+        case .legacyProducerClosed:
+            // Unreachable: the early return above is the only path a closed producer takes. Stated for
+            // exhaustiveness rather than folded into `.failed`, which would penalise a source for a
+            // request the mode refused to make.
+            return
         }
     }
 

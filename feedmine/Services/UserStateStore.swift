@@ -178,6 +178,16 @@ final class UserStateStore {
         try UserStateStore.migrate(db)
     }
 
+    /// Opens the user database at an explicit location.
+    ///
+    /// The app always uses the Application Support location above; this initializer exists so the
+    /// migration path can be exercised against a real file — an in-memory database cannot be reopened,
+    /// and "the new migrations do not reset existing state" is only provable across a reopen.
+    init(databaseURL: URL) throws {
+        db = try DatabaseQueue(path: databaseURL.path, configuration: UserStateStore.dbConfig)
+        try UserStateStore.migrate(db)
+    }
+
     // MARK: - Config
 
     private static var dbConfig: Configuration {
@@ -403,6 +413,47 @@ final class UserStateStore {
                 where error.message?.contains("duplicate column") == true {
                 Log.db.info("recipe_json column already present; skipping")
             }
+        }
+
+        migrator.registerMigration("v10_bookmark_snapshot") { db in
+            // Runtime V2 (plan §5.2): identity lives in `bookmark_item`, but the content that makes a
+            // bookmark usable offline lives in the rebuildable `feedmine.sqlite`. A rebuild — or an
+            // item row expiring under content retention — used to leave a dangling id with nothing to
+            // show. This snapshot is the minimum the promised offline experience needs: title, URL,
+            // authorship/source, text and the media reference. It is captured when the bookmark is
+            // written and never rewritten by a content rebuild.
+            try db.create(table: "bookmark_snapshot") { t in
+                t.column("list_id", .integer).notNull()
+                    .references("bookmark_list", onDelete: .cascade)
+                t.column("item_id", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("url", .text)
+                t.column("source_title", .text)
+                t.column("source_url", .text)
+                t.column("excerpt", .text)
+                t.column("media_url", .text)
+                t.column("authored_at", .integer)
+                t.column("captured_at", .integer).notNull()
+                t.primaryKey(["list_id", "item_id"])
+            }
+        }
+
+        migrator.registerMigration("v11_user_operation") { db in
+            // Runtime V2 (plan §5.2): a user action is recorded as an idempotent intention before any
+            // projection runs. There is no atomic commit across `user.sqlite` and the runtime database,
+            // so the intention is what survives a crash; a retry replays the operation id instead of
+            // repeating a toggle. `state` is `pending` | `applied` | `failed`.
+            try db.create(table: "user_operation") { t in
+                t.column("operation_id", .text).primaryKey().notNull()
+                t.column("kind", .text).notNull()
+                t.column("subject_id", .text).notNull()
+                t.column("payload_json", .text).notNull()
+                t.column("state", .text).notNull()
+                t.column("created_at", .integer).notNull()
+                t.column("applied_at", .integer)
+                t.column("failure_reason", .text)
+            }
+            try db.create(index: "idx_user_operation_state", on: "user_operation", columns: ["state"])
         }
 
         try migrator.migrate(db)

@@ -152,7 +152,13 @@ struct WelcomeScene: View {
                     FeedItemCardView(
                         item: item,
                         isRead: false,
-                        isBookmarked: false
+                        isBookmarked: false,
+                        mediaSlot: MainFeedCardBridge.card(
+                            item: item,
+                            presentation: nil,
+                            band: .card
+                        ).mediaSlot,
+                        affordances: MainFeedCardBridge.affordances(for: item)
                     )
                     .frame(width: 160, height: 110)
                     .scaleEffect(0.85)

@@ -1,0 +1,2915 @@
+FeedMine Feed Runtime V2
+
+Technical Architecture Specification v0.1
+
+Base conceitual: Unified Architecture Blueprint v0.4
+Natureza deste documento: proposta técnica executável
+Status: arquitetura candidata
+Escopo: novo Feed Runtime, canonical supply, acquisition/connectors, selection, publication, session, media e contrato com UI
+Fora de escopo: plano de migração do código existente e sequência detalhada de implementação
+
+⸻
+
+1. Propósito
+
+Este documento transforma a macroarquitetura do FeedMine Blueprint v0.4 em uma arquitetura de software concreta.
+
+O objetivo não é descrever como adaptar o FeedMine existente.
+
+O objetivo é responder:
+
+Se construíssemos hoje o motor ideal para cumprir o Blueprint 0.4, como ele deveria funcionar internamente?
+
+A solução deve ser:
+
+* local-first;
+* offline-first;
+* deterministicamente reproduzível;
+* altamente concorrente sem possuir estado concorrente descontrolado;
+* independente dos protocolos de aquisição;
+* capaz de operar com supply heterogênea;
+* econômica em CPU, memória, armazenamento, energia e rede;
+* compatível com as restrições de execução do iOS;
+* adequada para milhões de instalações independentes;
+* compacta em código;
+* simples de testar;
+* difícil de usar incorretamente.
+
+A arquitetura evita deliberadamente frameworks genéricos, plugin systems, global event buses, object graphs complexos e hierarquias de classes.
+
+O runtime é construído principalmente com:
+
+small value types
++
+pure functions
++
+SQLite
++
+a small number of actors
++
+Swift structured concurrency
++
+explicit state transitions
+
+⸻
+
+2. Decisão arquitetural principal
+
+A implementação será baseada em três mecanismos complementares:
+
+1. Canonical Local Supply
+2. Immutable Published Log
+3. Reducer-driven FeedSession
+
+Eles resolvem problemas diferentes.
+
+2.1 Canonical Local Supply
+
+Tudo que chega de sistemas externos é traduzido antes de entrar no domínio operacional do FeedMine.
+
+External Systems
+      ↓
+Connector
+      ↓
+Translated AcquisitionBatch
+      ↓
+Admission Transaction
+      ↓
+Canonical Local Supply
+
+Depois da Admission Boundary:
+
+RSS
+ActivityPub
+ATProto
+Nostr
+API
+WebSocket
+future protocol
+
+deixam de importar para Selection, Publication, Runway e Presentation.
+
+Essas camadas enxergam apenas FeedMine.
+
+⸻
+
+2.2 Immutable Published Log
+
+O feed que o usuário está navegando não é uma query viva.
+
+Ele é uma história publicada.
+
+FeedEdition
+    ├── Segment 0
+    ├── Segment 1
+    ├── Segment 2
+    └── Segment N
+
+Cada FeedSegment é append-only.
+
+Cada card publicado congela:
+
+origin identity
+exact origin revision
+text
+attribution
+media identity
+render contract
+actions
+publication metadata
+
+Nada upstream modifica silenciosamente um card já publicado.
+
+⸻
+
+2.3 Reducer-driven FeedSession
+
+FeedSession será uma state machine explícita.
+
+Mas não uma grande enum contendo todas as combinações possíveis.
+
+O estado da sessão será representado por pequenos estados ortogonais e uma função de transição pura:
+
+reduce(
+    state: FeedSessionState,
+    event: FeedSessionEvent
+) -> [FeedSessionEffect]
+
+O actor FeedSession apenas:
+
+serializa eventos
+→ chama o reducer
+→ executa effects
+→ recebe resultados
+→ produz snapshots
+
+Isso impede FeedSession de virar FeedStore 2.
+
+⸻
+
+3. Visão completa
+
+┌─────────────────────────────────────────────────────┐
+│                   EXTERNAL WORLD                    │
+│ RSS / Atom / APIs / streams / relays / repositories│
+└───────────────────────┬─────────────────────────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │   Connectors    │
+               │ protocol-owned  │
+               └────────┬────────┘
+                        │ AcquisitionBatch
+                        ▼
+               ┌─────────────────┐
+               │ AdmissionEngine │
+               │ transactional   │
+               └────────┬────────┘
+                        │
+              CANONICAL BOUNDARY
+                        │
+                        ▼
+        ┌────────────────────────────────┐
+        │       Canonical Supply         │
+        │ OriginRecord / OriginRevision  │
+        │ memberships / relations        │
+        │ providers / media / offers     │
+        └───────────────┬────────────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │  SelectionEngine│
+               └────────┬────────┘
+                        │ selection draft
+                        ▼
+               ┌─────────────────┐
+               │ MediaPreparation│
+               └────────┬────────┘
+                        │
+                        ▼
+             ┌──────────────────────┐
+             │ PublicationCoordinator│
+             └──────────┬───────────┘
+                        │ append
+                        ▼
+             ┌──────────────────────┐
+             │ FeedEdition/Segments │
+             │ immutable history    │
+             └──────────┬───────────┘
+                        │
+                        ▼
+                  FeedSession
+               ┌────────┼─────────┐
+               │        │         │
+             Window   Runway   Exposure
+               │
+               ▼
+        FeedPresentationSnapshot
+               │
+               ▼
+         FeedScreenStore
+               │
+               ▼
+             SwiftUI
+
+⸻
+
+4. Modelo de execução
+
+A arquitetura não usará actor para tudo.
+
+Actors existirão somente onde há estado efêmero concorrente cuja serialização precisa ser explicitamente controlada.
+
+Baseline:
+
+FeedSession                  actor
+AcquisitionCoordinator       actor
+PublicationCoordinator       actor
+ImageBroker                  actor
+RuntimeWriteCoordinator      actor
+
+Opcionalmente:
+
+ResourceGovernor             actor
+
+se os event sources do sistema exigirem coordenação interna.
+
+Todo o restante será preferencialmente:
+
+struct
+enum
+pure function
+repository
+database transaction
+
+⸻
+
+5. O que NÃO será usado como arquitetura interna
+
+Não haverá:
+
+global event bus
+NotificationCenter como runtime bus
+Combine pipeline central
+Redux store global do aplicativo
+actor por Source
+actor por Feed
+actor por Card
+actor por Asset
+protocol abstraction para cada classe
+generic DI container
+runtime plugin framework
+reflection-based registry
+
+Swift Concurrency será o modelo assíncrono do runtime.
+
+Combine não será necessário para a arquitetura interna.
+
+SwiftUI pode observar apenas o FeedScreenStore.
+
+⸻
+
+6. Package boundaries
+
+As fronteiras importantes devem ser reforçadas pelo compilador, não apenas por convenção.
+
+Proposta:
+
+FeedDomain
+FeedStorage
+FeedRuntime
+FeedConnectorSyndication
+FeedUIBridge
+
+FeedDomain
+
+Não importa:
+
+SwiftUI
+GRDB
+FeedKit
+protocol SDK
+URLSession implementation
+
+Contém:
+
+IDs
+canonical models
+FeedPlan
+policy configurations
+publication models
+connector contracts
+session events
+presentation values
+
+⸻
+
+FeedStorage
+
+Depende de:
+
+FeedDomain
+GRDB
+
+Contém:
+
+runtime.sqlite
+repositories
+migrations
+AdmissionEngine
+publication transactions
+retention
+
+⸻
+
+FeedRuntime
+
+Depende de:
+
+FeedDomain
+FeedStorage
+
+Contém:
+
+FeedSession
+SelectionEngine
+PublicationCoordinator
+RunwayController
+AcquisitionCoordinator
+MediaPreparation
+InteractionCoordinator
+ResourceGovernor
+
+⸻
+
+FeedConnectorSyndication
+
+Depende de:
+
+FeedDomain
+FeedKit
+Foundation networking
+
+Contém apenas:
+
+RSS
+Atom
+HTTP
+validators
+redirects
+syndication identity
+translation
+
+Um futuro connector cria outro target.
+
+Exemplo:
+
+FeedConnectorATProto
+FeedConnectorNostr
+FeedConnectorMastodon
+
+Protocol SDKs tornam-se fisicamente incapazes de aparecer em FeedRuntime.
+
+⸻
+
+FeedUIBridge
+
+Depende de:
+
+FeedDomain
+FeedRuntime
+SwiftUI / Observation
+
+Contém:
+
+FeedScreenStore
+ViewportTracker
+local visual presentation bridge
+
+⸻
+
+7. Composition root
+
+Haverá um único local responsável por construir o runtime.
+
+Exemplo conceitual:
+
+struct FeedRuntimeContainer {
+    let database: RuntimeDatabase
+    let selection: SelectionEngine
+    let publication: PublicationCoordinator
+    let acquisition: AcquisitionCoordinator
+    let media: MediaPreparation
+    let imageBroker: ImageBroker
+    let interactions: InteractionCoordinator
+}
+
+Não haverá service locator.
+
+Não haverá singleton de domínio.
+
+O application bootstrap cria o container e abre sessions a partir dele.
+
+⸻
+
+8. Identificadores
+
+IDs usados no hot path devem ser pequenos.
+
+Baseline proposta:
+
+SourceID             UInt64
+ProviderID           UInt64
+OriginRecordID       Int64
+OriginRevisionID     Int64
+EditionID            Int64
+SegmentID            Int64
+PublicationCardID    Int64
+AssetVersionID       Int64
+ActionID             Int64
+
+Objetos SQLite locais usam preferencialmente INTEGER PRIMARY KEY.
+
+Isso produz:
+
+* índices menores;
+* joins mais baratos;
+* menos memória;
+* menos bytes em snapshots;
+* menos overhead que UUID strings.
+
+Identidades externas continuam opacas e separadas.
+
+Quando uma identidade precisa sobreviver entre databases/dispositivos, uma chave de domínio explicitamente apropriada pode usar UUID/ULID.
+
+IDs internos locais não precisam carregar semântica externa.
+
+⸻
+
+9. External identity
+
+External IDs nunca serão usados diretamente como primary key operacional.
+
+O connector produz:
+
+struct ExternalObjectKey: Sendable {
+    let bytes: Data
+}
+
+Admission calcula também um fingerprint compacto:
+
+objectFingerprint = hash128(
+    connectorScope + externalObjectKey
+)
+
+O valor completo continua armazenado como evidence.
+
+O fingerprint permite índice pequeno.
+
+Collision handling deve comparar a external key completa antes de tratar duas identities como iguais.
+
+O mesmo padrão pode ser utilizado para versões externas.
+
+⸻
+
+10. Canonical content model
+
+O hot canonical model deve permanecer pequeno.
+
+struct CanonicalContent: Sendable {
+    let headline: String?
+    let summary: String?
+    let bodyText: String?
+    let authoredAt: Date?
+    let modifiedAt: Date?
+    let observedAt: Date
+    let language: LanguageCode?
+    let primaryLink: URL?
+    let searchProjection: String?
+}
+
+Nenhum campo existe porque RSS, Nostr ou ATProto possuem aquele campo.
+
+Ele existe apenas se FeedMine precisa compreendê-lo.
+
+⸻
+
+11. AcquisitionBatch físico
+
+O Blueprint apresenta arrays paralelos conceitualmente.
+
+A implementação proposta agrupa claims pertencentes à mesma observation.
+
+Isso reduz coordenação e torna invariantes locais.
+
+struct AcquisitionBatch: Sendable {
+    let target: TargetStamp
+    let observations: [TranslatedObservation]
+    let checkpoint: ConnectorCheckpoint?
+}
+struct TranslatedObservation: Sendable {
+    let externalObject: ExternalObjectKey
+    let revision: RevisionDescriptor
+    let precedence: RevisionPrecedence
+    let content: CanonicalContent
+    let provider: ProviderClaim?
+    let memberships: [MembershipClaim]
+    let relations: [RelationClaim]
+    let media: [MediaCandidate]
+    let interactions: [InteractionOffer]
+    let evidence: ConnectorEvidence?
+}
+
+O connector entrega um objeto semanticamente completo.
+
+Ele não entrega rows SQLite.
+
+Ele não persiste.
+
+⸻
+
+12. Connector contract
+
+Contrato público:
+
+protocol FeedConnector: Sendable {
+    func acquire(
+        target: AcquisitionTarget,
+        checkpoint: ConnectorCheckpoint?,
+        purpose: AcquisitionPurpose
+    ) -> AsyncThrowingStream<AcquisitionBatch>
+}
+
+O connector possui:
+
+protocol semantics
+network semantics
+external identity rules
+external revision rules
+pagination
+stream semantics
+reconnect semantics
+checkpoint interpretation
+translation
+
+O runtime possui:
+
+when work should execute
+whether the result is still valid
+what may be persisted
+budgets
+target lifetime
+supply demand
+
+⸻
+
+13. Connector dispatch
+
+Não haverá Universal Connector Registry.
+
+Haverá apenas um resolver compile-time.
+
+Exemplo:
+
+struct ConnectorTable {
+    let syndication: any FeedConnector
+    func connector(
+        for kind: ConnectorKind
+    ) -> any FeedConnector {
+        switch kind {
+        case .syndication:
+            syndication
+        }
+    }
+}
+
+Quando o segundo ecossistema existir, adiciona-se explicitamente outro connector.
+
+Essa pequena switch pertence exclusivamente à camada Acquisition.
+
+Nenhum downstream sabe que ela existe.
+
+⸻
+
+14. AcquisitionTarget
+
+AcquisitionTarget representa trabalho operacional.
+
+struct AcquisitionTarget: Sendable {
+    let id: AcquisitionTargetID
+    let connectorKind: ConnectorKind
+    let generation: UInt64
+    let configuration: ConnectorTargetConfiguration
+}
+
+configuration é connector-owned.
+
+Selection não a lê.
+
+Publication não a lê.
+
+Presentation não a lê.
+
+⸻
+
+15. Target leases
+
+Para permitir sharing de work, o planner não solicita simplesmente “start target”.
+
+Ele cria demanda.
+
+struct AcquisitionDemand {
+    let purpose: AcquisitionPurpose
+    let deficit: SupplyDeficit
+    let priority: DemandPriority
+}
+
+O planner resolve isso em leases:
+
+Demand A ─┐
+Demand B ─┼── Target T
+Demand C ─┘
+
+Enquanto pelo menos uma lease válida existir, T pode permanecer ativo.
+
+Isso permite:
+
+200 Sources
+→ 25 logical filters
+→ 3 connections
+
+sem 200 network tasks.
+
+⸻
+
+16. AcquisitionCoordinator
+
+O actor mantém somente coordenação efêmera:
+
+actor AcquisitionCoordinator {
+    var active: [AcquisitionTargetID: ActiveTarget]
+}
+
+ActiveTarget contém:
+
+Task
+target generation
+lease count
+purpose/priority
+start time
+
+Ele não mantém o conteúdo adquirido.
+
+Ele não é source of truth.
+
+Crash/restart reconstrói esse estado de SQLite + demanda atual.
+
+⸻
+
+17. Streaming e finite acquisition
+
+A mesma interface suporta os dois.
+
+Finite:
+
+start
+→ batch
+→ finish
+
+Streaming:
+
+start
+→ batch
+→ batch
+→ batch
+→ cancellation
+
+Backfill + live:
+
+backfill batches
+→ checkpoint transition
+→ live batches
+
+Nenhum desses formatos exige branch em Selection ou FeedSession.
+
+⸻
+
+18. Network scheduler
+
+Escalar para milhões de celulares não cria um servidor FeedMine central.
+
+Cria outro problema:
+
+milhões de clientes independentes não podem atacar os mesmos hosts simultaneamente.
+
+O Acquisition Coordinator terá scheduling host-aware.
+
+Cada host possui:
+
+token bucket
+concurrency limit
+failure/backoff state
+next eligible operation
+
+Baseline normal:
+
+global active acquisition targets    4
+per-host HTTP operations             2
+media transfers                      2
+
+Os números são tuning, não contratos.
+
+⸻
+
+19. Jitter obrigatório
+
+Cadências periódicas nunca serão sincronizadas apenas pelo relógio.
+
+Cada target obtém jitter estável:
+
+jitter = H(
+    localInstallationSalt,
+    targetID,
+    cadenceBucket
+)
+
+Isso evita que milhões de instalações executem:
+
+09:00:00 fetch
+09:00:00 fetch
+09:00:00 fetch
+...
+
+O installation salt permanece local.
+
+Não identifica o usuário remotamente.
+
+⸻
+
+20. HTTP efficiency
+
+No Syndication Connector:
+
+ETag
+Last-Modified
+conditional GET
+redirect caching
+connection reuse
+compression
+exponential backoff
+full jitter
+
+fazem parte da implementação baseline.
+
+Uma resposta 304 Not Modified deve ser tratada como operação barata.
+
+Network failures afetam cadence.
+
+Não afetam editorial quality.
+
+⸻
+
+21. AdmissionEngine
+
+Admission não será actor.
+
+Será uma operação transacional.
+
+struct AdmissionEngine {
+    func admit(
+        _ batch: AcquisitionBatch,
+        in db: Database
+    ) throws -> AdmissionResult
+}
+
+Cada batch relevante entra em uma transaction SQLite única.
+
+⸻
+
+22. Admission transaction
+
+Fluxo:
+
+BEGIN IMMEDIATE
+1. read AcquisitionTarget
+2. verify target exists
+3. verify generation
+4. verify binding state
+5. verify WriteAdmissionPolicy
+for each observation:
+    6. resolve OriginRecord identity
+    7. insert record if new
+    8. resolve immutable revision
+    9. insert revision if new
+   10. apply connector precedence
+   11. CAS currentRevisionID
+   12. upsert memberships
+   13. upsert provider attribution
+   14. upsert relations
+   15. upsert media candidates
+   16. upsert interaction offers
+   17. store bounded connector evidence
+18. persist checkpoint
+19. increment SupplyGeneration
+COMMIT
+
+Checkpoint nunca é avançado fora desta transaction quando representa aquele conteúdo.
+
+⸻
+
+23. SupplyGeneration
+
+runtime.sqlite possuirá um contador monotônico:
+
+SupplyGeneration
+
+Toda transaction que modifica canonical selectable supply incrementa esse número uma vez.
+
+Isso permite invalidar caches baratos:
+
+CachedRunwayEstimate(
+    context,
+    supplyGeneration
+)
+
+Sem observar dezenas de tabelas individualmente.
+
+SupplyGeneration não possui significado editorial.
+
+É apenas invalidação técnica.
+
+⸻
+
+24. Runtime database
+
+Storage físico:
+
+catalog.sqlite
+runtime.sqlite
+existing durable user storage
+asset filesystem
+
+runtime.sqlite:
+
+GRDB DatabasePool
+WAL
+foreign_keys = ON
+
+Writes de domínio continuam transacionais.
+
+Reads podem ocorrer concorrentemente.
+
+⸻
+
+25. Tables — acquisition
+
+Baseline:
+
+acquisition_target
+connector_checkpoint
+source_binding_runtime
+connector_evidence
+
+acquisition_target:
+
+id
+connector_kind
+generation
+state
+configuration_blob
+last_success_at
+last_attempt_at
+failure_class
+
+Connector configuration permanece opaque fora do connector/acquisition layer.
+
+⸻
+
+26. Tables — canonical identity
+
+origin_record
+origin_revision
+external_identity
+source_membership
+provider_attribution
+content_relation
+content_entity_relation
+content_cluster_relation
+
+origin_record:
+
+id INTEGER PRIMARY KEY
+connector_scope_id
+external_object_fp
+external_object_key
+current_revision_id
+availability
+first_observed_at
+last_observed_at
+
+Índice crítico:
+
+(connector_scope_id, external_object_fp)
+
+⸻
+
+27. OriginRevision
+
+origin_revision:
+
+id INTEGER PRIMARY KEY
+origin_record_id
+external_version_fp
+external_version_key
+headline
+summary
+body_text
+authored_at
+modified_at
+observed_at NOT NULL
+language
+primary_link
+search_projection
+
+Immutable após insert.
+
+Qualquer mudança semanticamente relevante cria outra revision.
+
+⸻
+
+28. Current revision
+
+origin_record.current_revision_id é future-facing.
+
+Atualização será compare-and-swap quando a precedence semantic exigir.
+
+Exemplo:
+
+expected current = V7
+incoming V8
+CAS V7 → V8
+
+Se outro batch já moveu para V9:
+
+CAS fails
+
+e a precedence rule decide o tratamento.
+
+Não existe “último write ganha” universal.
+
+⸻
+
+29. Selection hot path
+
+Selection não deve reconstruir o canonical graph inteiro para cada Segment.
+
+Será mantida uma read projection estreita.
+
+Proposta:
+
+selection_supply
+
+Campos quentes:
+
+origin_record_id
+current_revision_id
+provider_id
+sort_timestamp
+language
+availability
+media_state
+quality_features
+search_rowid
+
+Essa projection é atualizada dentro da mesma admission transaction quando necessário.
+
+Ela não substitui as canonical tables.
+
+É um índice operacional reconstruível.
+
+⸻
+
+30. Por que uma read projection
+
+Sem ela, a query típica poderia exigir:
+
+OriginRecord
+JOIN current Revision
+JOIN Provider
+JOIN Media
+JOIN Membership
+JOIN exposure history
+JOIN cluster
+...
+
+para centenas de candidatos.
+
+A hot projection permite:
+
+cheap eligibility query
+→ bounded candidate set
+→ scoring/sequencing in memory
+
+Isso simplifica tanto SQL quanto código.
+
+⸻
+
+31. FeedPlan será data-driven
+
+Não criaremos uma classe para cada tipo de feed.
+
+ResolvedFeedPlan será predominantemente configuration.
+
+struct ResolvedFeedPlan {
+    let candidateSpec: CandidateSpec
+    let eligibility: EligibilityPolicy
+    let scoring: ScoringPolicy
+    let sequencing: SequencingPolicy
+    let exposure: ExposurePolicy
+    let acquisition: AcquisitionPolicy
+}
+
+Policies são structs/enums sempre que possível.
+
+Não protocols com dezenas de conformances.
+
+⸻
+
+32. Candidate retrieval
+
+Selection ocorre em duas fases.
+
+Fase 1 — SQLite
+
+Aplica:
+
+hard eligibility
+context membership
+availability
+history exclusions
+date bounds
+language/region constraints
+basic ranking
+
+e retorna um bounded candidate pool.
+
+Fase 2 — memória
+
+Aplica:
+
+scoring
+provider diversity
+cluster diversity
+balance penalties
+deterministic sequencing
+progressive relaxation
+
+Isso reduz complexidade do SQL e mantém a lógica editorial testável.
+
+⸻
+
+33. Candidate pool
+
+Valores iniciais propostos:
+
+segment target           24 cards
+candidate oversampling   4×
+candidate pool           ~96 cards
+
+Não são invariantes.
+
+São FeedRuntimeConfiguration.
+
+Mesmo 150–200 candidatos são baratos em um aparelho moderno.
+
+O importante é nunca selecionar sobre milhares de objetos em memória durante scroll.
+
+⸻
+
+34. Scoring
+
+Scoring produz um valor base.
+
+Exemplo conceitual:
+
+quality
++ explicit-context relevance
++ freshness
++ explicit editorial weights
+
+Não exige behavioral personalization.
+
+O runtime não precisa construir perfil de usuário oculto.
+
+⸻
+
+35. Sequencing algorithm
+
+Não será usado um constraint solver complexo.
+
+Baseline: greedy deterministic sequencer.
+
+Para cada posição:
+
+effectiveScore =
+    baseScore
+  - providerPenalty
+  - clusterPenalty
+  - balancePenalty
+
+Seleciona-se o maior candidato ainda elegível.
+
+Se nenhum atende ao nível atual:
+
+relax media/category
+→ relax provider window
+→ allow limited provider repetition
+
+Hard eligibility nunca relaxa.
+
+Complexidade:
+
+O(segmentSize × candidatePool)
+
+Com:
+
+24 × 96
+
+isso é irrelevante computacionalmente.
+
+⸻
+
+36. Determinismo
+
+Toda ordenação termina em tie-break estável.
+
+Exemplo:
+
+effectiveScore DESC
+authoredSortDate DESC
+stableOriginID ASC
+
+Quando houver variação editorial deliberada:
+
+EditionSeed
+SegmentSeed
+
+entram no tie-break deterministicamente.
+
+Uma mesma entrada + mesmo seed + mesmas policies deve gerar a mesma sequência.
+
+⸻
+
+37. Selection output
+
+Selection não cria publication.
+
+Produz:
+
+struct SelectionDraft {
+    let candidates: [SelectedCandidate]
+    let reason: SelectionReason
+    let diagnostics: SelectionDiagnostics
+}
+
+Cada candidato já aponta para:
+
+OriginRecordID
+exact OriginRevisionID
+Source membership chosen
+Provider attribution chosen
+
+⸻
+
+38. MediaPreparation
+
+Media não será parte de Selection.
+
+Cada OriginRevision pode possuir:
+
+MediaCandidate[]
+
+MediaPreparation produz:
+
+PreparedMediaChoice
+
+Possibilidades:
+
+exact local asset
+local thumbnail
+local poster
+local waveform metadata
+deterministic placeholder
+no media
+
+Publication não precisa esperar pela internet para conseguir um card determinístico.
+
+⸻
+
+39. Publication gate
+
+Para um card ser publicado é obrigatório possuir:
+
+frozen text
+frozen attribution
+exact OriginRevisionID
+RenderContract
+deterministic local visual representation
+primary action if applicable
+
+“Deterministic local visual representation” pode significar placeholder.
+
+Não significa imagem integral obrigatória.
+
+⸻
+
+40. PublicationCoordinator
+
+Será o único componente autorizado a criar:
+
+FeedEdition
+FeedSegment
+PublishedCard
+
+API conceitual:
+
+actor PublicationCoordinator {
+    func ensurePublishedSupply(
+        for request: PublicationRequest
+    ) async throws -> PublicationResult
+}
+
+⸻
+
+41. Single-flight
+
+O coordinator mantém:
+
+inFlight[EditionID]
+
+Se três solicitações simultâneas pedirem novo supply:
+
+A ─┐
+B ─┼→ same publication task
+C ─┘
+
+Não são executadas três Selections equivalentes.
+
+⸻
+
+42. Long work fora do actor
+
+O actor não ficará ocupado durante queries/media preparation.
+
+Fluxo:
+
+actor:
+    establish single-flight
+    capture PublicationToken
+outside isolated state:
+    selection
+    media preparation
+    payload construction
+transaction:
+    re-read tail
+    validate token
+    validate revision
+    validate expected ordinal
+    commit
+actor:
+    finish single-flight
+
+Assim o actor protege coordenação, não vira fila de CPU.
+
+⸻
+
+43. Publication transaction
+
+Transaction final:
+
+BEGIN
+read edition
+verify EditorialRevision
+verify PublicationToken
+read current tail
+verify expected segment ordinal
+remove candidates already published
+verify exact revisions
+insert FeedSegment
+insert PublishedCards
+COMMIT
+
+Constraints:
+
+UNIQUE(edition_id, segment_ordinal)
+UNIQUE(edition_id, absolute_ordinal)
+UNIQUE(edition_id, publication_card_id)
+
+Se o tail mudou:
+
+abort composition
+recompose
+
+Nunca encaixar resultado antigo.
+
+⸻
+
+44. PublishedCard schema
+
+published_card será deliberadamente denormalizada para leitura rápida.
+
+id
+edition_id
+segment_id
+absolute_ordinal
+origin_record_id
+origin_revision_id
+source_id
+provider_id
+source_display_name
+provider_display_name
+title
+primary_text
+published_at
+media_reference
+primary_action_kind
+primary_action_reference
+interaction_summary
+render_kind
+render_media_slot
+render_aspect_ratio
+render_text_style
+publication_schema_version
+
+Essa duplicação é desejada.
+
+Published history precisa sobreviver à remoção de canonical/raw supply.
+
+⸻
+
+45. Por que edition_id + absolute_ordinal
+
+FeedWindow passa a ser trivial:
+
+SELECT ...
+FROM published_card
+WHERE edition_id = ?
+  AND absolute_ordinal BETWEEN ? AND ?
+ORDER BY absolute_ordinal;
+
+Não é necessário reconstruir toda Edition em memória.
+
+⸻
+
+46. FeedWindow
+
+FeedWindow é uma projection.
+
+Não é coleção proprietária duplicada.
+
+Config inicial:
+
+visible vicinity target: ~72 cards
+
+Por exemplo:
+
+24 cards behind
+24 local neighborhood
+24 ahead
+
+A geometria real pode alterar o window.
+
+A Edition pode possuir milhares de cards sem a UI mantê-los vivos.
+
+⸻
+
+47. SessionCursor
+
+Persistido como:
+
+EditionID
+PublicationCardID
+AnchorPlacement
+
+Nunca pixel offset.
+
+Para restore:
+
+find absolute ordinal of card
+→ materialize surrounding window
+→ return snapshot preserving anchor
+
+⸻
+
+48. FeedSession state model
+
+Não haverá um enum gigante do tipo:
+
+.loading
+.loaded
+.refreshing
+.offline
+...
+
+O estado possui dimensões separadas.
+
+struct FeedSessionState {
+    var lifecycle: LifecycleState
+    var context: ContextKey
+    var editorialRevision: EditorialRevision
+    var publicationEpoch: PublicationEpoch
+    var publicationToken: PublicationToken
+    var edition: EditionState?
+    var window: WindowState?
+    var renderEnvironment: RenderEnvironmentRevision
+    var refresh: RefreshState
+    var runway: RunwayState
+    var generation: UInt64
+}
+
+Isso evita state explosion.
+
+⸻
+
+49. FeedSession events
+
+enum FeedSessionEvent {
+    case appeared
+    case disappeared
+    case refreshRequested
+    case contextChanged(ContextKey)
+    case renderEnvironmentChanged(RenderEnvironment)
+    case viewport(ViewportObservation)
+    case restoreCompleted(RestoreResult, SessionStamp)
+    case publicationCompleted(PublicationResult, SessionStamp)
+    case refreshCompleted(RefreshResult, SessionStamp)
+    case runwayChanged(RunwayState, SessionStamp)
+    case visualStateChanged(PublicationCardID)
+}
+
+⸻
+
+50. FeedSession effects
+
+Reducer retorna effects.
+
+enum FeedSessionEffect {
+    case restore
+    case materializeWindow(WindowRequest)
+    case ensurePublishedRunway(RunwayDemand)
+    case beginRefresh
+    case persistCheckpoint
+    case emitSnapshot
+}
+
+Effect não executa dentro do reducer.
+
+Reducer permanece:
+
+pure
+deterministic
+synchronous
+unit-testable
+
+⸻
+
+51. SessionStamp
+
+Todo trabalho assíncrono iniciado por uma Session recebe identidade.
+
+struct SessionStamp {
+    let contextKey: ContextKey
+    let editorialRevision: EditorialRevision
+    let publicationEpoch: PublicationEpoch
+}
+
+Quando um resultado retorna:
+
+result.stamp == current stamp?
+    yes → may apply
+    no  → stale
+
+Stale result pode ter sido útil upstream.
+
+Mas não altera a presentation atual.
+
+⸻
+
+52. FeedSession actor
+
+O actor será fino.
+
+Pseudocódigo:
+
+actor FeedSession {
+    private var state: FeedSessionState
+    func handle(_ event: FeedSessionEvent) async {
+        let effects = reducer.reduce(
+            state: &state,
+            event: event
+        )
+        for effect in effects {
+            execute(effect)
+        }
+    }
+}
+
+O objetivo é que FeedSession.swift permaneça pequeno.
+
+A lógica de transição fica no reducer.
+
+A lógica operacional fica nos services.
+
+⸻
+
+53. UI update stream
+
+Snapshots são state replacement.
+
+O stream pode usar:
+
+AsyncStream(
+    bufferingPolicy: .bufferingNewest(1)
+)
+
+Se a UI não conseguiu aplicar generations:
+
+411
+412
+413
+
+e recebe apenas 413, tudo bem.
+
+O snapshot é completo e semanticamente coerente.
+
+⸻
+
+54. Important intents
+
+Intents não passam por canal lossy.
+
+await session.send(.refresh)
+
+é actor message normal.
+
+Nunca:
+
+buffer newest
+
+para:
+
+refresh
+context change
+card action
+render environment change
+
+⸻
+
+55. Viewport channel
+
+Viewport é telemetry.
+
+A UI pode produzir dezenas de mudanças por segundo.
+
+ViewportTracker coalesce antes do runtime.
+
+Baseline:
+
+sample/coalesce: 50–100 ms
+bufferNewest(1)
+
+Runway não precisa de cada frame.
+
+Ele precisa saber onde o usuário está indo agora.
+
+⸻
+
+56. Velocity smoothing
+
+Raw scroll velocity é ruidosa.
+
+Runway usa:
+
+EWMA velocity
+
+em vez de velocity instantânea.
+
+Exemplo:
+
+v = α × current + (1-α) × previous
+
+Isso evita acquisition pressure oscilando a cada frame.
+
+⸻
+
+57. Runway model
+
+Runway trabalha em distância visual.
+
+Snapshot interno:
+
+struct RunwaySnapshot {
+    let publishedPointsRemaining: Double
+    let estimatedSequenceablePoints: Double
+    let velocity: Double
+    let replenishmentP95: Duration
+    let confidence: Double
+}
+
+⸻
+
+58. Runway target
+
+Conceito:
+
+requiredDistance =
+    velocity
+    × replenishmentP95
+    × safetyFactor
+
+mais:
+
+absolute minimum runway
+
+O target deve ser limitado por floor/ceiling para evitar comportamento patológico.
+
+⸻
+
+59. Runway não seleciona por frame
+
+RunwayController reage apenas quando cruza bandas.
+
+Exemplo:
+
+HEALTHY
+   ↓ lower threshold
+REPLENISHING
+   ↓ safety threshold
+DEGRADED
+   ↓ zero
+EXHAUSTED
+
+Histerese evita:
+
+healthy
+replenishing
+healthy
+replenishing
+
+a cada pequena mudança.
+
+⸻
+
+60. Cached runway estimate
+
+A estimativa cara é recalculada somente quando muda:
+
+Context
+SupplyGeneration
+Edition tail
+Material media state
+
+Viewport muda apenas:
+
+distance remaining
+velocity
+
+Isso torna o scroll hot path extremamente barato.
+
+⸻
+
+61. Acquisition demand
+
+Runway nunca produz:
+
+fetch RSS
+GET URL
+open relay
+
+Produz:
+
+SupplyDeficit {
+    context
+    desiredSequenceableDistance
+    urgency
+}
+
+AcquisitionPlanner resolve esse déficit em targets.
+
+⸻
+
+62. Refresh
+
+Refresh será tratado como construção de successor Edition.
+
+E10 remains visible
+      │
+      ├── optional acquisition
+      ├── selection
+      ├── media gate
+      └── E11 Segment 0
+publication gate reached
+      ↓
+atomic session swap
+E10 → E11
+
+A UI nunca observa E10 sendo desmontada progressivamente.
+
+⸻
+
+63. Context switch
+
+Context change:
+
+invalidate SessionStamp
+→ resolve FeedPlan
+→ try compatible local Edition
+→ otherwise local Selection
+→ bounded acquisition only if required
+
+Context filtering nunca ocorre em SwiftUI.
+
+⸻
+
+64. Media asset storage
+
+Imagens/assets serão content-addressed.
+
+Estrutura:
+
+Assets/
+    ab/
+      cd/
+        <contentHash>
+
+Download:
+
+temporary file
+→ verify
+→ derive metadata
+→ fsync if needed
+→ atomic rename
+
+Bytes imutáveis depois da publicação da asset version.
+
+⸻
+
+65. PublishedMediaRef
+
+struct PublishedMediaRef {
+    let assetVersionID: AssetVersionID
+    let contentHash: ContentHash
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let mimeType: MediaType
+    let aspectRatio: Double
+}
+
+Eviction do arquivo não destrói essa identidade.
+
+⸻
+
+66. ImageBroker
+
+Decoded image cache é efêmero.
+
+actor ImageBroker {
+    var inFlight: [AssetVersionID: Task<FeedVisual, Never>]
+}
+
+Fluxo:
+
+request visual
+→ decoded memory cache?
+→ local disk?
+→ decode off-main
+→ return image
+
+Nunca:
+
+network
+
+⸻
+
+67. Decode deduplication
+
+Se cinco cards/views solicitarem o mesmo asset simultaneamente:
+
+request A ─┐
+request B ─┤
+request C ─┼→ same decode Task
+request D ─┤
+request E ─┘
+
+Não são executados cinco decodes.
+
+⸻
+
+68. Memory pressure
+
+Em memory warning:
+
+clear decoded image cache
+cancel speculative decodes
+retain publication metadata
+retain local assets according to retention
+
+Publication e canonical state não dependem da memória cache.
+
+⸻
+
+69. ResourceGovernor
+
+Um componente pequeno converte condições do aparelho em uma policy operacional.
+
+Inputs:
+
+Low Power Mode
+Low Data Mode
+thermal state
+memory pressure
+network constrained/expensive
+app foreground/background
+
+Output:
+
+struct ResourceProfile {
+    let acquisitionConcurrency: Int
+    let mediaConcurrency: Int
+    let allowsSpeculation: Bool
+    let decodedCacheBudget: Int
+    let backgroundBudget: BackgroundBudget
+}
+
+⸻
+
+70. Resource states
+
+Baseline:
+
+normal
+constrained
+critical
+
+Exemplo:
+
+Normal
+
+normal acquisition
+near-runway media
+limited speculation
+
+Constrained
+
+reduced concurrency
+no speculative media
+smaller decoded cache
+
+Critical
+
+user-initiated and essential runway only
+no speculative acquisition
+no speculative decode
+
+Isso não muda editorial score.
+
+Muda custo operacional.
+
+⸻
+
+71. Interaction architecture
+
+Interaction não pertence ao feed core.
+
+Publication pode carregar:
+
+primaryAction
+InteractionOffer[]
+
+UI recebe:
+
+ActionID
+
+e executa:
+
+UI
+→ FeedSession
+→ InteractionCoordinator
+→ connector-owned executor
+
+Protocol credential/signing semantics ficam atrás dessa boundary.
+
+⸻
+
+72. Action state
+
+Quando necessário, ActionID referencia um registro:
+
+action_id
+connector_kind
+origin_record_id
+action_kind
+opaque_connector_payload
+expiry/state
+
+Somente InteractionCoordinator + connector executor lê o payload connector-specific.
+
+⸻
+
+73. Exposure pipeline
+
+ViewportTracker mantém exposure continuity por:
+
+PublicationCardID
+
+Em memória ele acumula:
+
+entered time
+max visible fraction
+center crossed
+last geometry
+direction
+dwell
+
+Não grava SQLite a cada frame.
+
+⸻
+
+74. Exposure batching
+
+Quando um card deixa viewport ou atinge estado relevante:
+
+ExposureAccumulator
+→ RuntimeWriteCoordinator
+
+Flush por:
+
+batch size
+time interval
+lifecycle transition
+
+Baseline possível:
+
+20 facts
+or
+500 ms
+
+Números tunáveis.
+
+⸻
+
+75. RuntimeWriteCoordinator
+
+Pode agrupar apenas writes não críticos:
+
+exposure
+telemetry
+source health
+diagnostic counters
+
+Não recebe:
+
+Publication commit
+Admission commit
+checkpoint advancement
+durable user action
+
+Esses permanecem transactions explícitas.
+
+⸻
+
+76. App background
+
+Background work passa pelo mesmo Acquisition architecture.
+
+Não existe “background feed engine”.
+
+BG task
+→ bounded AcquisitionDemand
+→ AcquisitionPlanner
+→ Coordinator
+→ Admission
+
+O runtime normal continua sendo usado.
+
+A única diferença é o budget.
+
+⸻
+
+77. Persistence recovery
+
+Após crash:
+
+Actors são descartados.
+
+O runtime reconstrói tudo a partir de:
+
+SQLite
+session checkpoint
+FeedEdition
+current Origin revisions
+Acquisition checkpoints
+
+Nenhum correctness invariant depende da memória de um actor sobreviver.
+
+⸻
+
+78. Failure model
+
+A arquitetura separa falhas por domínio.
+
+Connector failure
+
+affects target health/cadence
+does not erase feed
+
+Admission rejection
+
+batch stale/invalid
+no canonical mutation
+
+Media failure
+
+placeholder remains valid
+
+Publication failure
+
+current Edition remains intact
+
+Refresh failure
+
+previous Edition remains visible
+
+Acquisition exhaustion
+
+tail changes state
+existing history remains navigable
+
+⸻
+
+79. No blocking network in presentation
+
+A cadeia abaixo deve ser estruturalmente impossível:
+
+Scroll
+→ View
+→ URL
+→ network
+
+Render path permitido:
+
+SwiftUI
+→ FeedCardPresentation
+→ ImageBroker
+→ memory/disk
+
+Isso aplica diretamente o invariant de que renderer não inicia rede e que protocol decoding também não chega a Selection, Publication ou Presentation.
+
+⸻
+
+80. Performance hot paths
+
+Há quatro hot paths relevantes.
+
+A. Scroll
+
+Precisa fazer apenas:
+
+layout
+local snapshot access
+viewport aggregation
+optional local decode
+
+Nunca DB query síncrona em View body.
+
+⸻
+
+B. Window shift
+
+Precisa fazer aproximadamente:
+
+one indexed SQLite range query
+presentation mapping
+snapshot swap
+
+⸻
+
+C. Candidate Selection
+
+Precisa fazer:
+
+bounded indexed candidate query
+small in-memory scoring/sequencing
+
+⸻
+
+D. Admission
+
+Pode ser mais pesada porque ocorre fora do interaction path.
+
+Mesmo assim deve trabalhar em batches e transactions curtas.
+
+⸻
+
+81. MainActor budget
+
+FeedScreenStore recebe snapshot pronto.
+
+No MainActor ocorre apenas:
+
+generation check
+snapshot assignment
+
+Não:
+
+DB
+selection
+sorting
+parsing
+image decoding
+media probing
+
+Target:
+
+<4 ms presentation apply
+
+⸻
+
+82. Warm start
+
+Warm startup:
+
+FeedScreen appears
+→ Session restore
+→ query checkpoint/Edition
+→ materialize local window
+→ emit snapshot
+
+Não espera:
+
+network
+catalog refresh
+connector
+image download
+selection
+
+quando há Edition utilizável.
+
+⸻
+
+83. Runtime data bounds
+
+Canonical supply não deve crescer indefinidamente.
+
+Retention terá budgets por:
+
+database bytes
+asset bytes
+record age
+protection roots
+
+Roots:
+
+active Editions
+checkpointed Edition
+bookmark
+collection
+pinned item
+durable read state
+required Action state
+
+Tudo fora dos roots pode competir por retention.
+
+⸻
+
+84. Storage budgets
+
+Os valores exatos serão tuning.
+
+A arquitetura trabalha com:
+
+struct StorageBudget {
+    let runtimeDatabaseBytes: Int64
+    let assetBytes: Int64
+    let connectorEvidenceBytes: Int64
+}
+
+Eviction ocorre pela categoria de durability.
+
+Não por cascades arbitrários.
+
+⸻
+
+85. Connector Evidence
+
+Connector Evidence é cold storage.
+
+Pode utilizar:
+
+versioned binary blob
+JSON blob
+compressed raw payload
+
+porque não está no hot path.
+
+Mas:
+
+Selection must not decode it
+Publication must not decode it
+Presentation must not decode it
+
+⸻
+
+86. Hot data não será JSON-centric
+
+Hot paths usam:
+
+typed SQLite columns
+integer IDs
+small enums
+normalized relations
+
+JSON/BLOB permanece reservado para connector-owned/cold/extensible state.
+
+Isso reduz parsing, allocations e schema leakage.
+
+⸻
+
+87. Search
+
+FTS opera sobre canonical projection.
+
+Exemplo:
+
+origin_revision_fts
+
+indexando:
+
+headline
+summary
+body/searchProjection
+
+Search Plan consulta FTS.
+
+Ele não delega search semantics ao connector, exceto quando um produto futuro explicitamente pedir remote search.
+
+⸻
+
+88. Observability
+
+A instrumentação será local-first.
+
+os_signpost/MetricKit podem medir:
+
+acquisition latency
+admission latency
+candidate query
+selection
+publication commit
+window materialization
+asset decode
+MainActor apply
+runway estimate
+scroll hitch
+
+Cada measurement deve ser praticamente zero-cost quando diagnostics estão desabilitados.
+
+⸻
+
+89. Correlation IDs
+
+Operações importantes podem usar IDs locais efêmeros:
+
+AcquisitionOperationID
+SelectionOperationID
+PublicationOperationID
+SessionGeneration
+
+para reconstruir timeline em diagnostics.
+
+Isso não exige remote telemetry.
+
+⸻
+
+90. Metrics de supply
+
+Manter separação explícita:
+
+CanonicalSupply
+MediaPreparedSupply
+SequenceableSupply
+PublishedSupply
+DecodedVisualWindow
+
+Nunca reutilizar genericamente “prepared”.
+
+Isso evita métricas semanticamente ambíguas.
+
+⸻
+
+91. Milhões de instalações
+
+O modelo de escala é importante:
+
+FeedMine não está executando uma máquina central com milhões de sessões.
+
+Existem milhões de pequenas máquinas locais independentes.
+
+Portanto, os problemas dominantes são:
+
+per-device efficiency
+battery
+disk
+memory
+background execution
+external-host load
+network privacy
+thundering herd
+
+e não:
+
+central horizontal scaling
+distributed cache
+server partitioning
+central message queue
+
+A arquitetura não deve importar soluções de backend distribuído que não resolvem problemas reais do cliente.
+
+⸻
+
+92. Source-friendly scaling
+
+Para reduzir impacto coletivo dos clientes:
+
+conditional requests
+jitter
+host token buckets
+target sharing
+bounded acquisition frontier
+adaptive cadence
+backoff
+speculation budgets
+background budgets
+
+são partes fundamentais da arquitetura.
+
+Não apenas otimizações posteriores.
+
+⸻
+
+93. Integração — alcance da mudança
+
+Essa arquitetura não é apenas troca de “feed engine”.
+
+O range de integração é:
+
+UI
+Session
+Presentation models
+Viewport tracking
+Media rendering
+Feed storage
+Canonical identity
+Catalog bindings
+Selection
+Publication
+Network acquisition
+Background execution
+Diagnostics
+Durable user-state bridges
+
+⸻
+
+94. UI impact
+
+Mudanças necessárias conceitualmente:
+
+FeedScreen
+FeedCardView
+FeedScreenStore
+ViewportTracker
+Refresh UX
+Context switching
+visual materialization
+action routing
+tail states
+
+Não é necessário reescrever toda a UI.
+
+Mas toda surface que hoje bypassa a Presentation Boundary precisará ser convertida.
+
+⸻
+
+95. Storage impact
+
+Será necessário um novo modelo de runtime storage.
+
+Principal mudança estrutural:
+
+external feed item
+
+deixa de ser simultaneamente:
+
+origin
+current content
+publication
+presentation identity
+
+Essas responsabilidades passam a entidades distintas.
+
+⸻
+
+96. Networking impact
+
+Toda aquisição passa por:
+
+AcquisitionDemand
+→ Planner
+→ Target
+→ Connector
+→ Batch
+→ Admission
+
+Não permanece network access espalhado por view models, stores ou media rendering.
+
+⸻
+
+97. Catalog impact
+
+Catálogo passa a declarar:
+
+Source
+Provider
+SourceBinding
+editorial metadata
+
+e não assumir que:
+
+Source == URL
+
+A camada operacional transforma bindings em targets.
+
+⸻
+
+98. Durable user data
+
+Bookmark, Collection e read state não devem depender de raw canonical rows para sobreviver.
+
+Será necessário um pequeno adapter layer entre:
+
+PublishedCard / durable content reference
+
+e os modelos duráveis existentes.
+
+O desenho exato depende do estado do FeedMine no momento da integração.
+
+⸻
+
+99. Code compactness strategy
+
+O código permanece pequeno por cinco decisões:
+
+1. Policies como dados
+
+Evitar subclasses e dezenas de implementations.
+
+2. Reducers puros
+
+Evitar state transition code espalhado.
+
+3. SQLite como source of truth
+
+Evitar object graph em memória.
+
+4. Poucos actors
+
+Evitar actor topology complexa.
+
+5. Boundary forte
+
+Evitar branches específicos de protocolo downstream.
+
+⸻
+
+100. Production code budget
+
+Não é uma métrica de qualidade, mas serve como guardrail arquitetural.
+
+Estimativa razoável para o runtime baseline, excluindo tests e connectors adicionais:
+
+Domain/types/policies             700–1,000
+Session + reducer                500–800
+Selection                        600–900
+Publication                      400–600
+Runway                           300–500
+Acquisition/admission            900–1,300
+Storage/migrations/repos       1,200–1,800
+Media                            600–900
+UI bridge                        300–500
+Diagnostics/background           300–500
+
+Faixa:
+
+~5,800–8,800 linhas de production Swift
+
+O primeiro Syndication Connector provavelmente adicionaria:
+
+~600–1,000
+
+Não é uma promessa de LOC.
+
+É um sinal de arquitetura.
+
+Se o core chegar rapidamente a 20–30 mil linhas antes de connectors complexos, o desenho provavelmente está criando abstração demais.
+
+⸻
+
+101. File size guardrails
+
+Nenhum arquivo central deveria crescer para milhares de linhas.
+
+Referência:
+
+FeedSession.swift            <300
+FeedSessionReducer.swift     <500
+SelectionEngine.swift        <400
+PublicationCoordinator.swift <400
+AdmissionEngine.swift        <500
+RunwayController.swift       <300
+
+Valores indicativos.
+
+Quando um arquivo excede muito isso, normalmente está absorvendo outra responsabilidade.
+
+⸻
+
+102. Protocol usage rule
+
+Criar protocol apenas em boundaries onde existem implementations realmente substituíveis ou efeito externo importante.
+
+Prováveis protocols:
+
+FeedConnector
+Clock
+possibly RandomSource
+possibly system resource observers
+
+Não criar automaticamente:
+
+OriginRepositoryProtocol
+EditionRepositoryProtocol
+MediaRepositoryProtocol
+FooServiceProtocol
+BarServiceProtocol
+
+apenas para mocking.
+
+Repositories concretos sobre GRDB podem ser testados contra SQLite real em memória.
+
+⸻
+
+103. Testing architecture
+
+A arquitetura favorece testes baratos.
+
+Reducer
+
+state + event
+→ exact new state/effects
+
+sem async ou database.
+
+Selection
+
+Fixtures canonical supply:
+
+candidates + policy + seed
+→ exact ordered IDs
+
+Admission
+
+SQLite temporary database:
+
+batch
+→ exact database state
+
+Publication
+
+SelectionDraft
+→ transaction
+→ immutable Segment
+
+Connector
+
+Recorded protocol fixtures:
+
+external payload
+→ AcquisitionBatch
+
+⸻
+
+104. Property tests
+
+Alguns invariants merecem property testing.
+
+Determinism
+
+same supply + same plan + same seed
+= same publication
+
+Publication immutability
+
+Depois do commit:
+
+arbitrary upstream mutation
+≠ change historical card
+
+Admission idempotency
+
+admit(batch)
+admit(batch)
+
+produz o mesmo semantic state.
+
+Stale rejection
+
+generation N result
+after generation N+1
+
+não altera canonical semantic state indevidamente.
+
+⸻
+
+105. Crash tests
+
+Devem existir testes nos pontos:
+
+before OriginRevision insert
+after OriginRevision insert
+before currentRevision CAS
+after CAS
+before checkpoint
+after checkpoint
+before publication Segment
+after Segment
+
+Objetivo:
+
+checkpoint never ahead of admitted content
+publication never half-committed
+
+⸻
+
+106. Architecture enforcement tests
+
+Build/test pode proibir imports.
+
+Exemplo:
+
+FeedRuntime/
+
+não pode importar:
+
+FeedKit
+ATProto SDK
+Nostr library
+Mastodon model library
+
+E FeedUIBridge não pode importar GRDB.
+
+Isso transforma architecture rules em build rules.
+
+⸻
+
+107. Runtime invariants
+
+Os seguintes invariants são normativos:
+
+I-01 UI never performs acquisition.
+I-02 Renderer never initiates network.
+I-03 Selection never decodes protocol-specific representation.
+I-04 Publication never decodes protocol-specific representation.
+I-05 Presentation never decodes protocol-specific representation.
+I-06 OriginRevision is immutable.
+I-07 FeedSegment is immutable.
+I-08 PublishedCard freezes an exact OriginRevision.
+I-09 Upstream mutation never rewrites published history.
+I-10 Only PublicationCoordinator appends FeedSegments.
+I-11 Admission checkpoint cannot advance beyond admitted content.
+I-12 Stale target generation cannot mutate canonical supply.
+I-13 FeedWindow is bounded.
+I-14 SwiftUI identity is PublicationCardID.
+I-15 Rerender does not create exposure.
+I-16 Durable state does not semantically depend on reconstructible data.
+I-17 Network health does not modify editorial quality.
+I-18 Connector-specific SDKs remain inside connector targets.
+I-19 Acquisition work is bounded by policy.
+I-20 Scroll never directly means loadMore/fetch.
+
+⸻
+
+108. Architectural anti-patterns
+
+Qualquer uma destas ocorrências deve ser tratada como architecture defect:
+
+if protocol == .nostr { ... }
+
+dentro de Selection.
+
+AsyncImage(url: ...)
+
+em FeedCard.
+
+FeedScreenStore.loadMore()
+
+chamando network.
+
+FeedSession.dbQueue.read { ... }
+
+com SQL inline.
+
+OriginRecord.nostrKind
+OriginRecord.rssGuid
+OriginRecord.atprotoCID
+
+no canonical model.
+
+SourceID(hash(url))
+
+como identidade editorial.
+
+⸻
+
+109. O papel do RuntimeKernel
+
+Não deve existir uma mega classe FeedRuntime.
+
+Pode existir apenas um façade pequeno:
+
+final class FeedRuntime {
+    func session(
+        context: ContextKey
+    ) -> FeedSession
+}
+
+Sua função é construir/obter Sessions e expor lifecycle global necessário.
+
+Não contém:
+
+selection
+SQL
+acquisition logic
+publication state
+media state
+
+⸻
+
+110. Arquitetura operacional resumida
+
+O sistema completo pode ser entendido como dois loops independentes.
+
+Supply loop
+
+Demand
+→ AcquisitionPlanner
+→ Connector
+→ AcquisitionBatch
+→ Admission
+→ Canonical Supply
+→ MediaPreparation
+
+Consumption loop
+
+FeedSession
+→ FeedWindow
+→ ViewportObservation
+→ Runway
+→ Publication demand
+→ Selection
+→ Publication
+→ FeedWindow
+
+Eles se encontram por supply.
+
+Não por chamadas UI → network.
+
+⸻
+
+111. O insight mais importante
+
+A arquitetura não precisa tentar prever todo futuro protocolo.
+
+Ela precisa tornar novos protocolos irrelevantes depois da admission boundary.
+
+O custo de adicionar um novo ecossistema deve ficar aproximadamente concentrado em:
+
+Connector
+SourceBinding translation
+AcquisitionTarget planning
+identity/version translation
+fixtures/tests
+optional interaction executor
+
+Se adicionar um protocolo exigir modificar:
+
+SelectionEngine
+PublicationCoordinator
+FeedEdition
+FeedSession
+FeedPresentationSnapshot
+FeedCardView
+
+a boundary falhou.
+
+⸻
+
+112. Resultado arquitetural
+
+O FeedMine V2 resultante não é um “feed loader”.
+
+É uma pequena máquina editorial local.
+
+Externamente ela recebe observações heterogêneas.
+
+Internamente ela mantém estoque canônico limitado.
+
+Ela publica uma história local imutável.
+
+A Session navega essa história através de uma janela finita.
+
+Runway antecipa escassez.
+
+Acquisition aumenta apenas a oferta futura.
+
+Media é preparada antes do renderer.
+
+SwiftUI só apresenta decisões já tomadas.
+
+Em sua forma final:
+
+heterogeneous world
+        ↓
+small protocol-specific connector
+        ↓
+transactional admission
+        ↓
+compact canonical local database
+        ↓
+bounded deterministic selector
+        ↓
+immutable publication log
+        ↓
+reducer-driven session
+        ↓
+finite local presentation window
+        ↓
+SwiftUI
+
+Isso produz exatamente a propriedade que o runtime precisa preservar:
+
+finger moves
+↓
+local history moves
+
+e não:
+
+finger moves
+↓
+database logic
+↓
+selection logic
+↓
+network
+↓
+remote media
+↓
+UI
+
+⸻
+
+113. Decisão final proposta
+
+A implementação técnica candidata é, portanto:
+
+um runtime data-oriented e SQLite-backed, com canonical admission transacional, immutable publication log, Session orientada por reducer, poucos actors de coordenação e Connectors isolados em compile-time boundaries.
+
+Não proponho uma grande graph architecture.
+
+Não proponho um engine baseado em centenas de objetos residentes.
+
+Não proponho uma framework abstrata de protocolos.
+
+Não proponho uma state machine monolítica.
+
+A inteligência está principalmente em:
+
+correct boundaries
+small stable identities
+immutable facts
+bounded working sets
+deterministic transitions
+transactional admission
+cheap local projections
+aggressive separation of hot and cold data
+
+Essa combinação é pequena o suficiente para continuar compreensível e forte o suficiente para suportar um FeedMine muito maior que o produto atual.

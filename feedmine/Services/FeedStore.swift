@@ -3,6 +3,8 @@ import UIKit
 import GRDB
 import NaturalLanguage
 import Observation
+import FeedRuntime
+import FeedDomain
 
 private actor CuratedStarterSourceCache {
     static let shared = CuratedStarterSourceCache()
@@ -28,7 +30,10 @@ final class FeedStore {
     let registry = SourceRegistry()
     let scheduler = AdaptiveScheduler()
     let reservoir = Reservoir()
-    let fetcher = RSSFetcher()
+    /// The process's one fetcher. Injectable so a test can script and count the requests a demand
+    /// makes — the no-double-acquisition proof in PR-15 counts attempts, and a counter over the real
+    /// network is neither scriptable nor offline.
+    let fetcher: RSSFetcher
     let prefetcher = ImagePrefetcher()
     let cardQueue = ReadyCardQueue()
     private(set) var imageResolutionQueue: ImageResolutionQueue!
@@ -949,6 +954,10 @@ final class FeedStore {
     private var activeSearchExpression = SearchExpression.empty
     private var activeSearchIncludesSources = true
     private var activeSearchIncludesContents = false
+    /// Whether the active search's *online* content demand was requested. Separate from
+    /// `activeSearchIncludesContents` so the local FTS query and the network sweep are two
+    /// decisions: the sweep is explicit and never an implicit effect of the local search.
+    private(set) var activeSearchDemandsOnlineContent = false
     private var searchNeedsRestartAfterFilterEditing = false
 
     // MARK: - Read & Seen state
@@ -1116,9 +1125,10 @@ final class FeedStore {
     #endif
 
     // MARK: - Init
-    init(inMemory: Bool = false) throws {
+    init(inMemory: Bool = false, fetcher: RSSFetcher? = nil) throws {
         let endInitMetric = FeedMetrics.beginInterval("FeedStore.init")
         defer { endInitMetric() }
+        self.fetcher = fetcher ?? RSSFetcher()
         self.usesPersistentStorage = !inMemory
         self.hasPreviouslyLoadedContent = !inMemory
             && UserDefaults.standard.bool(forKey: Self.hasPreviouslyLoadedContentKey)
@@ -1560,6 +1570,58 @@ final class FeedStore {
         coldStartRunwayIsUseful(items, targetSourceCount: Reservoir.pageSize)
     }
 
+    // MARK: - Source demand ledger (PR-14)
+
+    /// One refill per endpoint, shared by every producer that draws from this store.
+    ///
+    /// The twelve acquisition pairs the map in `local://recon-acquisition.md` §3 names all come from
+    /// producers calling `fetcher` directly with overlapping endpoint sets. The ledger is the value that
+    /// decides — synchronously on the main actor, before any `await` — which endpoints a demand may
+    /// refill and which it must join or answer from what is already retained locally.
+    private var sourceDemandLedger = SourceDemandLedger()
+
+    /// Observability for PR-14: how many demands this store led, joined and answered from a fresh refill.
+    var sourceDemandCounters: SourceDemandLedger.Counters { sourceDemandLedger.counters }
+    var sourcesInFlight: Int { sourceDemandLedger.inFlightCount }
+
+    private static func sourceDemandTimestampMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// Claims `[[urls]]` for one producer. The caller fetches only `grant.led`.
+    ///
+    /// `urls` are normalized with `OPMLParser.normalizeURL` and the grant's arrays are converted back to
+    /// the normalized form, so every producer compares endpoints by the same identity.
+    func claimSourceDemand(
+        _ urls: [String],
+        purpose: SourceDemandLedger.Purpose,
+        freshnessWindowMs: Int64? = nil
+    ) -> SourceDemandLedger.Grant {
+        sourceDemandLedger.demand(
+            urls.map { OPMLParser.normalizeURL($0) },
+            purpose: purpose,
+            atMs: Self.sourceDemandTimestampMs(),
+            freshnessWindowMs: freshnessWindowMs
+        )
+    }
+
+    /// Ends a claim. `outcomes` is the fetch result's per-source outcome map (keys are the raw source urls as the
+    /// fetcher reports them); an endpoint whose outcome is `.failed` is not recorded as fresh, so the next demand
+    /// retries it. The in-flight marks for `grant.led` are always cleared, including when `outcomes` is empty.
+    func finishSourceDemand(
+        _ grant: SourceDemandLedger.Grant,
+        outcomes: [String: FeedFetchOutcome]
+    ) {
+        let succeeded = Set(outcomes.compactMap { url, outcome in
+            outcome.isFailed ? nil : OPMLParser.normalizeURL(url)
+        })
+        sourceDemandLedger.finish(
+            grant.led,
+            atMs: Self.sourceDemandTimestampMs(),
+            succeeded: succeeded
+        )
+    }
+
     nonisolated private static func activeCatalogSourceCount() -> Int {
         if let count = CatalogRuntime.activeManifest()?.sourceCount {
             return count
@@ -1657,8 +1719,16 @@ final class FeedStore {
                 ? items.count
                 : items.filter { self.activeContentType.matches($0) }.count
             let remainingItems = max(1, Self.coldStartImmediateItemCount - relevantItems)
+            // P1: the bootstrap leads its chunk; endpoints another producer is already refilling are joined,
+            // and a chunk with nothing left to lead is answered by that producer instead of fetched again.
+            let grant = claimSourceDemand(chunk.map(\.url), purpose: .bootstrap)
+            let grantedURLs = Set(grant.led)
+            let grantedChunk = chunk.filter {
+                grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+            }
+            guard !grantedChunk.isEmpty else { break }
             let result = await fetcher.fetchStarter(
-                chunk,
+                grantedChunk,
                 maxConcurrent: min(48, chunk.count),
                 // Stop a chunk at a *screenful* from a few publishers, not at the runway's
                 // diversity target: with `coldStartFetchChunkSize = 240` equal to the measured source
@@ -1675,6 +1745,7 @@ final class FeedStore {
                     self?.recordStartupFetchProgress(result)
                 }
             )
+            finishSourceDemand(grant, outcomes: result.sourceOutcomes)
             items.append(contentsOf: result.items)
             fetchedSourceCount += result.fetchedSourceCount
             failedSourceCount += result.failedSourceCount
@@ -2908,20 +2979,31 @@ final class FeedStore {
         display.setLoadingState(.idle)
     }
 
-    func loadMoreIfNeeded(currentItem: FeedItem) async {
+    /// Replenishment scheduled from a viewport observation (PR-13).
+    ///
+    /// The per-item callback this replaces fired when a card appeared, so its demand signal was "a card
+    /// exists" rather than "the viewport is here": it could not tell a fling from a settle, and with
+    /// filters active it compared an index in the filtered page against the unfiltered count. The
+    /// observation below states both numbers in the same space — the page the reader is looking at.
+    ///
+    /// The work is still bounded the same way: a 300 ms throttle that rejects the rapid-fire updates a
+    /// scroll produces, one append of a reservoir page, and a trim debounce. The observation itself
+    /// performs no selection, decode or fetch.
+    func loadMoreIfNeeded(viewportLastVisibleOrdinal: Int, publishedOrdinalCount: Int) async {
         guard !isSearching else { return }
         guard !isBookmarkFeed else { return }
         guard !activePreset.isSmartFeed else { return }
         guard !activePreset.isLastClicked else { return }
 
-        // Fast reject: if the last load-more was within 300ms, skip the O(n) scan.
-        // Cards appear in rapid succession during scroll; only the last one matters.
+        // Fast reject: if the last load-more was within 300ms, skip the O(1) threshold check.
+        // The viewport moves in rapid succession during scroll; only the last position matters.
         let now = Date()
         if let last = lastLoadMoreAttempt, now.timeIntervalSince(last) < 0.3 { return }
         lastLoadMoreAttempt = now
 
-        guard let itemIndex = visibleItems.firstIndex(where: { $0.id == currentItem.id }) else { return }
-        guard itemIndex >= visibleItems.count - Reservoir.loadMoreThreshold else { return }
+        let itemIndex = viewportLastVisibleOrdinal
+        guard publishedOrdinalCount > 0, itemIndex >= 0 else { return }
+        guard itemIndex >= publishedOrdinalCount - Reservoir.loadMoreThreshold else { return }
         guard itemIndex != lastLoadedIndex else { return }
         lastLoadedIndex = itemIndex
 
@@ -2934,7 +3016,7 @@ final class FeedStore {
                 guard let self else { return }
                 await self.runwayController.reportViewport(
                     currentIndex: itemIndex,
-                    publishedCount: self.visibleItems.count
+                    publishedCount: publishedOrdinalCount
                 )
                 await self.runwayController.evaluate()
             }
@@ -3476,18 +3558,37 @@ final class FeedStore {
     }
 
     // MARK: - Search
-    func search(_ query: String, includeSources: Bool = true, includeContents: Bool = true) {
+
+    /// Installs the canonical content index the local search reads, or removes it.
+    ///
+    /// Called by the composition of a launch whose runtime owns acquisition (`v2Full`) and by its
+    /// teardown; never in `legacy`, `mirroredShadow` or `v2Presentation`, where nothing admits into a
+    /// runtime database and the legacy `feed_item_fts` over `feedmine.sqlite` remains the index with
+    /// content in it (plan §14 PR-14 clause two). The store does not decide the mode: it is handed the
+    /// read path the composition authorized, so the search cannot disagree with the producer.
+    func useCanonicalContentSearch(_ source: CanonicalContentSearch?) {
+        searchEngine.canonicalContentSearch = source
+    }
+
+    func search(
+        _ query: String,
+        includeSources: Bool = true,
+        includeContents: Bool = true,
+        demandOnlineContent: Bool
+    ) {
         search(
             SearchExpression(legacyQuery: query),
             includeSources: includeSources,
-            includeContents: includeContents
+            includeContents: includeContents,
+            demandOnlineContent: demandOnlineContent
         )
     }
 
     func search(
         _ expression: SearchExpression,
         includeSources: Bool = true,
-        includeContents: Bool = true
+        includeContents: Bool = true,
+        demandOnlineContent: Bool
     ) {
         searchTask?.cancel()
         isSearching = true
@@ -3503,6 +3604,7 @@ final class FeedStore {
         activeSearchExpression = expression
         activeSearchIncludesSources = includeSources
         activeSearchIncludesContents = includeContents
+        activeSearchDemandsOnlineContent = demandOnlineContent
         guard expression.canSearch else {
             unifiedSearchResults = .empty
             isSearchLoading = false
@@ -3523,8 +3625,9 @@ final class FeedStore {
                   self.isSearching,
                   generation == self.searchGeneration else { return }
             // Source-only search is satisfied by the complete catalog index.
-            // Contents search additionally walks every eligible live endpoint.
-            guard includeContents, self.usesPersistentStorage else { return }
+            // The local content search is the canonical FTS; the online sweep is a
+            // separate, explicit demand and never an implicit effect of it.
+            guard demandOnlineContent, includeContents, self.usesPersistentStorage else { return }
             await self.runRemoteSearchSweep(
                 expression: expression,
                 includeSources: includeSources,
@@ -3607,10 +3710,25 @@ final class FeedStore {
                   isSearching,
                   generation == searchGeneration else { return }
             let chunk = Array(sources[start..<min(start + batchSize, sources.count)])
+            // P3/P8: the sweep leads only what no other producer is already refilling; a chunk with nothing
+            // left to lead still advances the scan cursor so the progress denominator cannot stall.
+            let grant = claimSourceDemand(chunk.map(\.url), purpose: .searchSweep)
+            let grantedURLs = Set(grant.led)
+            let grantedChunk = chunk.filter {
+                grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+            }
+            guard !grantedChunk.isEmpty else {
+                searchScannedSourceCount = min(
+                    searchTotalSourceCount,
+                    searchScannedSourceCount + chunk.count
+                )
+                continue
+            }
             let result = await fetcher.fetchAll(
-                chunk,
+                grantedChunk,
                 maxConcurrent: min(16, chunk.count)
             )
+            finishSourceDemand(grant, outcomes: result.sourceOutcomes)
             guard !Task.isCancelled,
                   isSearching,
                   generation == searchGeneration else { return }
@@ -3620,7 +3738,7 @@ final class FeedStore {
                 by: { OPMLParser.normalizeURL($0.sourceURL) }
             ).mapValues(\.count)
             var healthEntries: [(url: String, itemCount: Int?)] = []
-            for source in chunk {
+            for source in grantedChunk {
                 let status = result.sourceOutcomes[source.url] ?? .failed(URLError(.unknown))
                 scheduler.recordFetch(
                     sourceURL: source.url,
@@ -3776,6 +3894,7 @@ final class FeedStore {
         searchFailedSourceCount = 0
         searchScanCompleted = false
         activeSearchExpression = .empty
+        activeSearchDemandsOnlineContent = false
         searchGeneration &+= 1
         unifiedSearchResults = .empty
     }
@@ -3803,7 +3922,8 @@ final class FeedStore {
         search(
             activeSearchExpression,
             includeSources: activeSearchIncludesSources,
-            includeContents: activeSearchIncludesContents
+            includeContents: activeSearchIncludesContents,
+            demandOnlineContent: activeSearchDemandsOnlineContent
         )
     }
 
@@ -4419,9 +4539,24 @@ final class FeedStore {
     /// cold start. Runs alongside the DB seed — if the database has nothing,
     /// this fetches fresh content from the network immediately.
     func fetchWhatsNewBooster() {
+        // P2: the booster joins the progressive/bootstrap refill instead of re-requesting enabled endpoints
+        // they already hold, and answers from a refill inside the same 15-minute window the showcase uses.
+        let enabled = registry.enabledSources
+        let grant = claimSourceDemand(
+            enabled.map(\.url),
+            purpose: .whatsNewBooster,
+            freshnessWindowMs: FeedSurfaceCatalog.plan(for: .whatsNew).refillFreshnessWindowMs
+        )
+        let grantedURLs = Set(grant.led)
+        let grantedSources = enabled.filter {
+            grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+        }
         whatsNewManager.fetchWhatsNewBooster(
-            enabledSources: registry.enabledSources,
+            grantedSources: grantedSources,
             fetcher: fetcher,
+            finishDemand: { [self] _, batch in
+                finishSourceDemand(grant, outcomes: batch.sourceOutcomes)
+            },
             persistFetchedItems: { [self] in await persistFetchedItems($0) },
             throttledReservoirAppend: { [self] in throttledReservoirAppend($0) },
             collectCandidates: { [self] in collectWhatsNewCandidates($0) },
@@ -5388,12 +5523,20 @@ final class FeedStore {
             // Gentle 1s inter-chunk delay (skip first) to avoid rate-limiting
             // from YouTube and other aggressive CDNs when processing 800+ sources.
             if chunkStart > 0 { try? await Task.sleep(for: .seconds(1)) }
+            // P3: the progressive fill leads only the endpoints no other producer is already refilling.
+            let grant = claimSourceDemand(chunk.map(\.url), purpose: .progressiveFetch)
+            let grantedURLs = Set(grant.led)
+            let grantedChunk = chunk.filter {
+                grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+            }
+            guard !grantedChunk.isEmpty else { continue }
             let result: FeedFetchBatch
             if chunkStart == 0 && reservoir.reservoirCount < Reservoir.reservoirLowWatermark {
-                result = await fetcher.fetchStarter(chunk, maxConcurrent: 10)
+                result = await fetcher.fetchStarter(grantedChunk, maxConcurrent: 10)
             } else {
-                result = await fetcher.fetchAll(chunk, maxConcurrent: 5)
+                result = await fetcher.fetchAll(grantedChunk, maxConcurrent: 5)
             }
+            finishSourceDemand(grant, outcomes: result.sourceOutcomes)
             guard !Task.isCancelled else { break }
             await Task.yield()  // Let UI work run between chunks
             totalFetched += result.items.count
@@ -5403,7 +5546,7 @@ final class FeedStore {
             let sourceItemCounts = Dictionary(grouping: result.items, by: \.sourceURL)
                 .mapValues(\.count)
             var healthEntries: [(url: String, itemCount: Int?)] = []
-            for source in chunk {
+            for source in grantedChunk {
                 scheduler.recordFetch(sourceURL: source.url, outcome: result.sourceOutcomes[source.url] ?? .failed(URLError(.unknown)))
                 let count = sourceItemCounts[source.url]
                 healthEntries.append((source.url, count))
@@ -5607,27 +5750,181 @@ final class FeedStore {
         activePreset = Settings.activePreset
     }
 
-    /// Runs a short, persisted slice of the Smart Feed queue for a
-    /// `BGAppRefreshTask`. The system owns the execution window; cancellation
-    /// is checked between feeds and propagated into the network task group.
-    func performSmartFeedBackgroundRefresh() async -> Bool {
-        guard usesPersistentStorage else { return true }
+    /// One bounded background refresh, on behalf of a `BGAppRefreshTask` (plan §14 PR-15).
+    ///
+    /// This is the demand the handler used to serve by building `loader ?? FeedLoader()` — a second
+    /// `FeedStore`, `RSSFetcher`, OPML parse and taxonomy load for the same work the foreground was
+    /// already doing (P9 in the acquisition map). The demand is served by *this* store, through the
+    /// same fetcher, the same demand ledger and the same persistence the foreground uses.
+    ///
+    /// The due Smart Feed presets go first, because they are what the task identifier names; when none
+    /// is due the budget is spent on a bounded refill of the enabled set. Both halves claim their
+    /// endpoints on `SourceDemandLedger`, so an endpoint another producer already holds issues no
+    /// request — which is the pair closing by a count rather than by a comment.
+    ///
+    /// The claim is released on every exit, including cancellation: endpoints this demand did not
+    /// refill become eligible again, the ones it did refill stay fresh, and content it already
+    /// committed stays committed.
+    func runBackgroundRefreshDemand(_ demand: BackgroundRefreshDemand) async -> BackgroundRefreshDemandReport {
+        var report = BackgroundRefreshDemandReport()
+        guard demand.isAllowed else { return report }
+        // No `usesPersistentStorage` guard: the demand is driven by tests as well as by the system, and
+        // an in-memory store serves it through the same ledger, fetcher and persistence. The one thing
+        // that does need durable storage is the catalogue preparation below, which guards itself.
         await prepareForBackgroundSmartFeedRefresh()
-        guard !Task.isCancelled, !registry.sources.isEmpty else { return false }
+        guard !registry.sources.isEmpty else { return report }
+        guard !Task.isCancelled else {
+            report.cancelled = true
+            return report
+        }
 
-        let maximumFeeds = ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 2
-        var attempted = false
-        var allSucceeded = true
+        // Any condition that shrank the demand means one preset rather than two: a background window
+        // is short, and a constrained device should spend it on less, not on the same amount twice.
+        let maximumFeeds = demand.appliedSignals.isEmpty ? 2 : 1
+        var refreshedPreset = false
         for _ in 0..<maximumFeeds {
-            guard !Task.isCancelled else { return false }
+            guard !Task.isCancelled else {
+                report.cancelled = true
+                return report
+            }
             guard let succeeded = await performNextSmartFeedRefresh(
                 mode: .background,
                 presentWhenActive: false
             ) else { break }
-            attempted = true
-            allSucceeded = allSucceeded && succeeded
+            refreshedPreset = true
+            if succeeded {
+                report.smartFeedsRefreshed += 1
+            } else {
+                report.smartFeedsFailed += 1
+            }
         }
-        return !attempted || allSucceeded
+        guard !refreshedPreset else { return report }
+
+        await refillEnabledSet(for: demand, into: &report)
+        return report
+    }
+
+    /// One bounded refill of the enabled set, claimed on the demand ledger and raced against the
+    /// demand's own deadline.
+    private func refillEnabledSet(
+        for demand: BackgroundRefreshDemand,
+        into report: inout BackgroundRefreshDemandReport
+    ) async {
+        let candidates = backgroundRefreshCandidates(limit: demand.sourceLimit)
+        guard !candidates.isEmpty else { return }
+
+        // No freshness window: a background refresh wants current bytes, and the ledger's `shared`
+        // answer — not recency — is what keeps it from duplicating the foreground.
+        let grant = claimSourceDemand(candidates.map(\.url), purpose: .backgroundDrip)
+        report.led = grant.led.count
+        report.shared = grant.shared.count
+        report.servedFresh = grant.servedFresh.count
+        guard !grant.led.isEmpty else { return }
+
+        let grantedURLs = Set(grant.led)
+        let granted = candidates.filter { grantedURLs.contains(OPMLParser.normalizeURL($0.url)) }
+        var outcomes: [String: FeedFetchOutcome] = [:]
+        defer {
+            // Always: an endpoint whose outcome is a failure is not recorded as fresh, so the next
+            // demand retries it, and no claim is left behind by a cancelled run.
+            finishSourceDemand(grant, outcomes: outcomes)
+        }
+        guard !Task.isCancelled else {
+            report.cancelled = true
+            return
+        }
+
+        isRegularBackgroundFetchActive = true
+        let fetcher = self.fetcher
+        let cap = max(1, demand.maxConcurrency)
+        let deadline = demand.deadline
+        // Two structured children, so the demand's own cancellation reaches both. The fetch's result is
+        // always the answer: a deadline that elapses stops the fetch starting new work and then keeps
+        // draining for what it already produced, and a cancellation does the same. Discarding that batch
+        // would make "committed then cancelled" indistinguishable from "cancelled before commit".
+        enum RefillEvent: Sendable {
+            case batch(FeedFetchBatch)
+            case deadline
+            case cancelled
+        }
+        var batch: FeedFetchBatch?
+        await withTaskGroup(of: RefillEvent.self) { group in
+            group.addTask { .batch(await fetcher.fetchAll(granted, maxConcurrent: cap)) }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: deadline)
+                    return .deadline
+                } catch {
+                    return .cancelled
+                }
+            }
+            drain: while let event = await group.next() {
+                switch event {
+                case .batch(let value):
+                    batch = value
+                    // `withTaskGroup` awaits the children it is left with but does not cancel them, so
+                    // the sleeper would otherwise hold the demand for its full ceiling.
+                    group.cancelAll()
+                    break drain
+                case .deadline:
+                    // The demand's own ceiling, not the system's window.
+                    group.cancelAll()
+                case .cancelled:
+                    // The task went away; the fetch is cancelled with it and still reports what it has.
+                    break
+                }
+            }
+        }
+        isRegularBackgroundFetchActive = false
+
+        if let batch {
+            outcomes = batch.sourceOutcomes
+            report.attempted = batch.sourceOutcomes.count
+            report.failed = batch.failedSourceCount
+            for source in granted {
+                let outcome = batch.sourceOutcomes[source.url] ?? .failed(URLError(.unknown))
+                if !outcome.isFailed { report.committed += 1 }
+                scheduler.recordFetch(sourceURL: source.url, outcome: outcome)
+            }
+            let responseTimes = await fetcher.drainResponseTimes()
+            for (url, milliseconds) in responseTimes {
+                scheduler.recordResponseTime(sourceURL: url, milliseconds: milliseconds)
+            }
+            report.newItems = await commitBackgroundItems(batch.items)
+        }
+
+        report.cancelled = Task.isCancelled
+        if !report.cancelled { lastRefreshDate = .now }
+    }
+
+    /// The endpoints one background demand may spend its budget on: the enabled set, least recently
+    /// fetched first, so a bounded slice spreads over the catalogue instead of repeating its head.
+    private func backgroundRefreshCandidates(limit: Int) -> [FeedSource] {
+        let enabled = registry.enabledSources
+        guard enabled.count > limit else { return enabled }
+        return Array(
+            enabled
+                .sorted {
+                    (scheduler.lastFetchedAt[$0.url] ?? .distantPast)
+                        < (scheduler.lastFetchedAt[$1.url] ?? .distantPast)
+                }
+                .prefix(limit)
+        )
+    }
+
+    /// Persists what one demand fetched and runs the same downstream steps the drip runs, so a
+    /// background commit reaches the reservoir, What's New and the image prefetcher exactly as a
+    /// foreground one does. Returns how many items were new to the database.
+    private func commitBackgroundItems(_ items: [FeedItem]) async -> Int {
+        guard !items.isEmpty else { return 0 }
+        let actualNew = await persistFetchedItems(items)
+        let visibleNew = await presentationItems(from: actualNew)
+        guard !visibleNew.isEmpty else { return actualNew.count }
+        throttledReservoirAppend(visibleNew)
+        collectWhatsNewCandidates(visibleNew)
+        prefetchImagesIfEnabled(for: visibleNew)
+        await capSourceItemsBatch(Array(Set(actualNew.map(\.sourceURL))))
+        return actualNew.count
     }
 
     /// Slow-drip background refresh — fetches a small batch of sources every
@@ -5689,9 +5986,17 @@ final class FeedStore {
                     Array(sourceSnapshot.shuffled().prefix(batchSize))
                 }.value
                 guard !batch.isEmpty else { continue }
+                // P3/P4: the drip joins a refill another producer already holds instead of duplicating it.
+                let grant = self.claimSourceDemand(batch.map(\.url), purpose: .backgroundDrip)
+                let grantedURLs = Set(grant.led)
+                let grantedBatch = batch.filter {
+                    grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+                }
+                guard !grantedBatch.isEmpty else { continue }
                 self.isRegularBackgroundFetchActive = true
-                let result = await self.fetcher.fetchAll(batch, maxConcurrent: 2)
+                let result = await self.fetcher.fetchAll(grantedBatch, maxConcurrent: 2)
                 self.isRegularBackgroundFetchActive = false
+                self.finishSourceDemand(grant, outcomes: result.sourceOutcomes)
                 guard !Task.isCancelled else { break }
                 // Drain response times for future speed-sorted batches.
                 let bgResponseTimes = await self.fetcher.drainResponseTimes()
@@ -5707,8 +6012,8 @@ final class FeedStore {
                     // Cap per source to prevent domination
                     await self.capSourceItemsBatch(Array(Set(actualNew.map(\.sourceURL))))
                 }
-                // Record fetch health for each source
-                for source in batch {
+                // Record fetch health for each source this pass actually refilled
+                for source in grantedBatch {
                     self.scheduler.recordFetch(sourceURL: source.url, outcome: result.sourceOutcomes[source.url] ?? .failed(URLError(.unknown)))
                 }
                 self.lastRefreshDate = .now
@@ -6412,26 +6717,40 @@ final class FeedStore {
                 )
             }
 
-            let result = await fetcher.fetchStarter(
-                responsiveSources,
-                maxConcurrent: min(18, responsiveSources.count),
-                minimumSuccessfulSources: min(8, responsiveSources.count),
-                minimumItemCount: min(12, responsiveSources.count),
-                deadline: .seconds(7)
+            // P1: the showcase joins the bootstrap instead of re-fetching endpoints it is already refilling,
+            // and an endpoint the Main Feed refilled in the last 15 minutes is answered from local retention.
+            let grant = claimSourceDemand(
+                responsiveSources.map(\.url),
+                purpose: .onboardingShowcase,
+                freshnessWindowMs: FeedSurfaceCatalog.plan(for: .onboarding).refillFreshnessWindowMs
             )
-            for source in responsiveSources {
-                scheduler.recordFetch(
-                    sourceURL: source.url,
-                    outcome: result.sourceOutcomes[source.url] ?? .failed(URLError(.unknown))
-                )
+            let grantedURLs = Set(grant.led)
+            let grantedSources = responsiveSources.filter {
+                grantedURLs.contains(OPMLParser.normalizeURL($0.url))
             }
-            let actualNew = await persistFetchedItems(result.items)
-            if !actualNew.isEmpty {
-                cached.insert(contentsOf: actualNew, at: 0)
-                let visibleNew = await presentationItems(from: actualNew)
-                if !visibleNew.isEmpty {
-                    throttledReservoirAppend(visibleNew)
-                    prefetchImagesIfEnabled(for: visibleNew)
+            if !grantedSources.isEmpty {
+                let result = await fetcher.fetchStarter(
+                    grantedSources,
+                    maxConcurrent: min(18, responsiveSources.count),
+                    minimumSuccessfulSources: min(8, responsiveSources.count),
+                    minimumItemCount: min(12, responsiveSources.count),
+                    deadline: .seconds(7)
+                )
+                finishSourceDemand(grant, outcomes: result.sourceOutcomes)
+                for source in grantedSources {
+                    scheduler.recordFetch(
+                        sourceURL: source.url,
+                        outcome: result.sourceOutcomes[source.url] ?? .failed(URLError(.unknown))
+                    )
+                }
+                let actualNew = await persistFetchedItems(result.items)
+                if !actualNew.isEmpty {
+                    cached.insert(contentsOf: actualNew, at: 0)
+                    let visibleNew = await presentationItems(from: actualNew)
+                    if !visibleNew.isEmpty {
+                        throttledReservoirAppend(visibleNew)
+                        prefetchImagesIfEnabled(for: visibleNew)
+                    }
                 }
             }
         }
@@ -7050,7 +7369,22 @@ final class FeedStore {
     func loadSourceContent(_ source: SourceReference) async -> SourceContentResult {
         await recordExplicitSourceAccess(source.feedURL)
         let resolved = registry.source(forURL: source.feedURL) ?? source.feedSource
+        // P6: an endpoint the Main Feed refilled inside this surface's window is answered from local
+        // retention instead of being fetched a second time.
+        let grant = claimSourceDemand(
+            [resolved.url],
+            purpose: .sourceDetail,
+            freshnessWindowMs: FeedSurfaceCatalog.plan(for: .source).refillFreshnessWindowMs
+        )
+        guard !grant.led.isEmpty else {
+            // servedFresh or shared: no request is made here. `FeedFetchStatus` has no notModified case —
+            // a 304 maps to `.success` in `FeedFetchResult.status` — so `.success` with 0 new items is the
+            // honest "unchanged, not refetched" answer for this surface.
+            let items = await sourceContentFromCache(source)
+            return SourceContentResult(items: items, fetchStatus: .success, fetchedItemCount: 0)
+        }
         let fetchResult = await fetcher.fetch(resolved)
+        finishSourceDemand(grant, outcomes: [resolved.url: fetchResult.outcome])
         if !fetchResult.items.isEmpty {
             _ = await persistFetchedItems(fetchResult.items)
         }
@@ -7139,7 +7473,27 @@ final class FeedStore {
         guard !sources.isEmpty else {
             return SourceCollectionContentResult(items: [], sourceCount: 0, failedSourceCount: 0, emptySourceCount: 0)
         }
-        let batch = await fetcher.fetchAll(sources, maxConcurrent: min(8, sources.count))
+        // P7: members another producer is already refilling are joined, and a member refilled inside this
+        // surface's window is answered from local retention. `cachedSourceItems` still runs over every member,
+        // so a member this pass did not refill contributes its locally retained items exactly as before.
+        let grant = claimSourceDemand(
+            sources.map(\.url),
+            purpose: .collectionDetail,
+            freshnessWindowMs: FeedSurfaceCatalog.plan(for: .sourceCollection).refillFreshnessWindowMs
+        )
+        let grantedURLs = Set(grant.led)
+        let grantedSources = sources.filter {
+            grantedURLs.contains(OPMLParser.normalizeURL($0.url))
+        }
+        var batch = FeedFetchBatch(
+            items: [], fetchedSourceCount: 0, failedSourceCount: 0,
+            emptySourceCount: 0, notModifiedCount: 0, throttledCount: 0,
+            sourceOutcomes: [:]
+        )
+        if !grantedSources.isEmpty {
+            batch = await fetcher.fetchAll(grantedSources, maxConcurrent: min(8, sources.count))
+            finishSourceDemand(grant, outcomes: batch.sourceOutcomes)
+        }
         if !batch.items.isEmpty {
             _ = await persistFetchedItems(batch.items)
         }
