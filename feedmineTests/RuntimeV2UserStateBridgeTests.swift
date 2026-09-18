@@ -225,6 +225,48 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
         XCTAssertEqual(secondReport, ReplayReport(applied: 0, failed: 0), "reconciling twice is not two writes")
     }
 
+    func testLaunchReconcileRepairsBothBookmarkProjectionAndListMembership() async throws {
+        let article = item(id: "item-launch-reconcile")
+
+        // Simulate a process dying after user.sqlite committed but before either runtime projection.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-launch-reconcile",
+            snapshot: snapshot(article, at: fixedDate),
+            at: fixedDate
+        )
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertNil(try projections.projection(kind: .bookmark, subjectID: article.id))
+        let listID = await store.bookmarkStore.defaultListID()
+        XCTAssertNil(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )
+        )
+
+        let report = await bridge.reconcileForLaunch(at: fixedDate)
+
+        XCTAssertEqual(report, ReplayReport(applied: 2, failed: 0))
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.lastOperationID,
+            "op-launch-reconcile"
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.lastOperationID,
+            "op-launch-reconcile"
+        )
+        XCTAssertEqual(
+            await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1)),
+            ReplayReport(applied: 0, failed: 0),
+            "the launch repair is idempotent across both projections"
+        )
+    }
+
     func testOnlyTheNewestOperationPerSubjectDecidesTheProjection() async throws {
         let article = item(id: "item-e")
         _ = await bridge.setBookmarked(
