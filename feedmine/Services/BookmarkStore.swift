@@ -89,6 +89,21 @@ final class BookmarkStore {
         }
     }
 
+    /// Whether the item exists in at least one bookmark list.
+    ///
+    /// The runtime's top-level bookmark overlay is global across boxes, while list membership is
+    /// tracked separately. Removing an item from one box must therefore not make it look unbookmarked
+    /// when another box still contains it.
+    func isBookmarkedAnywhere(itemID: String) async throws -> Bool {
+        try await userDB.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT 1 FROM bookmark_item WHERE item_id = ? LIMIT 1",
+                arguments: [itemID]
+            ) != nil
+        }
+    }
+
     /// All bookmarked item IDs across every list. Used by FeedStore to stamp
     /// `isBookmarked` on visible items so bookmark indicators render correctly.
     func allBookmarkedItemIDs() -> Set<String> {
@@ -325,6 +340,29 @@ final class BookmarkStore {
         }) ?? []
     }
 
+    /// The newest operation for each (subject, list) pair.
+    ///
+    /// List membership is not the same state as "bookmarked anywhere": one item can belong to more
+    /// than one box, and recovery must be able to replay a removal from one box without erasing the
+    /// other. JSON is queried only here, in the user-state compatibility store; it never enters a
+    /// Runtime V2 hot path.
+    func newestOperationsBySubjectAndList(kind: String = "bookmark.set") async -> [BookmarkOperationRecord] {
+        (try? await userDB.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT operation_id, kind, subject_id, payload_json, state, created_at,
+                       applied_at, failure_reason
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY subject_id, json_extract(payload_json, '$.listID')
+                        ORDER BY created_at DESC, operation_id DESC
+                    ) AS row_number
+                    FROM user_operation WHERE kind = ?
+                ) WHERE row_number = 1
+                ORDER BY subject_id, json_extract(payload_json, '$.listID')
+                """, arguments: [kind]).map(Self.operationRecord(from:))
+        }) ?? []
+    }
+
     func bookmarkSnapshots(listID: Int64? = nil) async throws -> [BookmarkSnapshot] {
         let targetListID = listID ?? defaultListID()
         return try await userDB.read { db in
@@ -380,16 +418,20 @@ final class BookmarkStore {
         "{\"listID\":\(listID),\"wanted\":\(wanted ? "true" : "false")}"
     }
 
+    private struct StoredOperationPayload: Decodable {
+        let listID: Int64
+        let wanted: Bool
+    }
+
     private nonisolated static func operationRecord(from row: Row) -> BookmarkOperationRecord {
         let payload = row["payload_json"] as String
-        let wanted = payload.contains("\"wanted\":true")
-        let listID = Int64(payload.split(separator: ":").last?.prefix(while: { $0.isNumber }) ?? "") ?? 0
+        let decoded = try? JSONDecoder().decode(StoredOperationPayload.self, from: Data(payload.utf8))
         return BookmarkOperationRecord(
             operationID: row["operation_id"],
             kind: row["kind"],
             subjectID: row["subject_id"],
-            wanted: wanted,
-            listID: listID,
+            wanted: decoded?.wanted ?? false,
+            listID: decoded?.listID ?? 0,
             state: BookmarkOperationState(rawValue: row["state"]) ?? .pending,
             createdAt: Date(timeIntervalSince1970: row["created_at"]),
             appliedAt: (row["applied_at"] as Int64?).map { Date(timeIntervalSince1970: Double($0)) },
