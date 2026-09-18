@@ -481,6 +481,13 @@ public actor AcquisitionCoordinator {
         do {
             event = try await source.pull(request)
         } catch {
+            // Cancellation is control flow, not target health. Treating a connector's
+            // CancellationError (or another error observed after this task was cancelled) as a
+            // transport failure would incorrectly degrade the frontier and could suppress useful
+            // work on the next demand.
+            if error is CancellationError || Task.isCancelled {
+                return (.sourceCancelled, true)
+            }
             return (.sourceFailed("\(error)"), true)
         }
         switch event {
