@@ -218,6 +218,57 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
         XCTAssertTrue(operation.wanted)
     }
 
+    func testRemovingOneBoxDoesNotClearGlobalBookmarkWhileAnotherBoxStillOwnsIt() async throws {
+        let article = item(id: "item-multi-list")
+        let defaultList = store.bookmarkStore.defaultListID()
+        let secondList = try await store.bookmarkStore.createBookmarkList(name: "Second box")
+
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-multi-default",
+            listID: defaultList,
+            snapshot: BookmarkSnapshot(item: article, listID: defaultList, at: fixedDate),
+            at: fixedDate
+        )
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-multi-second",
+            listID: secondList,
+            snapshot: BookmarkSnapshot(item: article, listID: secondList, at: fixedDate),
+            at: fixedDate.addingTimeInterval(1)
+        )
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-multi-remove-default",
+            listID: defaultList,
+            at: fixedDate.addingTimeInterval(2)
+        )
+
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.wanted,
+            true,
+            "bookmark overlay is global across boxes; removing one membership must not clear another"
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: defaultList),
+                subjectID: article.id
+            )?.wanted,
+            false
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: secondList),
+                subjectID: article.id
+            )?.wanted,
+            true
+        )
+    }
+
     // MARK: - Crash between the two databases
 
     func testCrashBetweenTheDatabasesIsRepairedByReconcile() async throws {
