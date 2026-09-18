@@ -382,6 +382,51 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
         )
     }
 
+    func testSameSecondOperationsReplayInCommitOrderNotOperationIDOrder() async throws {
+        let article = item(id: "item-same-second")
+        let listID = store.bookmarkStore.defaultListID()
+
+        // Both operations deliberately share the same second. The ids are reverse-lexical relative to
+        // commit order so an ORDER BY operation_id tie-break picks the wrong one.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-z-add",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-a-remove",
+            listID: listID,
+            at: fixedDate
+        )
+
+        let newest = try XCTUnwrap(
+            await store.bookmarkStore.newestOperationsBySubject().first {
+                $0.subjectID == article.id
+            }
+        )
+        XCTAssertEqual(newest.operationID, "op-a-remove")
+        XCTAssertFalse(newest.wanted)
+
+        _ = await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1))
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.wanted,
+            false
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            false
+        )
+    }
+
     func testOnlyTheNewestOperationPerSubjectDecidesTheProjection() async throws {
         let article = item(id: "item-e")
         _ = await bridge.setBookmarked(
