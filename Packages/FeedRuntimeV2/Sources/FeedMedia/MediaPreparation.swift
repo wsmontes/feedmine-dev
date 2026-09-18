@@ -429,6 +429,34 @@ public struct MediaPreparationRequest: Hashable, Sendable {
     }
 }
 
+/// A canonical media candidate whose bytes do not have an identity yet.
+///
+/// Connectors can name a remote resource but cannot honestly name the digest of bytes they have not
+/// fetched. Preparation owns that transition: it downloads through the policy-enforcing transport,
+/// derives the SHA-256 identity from the exact bytes, validates/decodes them, and only then makes the
+/// immutable asset durable. The URL never survives into publication.
+public struct MediaCandidatePreparationRequest: Hashable, Sendable {
+    public let url: URL
+    public let role: MediaRole
+    public let targetWidth: Int?
+    public let mediaTypeHint: String?
+    public let deadline: Date
+
+    public init(
+        url: URL,
+        role: MediaRole = .image,
+        targetWidth: Int? = nil,
+        mediaTypeHint: String? = nil,
+        deadline: Date
+    ) {
+        self.url = url
+        self.role = role
+        self.targetWidth = targetWidth
+        self.mediaTypeHint = mediaTypeHint
+        self.deadline = deadline
+    }
+}
+
 /// The durable, immutable result of one preparation.
 public struct PreparedMedia: Sendable, Equatable {
     public let descriptor: MediaAssetDescriptor
@@ -543,16 +571,116 @@ public struct MediaPreparation: Sendable {
         return prepared
     }
 
+    /// Prepares a connector-declared candidate whose immutable identity is not known until the bytes
+    /// arrive. The digest is derived here, never guessed from the URL.
+    public func prepareCandidate(_ request: MediaCandidatePreparationRequest) async throws -> PreparedMedia {
+        try Self.validate(
+            url: request.url,
+            role: request.role,
+            targetWidth: request.targetWidth
+        )
+        try Self.checkCancellation()
+        guard clock.now < request.deadline else { throw MediaPreparationError.deadlineExceeded }
+
+        let bytes = try await limiter.withDownloadPermit {
+            try await self.download(
+                url: request.url,
+                deadline: request.deadline,
+                mediaTypeHint: request.mediaTypeHint
+            )
+        }
+        let exact = MediaPreparationRequest(
+            url: request.url,
+            expectedDigest: ContentDigest.sha256(bytes),
+            expectedByteCount: bytes.count,
+            recipeVersion: .sourceBytes,
+            role: request.role,
+            targetWidth: request.targetWidth,
+            mediaTypeHint: request.mediaTypeHint,
+            deadline: request.deadline
+        )
+        let prepared = try await materialize(bytes, request: exact, servedFromLocalAsset: false)
+        try Self.checkCancellation()
+        guard clock.now < request.deadline else { throw MediaPreparationError.deadlineExceeded }
+        do {
+            try await store.publish(bytes, descriptor: prepared.descriptor)
+        } catch let error as MediaPreparationError {
+            throw error
+        } catch {
+            throw MediaPreparationError.publicationFailed(String(describing: error))
+        }
+        await register(prepared)
+        return prepared
+    }
+
+    /// Materializes a published asset from memory/disk only.
+    ///
+    /// This is the renderer-side recovery path after a relaunch: cache miss → local durable bytes →
+    /// decode off the caller actor. It intentionally has no URL and therefore cannot initiate network.
+    public func materializeLocal(_ identity: MediaAssetIdentity) async throws -> DecodedImage? {
+        if let decoded = await cache.decoded(identity.assetVersionID) {
+            return decoded
+        }
+        guard let bytes = try await store.localBytes(for: identity.assetVersionID) else {
+            return nil
+        }
+        guard ContentDigest.sha256(bytes) == identity.assetVersionID.contentDigest else {
+            _ = await store.reclaim([identity.assetVersionID])
+            return nil
+        }
+        guard !bytes.isEmpty else { return nil }
+        guard bytes.count <= budget.maxCompressedBytes else { return nil }
+
+        let metadata = try await decodeOffCallingActor { try self.decoder.inspect(bytes) }
+        let acceptance = budget.inspect(
+            byteCount: bytes.count,
+            pixelWidth: metadata.pixelWidth,
+            pixelHeight: metadata.pixelHeight,
+            targetWidth: identity.pixelWidth
+        )
+        let target: Int?
+        switch acceptance {
+        case .rejected:
+            return nil
+        case .accepted(let downsampleTo):
+            target = downsampleTo
+        }
+        let decoded = try await limiter.withDecodePermit {
+            try await self.decodeOffCallingActor {
+                try self.decoder.decode(bytes, downsampleTo: target)
+            }
+        }
+        try Self.validate(decoded: decoded, downsampleTo: target)
+
+        let descriptor = MediaAssetDescriptor(identity: identity, byteCount: bytes.count)
+        await cache.registerUnpublished(descriptor)
+        await cache.storeDecoded(decoded, descriptor: descriptor)
+        await cache.markPublished(identity.assetVersionID)
+        return decoded
+    }
+
     // MARK: steps
 
     /// Bounded download: the deadline becomes the request timeout, the byte ceiling is enforced
     /// before the payload is handed on, and the transport is the injected port.
     private func download(_ request: MediaPreparationRequest) async throws -> Data {
-        let remaining = request.deadline.timeIntervalSince(clock.now)
+        try await download(
+            url: request.url,
+            deadline: request.deadline,
+            mediaTypeHint: request.mediaTypeHint
+        )
+    }
+
+    private func download(
+        url: URL,
+        deadline: Date,
+        mediaTypeHint: String?
+    ) async throws -> Data {
+        let remaining = deadline.timeIntervalSince(clock.now)
         guard remaining > 0 else { throw MediaPreparationError.deadlineExceeded }
-        var urlRequest = URLRequest(url: request.url, timeoutInterval: remaining)
+        var urlRequest = URLRequest(url: url, timeoutInterval: remaining)
         urlRequest.httpMethod = "GET"
-        urlRequest.setValue(request.mediaTypeHint ?? "image/*", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(mediaTypeHint ?? "image/*", forHTTPHeaderField: "Accept")
 
         let data: Data
         let response: HTTPURLResponse
@@ -646,16 +774,20 @@ public struct MediaPreparation: Sendable {
     // MARK: validation
 
     private static func validate(_ request: MediaPreparationRequest) throws {
-        switch request.role {
+        try validate(url: request.url, role: request.role, targetWidth: request.targetWidth)
+    }
+
+    private static func validate(url: URL, role: MediaRole, targetWidth: Int?) throws {
+        switch role {
         case .image, .thumbnail, .poster:
             break
         case .audio, .video, .waveform:
-            throw MediaPreparationError.unsupportedMediaRole(request.role)
+            throw MediaPreparationError.unsupportedMediaRole(role)
         }
-        guard request.url.scheme != nil else {
-            throw MediaPreparationError.invalidRequest("url has no scheme: \(request.url)")
+        guard url.scheme != nil else {
+            throw MediaPreparationError.invalidRequest("url has no scheme: \(url)")
         }
-        if let targetWidth = request.targetWidth, targetWidth < 1 {
+        if let targetWidth, targetWidth < 1 {
             throw MediaPreparationError.invalidRequest("target width \(targetWidth) is not positive")
         }
     }
