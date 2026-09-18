@@ -431,7 +431,7 @@ struct UserStateBridge: Sendable {
     @discardableResult
     func reconcile(at: Date = Date()) async -> ReplayReport {
         let newest = await bookmarks.newestOperationsBySubject()
-        let bookmarkedAnywhere = (try? await bookmarks.allBookmarkedItemIDs()) ?? []
+        let bookmarkedAnywhere = await bookmarks.allBookmarkedItemIDsAsync()
         var applied = 0
         var failed = 0
         for operation in newest {
