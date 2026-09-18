@@ -2232,21 +2232,24 @@ and the row that files it cannot drift apart.
 
 **The pass, and why it is not optional.** A card bookmarked before this projection existed has no membership row,
 and its box would then show only what was saved since — a *wrong* page rather than a missing one, which is the
-failure mode this whole line of work exists to avoid. `reconcileListMemberships` reads the authority's lists
-(`allBookmarkLists` + `bookmarkedItems(listID:)`) and writes what the projection is missing, keyed on the
-subject's newest bookmark operation so that a second pass is a no-op. A subject with no bookmark operation has no
-operation id to key idempotence on, and it is **skipped, not guessed**: inventing one would make every launch a
-new write.
+failure mode this whole line of work exists to avoid. The launch repair is now `reconcileForLaunch()`: it replays
+both the whole-set bookmark projection and each list membership from the durable operation log. Membership replay
+is keyed by **(subject, list)**, so it can repair an interrupted removal as well as an interrupted add; iterating
+only the rows that still exist in `bookmark_item` could never discover the former. The whole-set projection is
+derived from the authoritative "bookmarked anywhere" set, because removing a subject from one box does not make it
+globally unbookmarked while another box still owns it. Replaying either projection is idempotent on the operation
+id.
 
-**The hook.** `MainFeedRuntime.durableUserActions` builds the bridge and the loader exists only there, so the pass
-is fired there, fire-and-forget: a box that opens before it finishes shows what the save path wrote, and the pass
-makes it whole.
+The operation payload is decoded as JSON when replayed. This matters because its shape is
+`{"listID":…,"wanted":…}`: the previous string-splitting decoder read the final value instead of `listID` and
+therefore reconstructed the list as zero. Operations that share the same second are ordered by SQLite insertion
+order (`rowid`) rather than by their random operation-id string, so a rapid add/remove pair replays in commit
+order.
 
-**A finding this section records rather than fixes.** The bridge's *whole-set* `reconcile()` — whose own doc says
-"Run at launch" — has **no caller**. The state projection's crash-recovery pass (the one that replays an operation
-whose runtime write was lost) is therefore unwired, and has been since it was written. It is left alone here
-because wiring it is a behaviour change beyond this slice, and it is named so the next reader does not have to
-find it: `grep -rn '\.reconcile(' feedmine/` returns nothing.
+**The hook.** `MainFeedRuntime.durableUserActions` builds the bridge and the loader exists only there, so the full
+repair is fired there, fire-and-forget: current content can render immediately, while any projection owed by a
+previously committed `user.sqlite` operation is restored in the background. The older finding that
+`reconcile()` had no production caller is therefore closed.
 
 **One contract updated with its reason.** `testProjectionWatermarkAdvancesOnlyWithRealChanges` pinned *one*
 watermark revision per save. A save now writes two projections — the whole-set state and the membership — so it
@@ -2430,9 +2433,8 @@ with the box drawing its saved cards and its own control, and the runs after it 
   the runtime owns (`catalogue = targets` in `watch`). Every later acquisition - the Main Feed's included -
   runs against whatever the last session watched. Open, and independent of the box.
 
-The UI test therefore skips with this reason rather than passing on a claim it cannot make or failing on a
-defect it is not about: its surface half is proven and recorded above, and it goes green again when the box's
-own composition keeps its cards.
+The UI test no longer turns this regression into an `XCTSkip`. The five underlying defects are recorded and
+closed above; if the box's runtime composition stops drawing its saved cards/control again, the test now fails.
 
 **And the box's own page is what the screen draws — measured, clean build, 2026-09-18.** After the five fixes
 above (the claim keeping the legacy page until the session delivers, the per-session stamp, the empty-edition
@@ -2449,6 +2451,5 @@ being reused), one run from a cleared `DerivedData`:
 - `Test Case '…testOpeningABookmarkBoxComposesTheBoxThroughTheRuntime' passed (46.688 seconds)`.
 
 So the box's content path is closed end to end on the surface: the reader's saved cards, composed by the box's
-own session, drawn by the presentation, each with the control that belongs to that surface. The test keeps its
-`XCTSkip` — not as a live failure, but because it states the failure mode this section measured, and it fires
-only if one of those five fixes regresses.
+own session, drawn by the presentation, each with the control that belongs to that surface. The regression test
+now asserts that outcome directly instead of preserving a stale skip after the five fixes landed.
