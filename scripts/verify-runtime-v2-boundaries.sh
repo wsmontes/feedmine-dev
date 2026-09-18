@@ -65,8 +65,8 @@ RULES = {
         "forbidden_products": {"GRDB", "FeedKit"},
     },
     "FeedUIBridge": {
-        "allowed": {"Foundation", "FeedDomain", "FeedRuntime", "FeedStorage", "SwiftUI", "UIKit", "Observation"},
-        "forbidden_siblings": {"FeedConnectorSyndication", "FeedMedia"},
+        "allowed": {"Foundation", "FeedDomain", "FeedRuntime", "SwiftUI", "UIKit", "Observation"},
+        "forbidden_siblings": {"FeedStorage", "FeedConnectorSyndication", "FeedMedia"},
         "forbidden_products": {"GRDB", "FeedKit"},
     },
 }
@@ -86,6 +86,23 @@ def swift_files(directory):
         for name in sorted(filenames):
             if name.endswith(".swift"):
                 yield os.path.join(dirpath, name)
+
+# Swift 6 permits attributes and access modifiers on imports (for example
+# `@preconcurrency import Foo` and `public import Foo`). Recognize those forms so valid
+# Swift syntax cannot bypass the architecture gate.
+IMPORT_RE = re.compile(
+    r"^\s*"
+    r"(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?\s+)*"
+    r"(?:(?:public|package|internal|fileprivate|private)\s+)?"
+    r"import\s+"
+    r"(?:(?:class|struct|enum|protocol|typealias|func|var|let)\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+def imported_module(line):
+    match = IMPORT_RE.match(line)
+    return match.group(1) if match else None
+
 
 manifest_path = os.path.join(root, "Package.swift")
 manifest = open(manifest_path, encoding="utf-8").read()
@@ -112,10 +129,9 @@ for target, rule in sorted(RULES.items()):
             checked_files += 1
             with open(path, encoding="utf-8") as handle:
                 for lineno, line in enumerate(handle, start=1):
-                    match = re.match(r"\s*import\s+([A-Za-z_][A-Za-z0-9_]*)", line)
-                    if not match:
+                    module = imported_module(line)
+                    if module is None:
                         continue
-                    module = match.group(1)
                     checked_imports += 1
                     if module in rule["forbidden_siblings"]:
                         violations.append(
@@ -160,9 +176,9 @@ for target, rule in sorted(RULES.items()):
         for path in swift_files(sources_dir):
             with open(path, encoding="utf-8") as handle:
                 for line in handle:
-                    match = re.match(r"\s*import\s+([A-Za-z_][A-Za-z0-9_]*)", line)
-                    if match:
-                        imported_modules.add(match.group(1))
+                    module = imported_module(line)
+                    if module is not None:
+                        imported_modules.add(module)
     imported_siblings = imported_modules & SIBLINGS
     for name in sorted(imported_siblings - declared):
         violations.append(f"{target}: sources import '{name}' but the manifest does not declare it")
