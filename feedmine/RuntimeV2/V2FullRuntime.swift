@@ -1,5 +1,6 @@
 import Foundation
 import FeedDomain
+import FeedMedia
 import FeedRuntime
 import FeedStorage
 
@@ -258,6 +259,7 @@ final class V2FullRuntime {
     let acquisition: V2Acquisition
     let repository: PublicationRepository
     let coordinator: PublicationCoordinator
+    let media: V2MediaPipeline
 
     private let checkpoints: SessionCheckpointStore
     private let facts: ExposureFactStore
@@ -275,6 +277,8 @@ final class V2FullRuntime {
     init(
         database: RuntimeDatabase,
         acquisition: V2Acquisition,
+        transport: any HTTPTransport,
+        assetRoot: URL,
         clock: any EditorialClock = SystemEditorialClock()
     ) {
         self.database = database
@@ -282,8 +286,20 @@ final class V2FullRuntime {
         self.editorialClock = clock
         self.checkpoints = SessionCheckpointStore(database: database)
         self.facts = ExposureFactStore(database: database)
-        self.repository = PublicationRepository(database: database)
-        self.coordinator = PublicationCoordinator(repository: repository, clock: clock)
+        let repository = PublicationRepository(database: database)
+        self.repository = repository
+        let media = V2MediaPipeline(
+            database: database,
+            transport: transport,
+            rootDirectory: assetRoot,
+            clock: clock
+        )
+        self.media = media
+        self.coordinator = PublicationCoordinator(
+            repository: repository,
+            clock: clock,
+            assets: media.assets
+        )
         self.sessionStamp = SessionStamp(UInt64(Date().timeIntervalSince1970 * 1000))
     }
 
@@ -306,7 +322,10 @@ final class V2FullRuntime {
         renderEnvironment: RenderEnvironmentRevision,
         userActions: any FeedSessionUserActions,
         onWatched: @MainActor (V2AcquisitionReport) -> Void,
-        onSnapshot: @escaping @MainActor (FeedPresentationSnapshot) -> Void
+        onSnapshot: @escaping @MainActor (
+            FeedPresentationSnapshot,
+            [PublicationCardID: RenderImage]
+        ) -> Void
     ) async {
         report = await acquisition.watch(descriptors)
         onWatched(report)
@@ -329,6 +348,7 @@ final class V2FullRuntime {
             plans: plans,
             coordinator: coordinator,
             acquisition: acquisition,
+            media: media.preparer,
             // One line per composition, always. A publication path that logs nothing is a path nobody
             // can diagnose: a successor loop at seventeen editions a second produced a log with no
             // repeated line at all.
@@ -371,7 +391,10 @@ final class V2FullRuntime {
 
     private func startConsuming(
         _ session: FeedSession,
-        onSnapshot: @escaping @MainActor (FeedPresentationSnapshot) -> Void
+        onSnapshot: @escaping @MainActor (
+            FeedPresentationSnapshot,
+            [PublicationCardID: RenderImage]
+        ) -> Void
     ) {
         snapshotTask?.cancel()
         snapshotTask = Task { @MainActor in
@@ -380,8 +403,44 @@ final class V2FullRuntime {
                 Log.feed.info(
                     "runtime-v2 v2Full snapshot edition=\(snapshot.editionID?.description ?? "none") cards=\(snapshot.cards.count) sequence=\(snapshot.sequence) context=\(snapshot.contextKey)"
                 )
-                onSnapshot(snapshot)
+                let localMedia = await self.prewarmMedia(for: snapshot)
+                guard !Task.isCancelled else { return }
+                onSnapshot(snapshot, localMedia)
             }
+        }
+    }
+
+    /// Resolves the snapshot's published visuals before SwiftUI sees the page.
+    ///
+    /// Freshly prepared assets normally hit the decoded cache. Warm restore may decode from the
+    /// content-addressed store. Neither path can access the network: a missing/corrupt asset is omitted
+    /// here and presentation draws the publication's deterministic placeholder.
+    private func prewarmMedia(
+        for snapshot: FeedPresentationSnapshot
+    ) async -> [PublicationCardID: RenderImage] {
+        let localIDs = snapshot.cards.compactMap { card -> PublicationCardID? in
+            if case .local = card.media { return card.id }
+            return nil
+        }
+        guard !localIDs.isEmpty else { return [:] }
+
+        let repository = self.repository
+        let media = self.media
+        return await withTaskGroup(of: (PublicationCardID, RenderImage?).self) { group in
+            for cardID in localIDs {
+                group.addTask {
+                    guard let record = try? repository.card(cardID) else {
+                        return (cardID, nil)
+                    }
+                    return (cardID, await media.prewarm(card: record))
+                }
+            }
+            var result: [PublicationCardID: RenderImage] = [:]
+            result.reserveCapacity(localIDs.count)
+            for await (cardID, image) in group {
+                if let image { result[cardID] = image }
+            }
+            return result
         }
     }
 
