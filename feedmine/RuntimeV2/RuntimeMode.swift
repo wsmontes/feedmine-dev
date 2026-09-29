@@ -86,7 +86,15 @@ enum RuntimeModeLaunch {
 
     /// A request spelled as launch arguments. Presence of a flag is `true`; the flags describe one
     /// launch and are never persisted.
-    static func argumentRequest(from arguments: [String]) -> RequestedFeatures? {
+    static func argumentRequest(
+        from arguments: [String],
+        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode
+    ) -> RequestedFeatures? {
+        // Runtime-mode launch flags are a test/development instrument, not a public process API.
+        // Production rollback is the persisted request below, which is deliberate and survives a
+        // relaunch. A crafted process/deep-link launch must not be able to downgrade the shipping
+        // runtime or create a shadow owner.
+        guard allowDeveloperOverrides else { return nil }
         let names = [shadowArgument, v2UIArgument, v2NetworkArgument]
         guard arguments.contains(where: names.contains) else { return nil }
         return RequestedFeatures(
@@ -104,10 +112,14 @@ enum RuntimeModeLaunch {
     static func decide(
         in defaults: UserDefaults = .standard,
         arguments: [String] = ProcessInfo.processInfo.arguments,
+        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode,
         at: Date = Date()
     ) -> RuntimeLaunchDecision {
         let decision: RuntimeLaunchDecision
-        if let features = argumentRequest(from: arguments) {
+        if let features = argumentRequest(
+            from: arguments,
+            allowDeveloperOverrides: allowDeveloperOverrides
+        ) {
             decision = decide(features, source: .launchArguments, at: at)
         } else if let features = storedRequest(in: defaults) {
             decision = decide(features, source: .stored, at: at)
