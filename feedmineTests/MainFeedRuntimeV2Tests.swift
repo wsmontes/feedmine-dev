@@ -31,6 +31,30 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertNil(ShadowMirrorRegistry.current, "a legacy launch must install no mirror sink")
     }
 
+    func testProductionLaunchArgumentsCannotOverrideRuntimeMode() {
+        let defaults = makeDefaults(name: "release-mode-arguments")
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: ["feedmine", RuntimeModeLaunch.shadowArgument],
+            allowDeveloperOverrides: false
+        )
+
+        XCTAssertEqual(decision.mode, .v2Full)
+        XCTAssertEqual(decision.source, .none)
+    }
+
+    func testHarnessLaunchArgumentsCanStillSelectRuntimeMode() {
+        let defaults = makeDefaults(name: "test-mode-arguments")
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: ["feedmine", RuntimeModeLaunch.shadowArgument],
+            allowDeveloperOverrides: true
+        )
+
+        XCTAssertEqual(decision.mode, .mirroredShadow)
+        XCTAssertEqual(decision.source, .launchArguments)
+    }
+
     func testFreshInstallUsesV2FullAsTheShippingDefault() {
         let defaults = makeDefaults(name: "release-default")
         let decision = RuntimeModeLaunch.decide(in: defaults, arguments: [])
