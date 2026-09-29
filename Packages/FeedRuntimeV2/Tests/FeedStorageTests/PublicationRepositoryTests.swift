@@ -784,6 +784,53 @@ final class PublicationRepositoryTests: RuntimeV2TestCase {
         try assertPublicationIntegrity()
     }
 
+    /// A card is part of the editorial decision that created its edition. Accepting a frozen payload
+    /// from another revision would make the row writable but unrestorable: restore recomputes the
+    /// payload digest against the edition revision. Refuse that mismatch before the transaction.
+    func testCardFromAnotherEditorialRevisionCommitsNothing() throws {
+        let source = try ensureSource("catalog:alpha", displayTitle: "Alpha")
+        let row = try insertSupplyRow(
+            objectKey: "item-cross-revision",
+            sourceIDs: [source],
+            headline: "Cross revision",
+            observedAt: TestInstant.epochMilliseconds
+        )
+        let context = try planContext()
+        let edition = try openDraft(context: context, revisionTag: "revision-a")
+        let mismatched = try card(
+            edition: edition,
+            record: row,
+            absoluteOrdinal: 0,
+            title: "Cross revision",
+            primaryText: "Excerpt",
+            sourceDisplayName: "Alpha",
+            sourceID: source,
+            publishedAt: nil,
+            revisionTag: "revision-b"
+        )
+        let before = try publicationDump()
+
+        XCTAssertThrowsError(
+            try publish(
+                repositories(),
+                token: edition.token,
+                cards: [mismatched],
+                activation: .activate(successorOf: nil),
+                pinned: [try OriginRevisionID(row.revisionID)]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PublicationFailure,
+                .invalidComposition("a card's editorial revision is not the publication token's")
+            )
+        }
+
+        XCTAssertEqual(try publicationDump(), before, "the rejected composition must write nothing")
+        XCTAssertEqual(try rowCount("feed_segment"), 0)
+        XCTAssertEqual(try rowCount("published_card"), 0)
+        try assertPublicationIntegrity()
+    }
+
     /// A pinned revision that lost hard eligibility between composition and commit is refused, and the
     /// refusal rolls the segment back: no card is published for content the plan may no longer use.
     func testRevokedEligibilityAtCommitCommitsNothing() throws {
