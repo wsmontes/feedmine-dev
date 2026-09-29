@@ -473,6 +473,12 @@ final class MainFeedRuntime {
             presentation.attach(loader)
             return
         }
+        // The source registry is live user state: imports and enable/disable changes after launch must
+        // replace the acquisition owner's catalogue. Observe its two revisions rather than individual
+        // UI commands so every mutation path has the same effect.
+        isCatalogueObservationAttached = true
+        armCatalogueObservation()
+
         // The session's plan is built from the loader's own selectors, so the selection it owns is known
         // before the catalogue arrives — and it is claimed before the legacy page is followed, or the
         // cached page would be materialized for a surface the session is about to own.
@@ -501,13 +507,55 @@ final class MainFeedRuntime {
     /// Whether the claim above is a bookmark box, so closing one adopts the unboxed feed back.
     private var claimedSelectionWasBox = false
 
-    /// The source set the launch registered, reused by every session the runtime adopts.
+    /// The current source-catalogue snapshot registered with the one acquisition owner.
     ///
-    /// `V2Acquisition.watch` *replaces* the one catalogue the runtime's acquisition actor holds, so a
-    /// session that watched a narrower set would shrink the launch's acquisition for good (baseline §8.62:
-    /// a bookmark box's session registered 1 target over the launch's 32). The launch's set is stated once,
-    /// from the loader's catalogue load, and every later session states the same one.
+    /// It is reused across context/session switches so a Bookmark Box cannot accidentally shrink the
+    /// process-wide watch to the subjects visible in that box. It is invalidated only when
+    /// `SourceRegistry.sourceRevision` or `enablementRevision` changes, at which point the same owner
+    /// re-registers the new full enabled set.
     private var launchDescriptors: [V2AcquisitionSourceDescriptor]?
+    private var isCatalogueObservationAttached = false
+    /// Observable proof for tests/diagnostics that a live catalogue mutation restarted the owner rather
+    /// than falling through to the gated legacy fetch path.
+    private(set) var catalogueRestartCount = 0
+
+    /// Re-arms observation of the source catalogue after each mutation.
+    ///
+    /// `withObservationTracking` fires once, so the callback must re-arm itself. Only revisions are
+    /// observed; deriving `enabledSources` here would allocate the complete source array on every
+    /// observation pass.
+    private func armCatalogueObservation() {
+        guard isCatalogueObservationAttached, let loader else { return }
+        withObservationTracking {
+            _ = loader.sourceRegistry.sourceRevision
+            _ = loader.sourceRegistry.enablementRevision
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isCatalogueObservationAttached else { return }
+                self.sourceCatalogueDidChange()
+                self.armCatalogueObservation()
+            }
+        }
+    }
+
+    /// Invalidates the acquisition owner's catalogue after an import, removal or enablement change.
+    ///
+    /// If the reader is currently on a compatibility surface, only the cached descriptor set is
+    /// invalidated; returning to a runtime-owned surface will rebuild it then. If the runtime-owned
+    /// surface is visible now, its session is restarted through the same owner so the new source set is
+    /// effective immediately without ever opening the legacy acquisition gate.
+    private func sourceCatalogueDidChange() {
+        launchDescriptors = nil
+        guard ownsAcquisition,
+              presentation.selectionContextKey == claimedSelection,
+              let full = composition?.full,
+              let loader
+        else { return }
+
+        catalogueRestartCount += 1
+        let surface = surfaceContexts.mainFeed(loader: loader)
+        startSession(full: full, surface: surface, loader: loader)
+    }
 
     /// Adopts a selection the reader moved to, when its cards are ones the runtime can compose.
     ///
@@ -557,12 +605,10 @@ final class MainFeedRuntime {
             // no sources, registers no acquisition target, and delivers an empty first edition; that is
             // exactly what a simulator launch showed (an edition and zero `acquisition_target` rows,
             // 35 s before `progressiveFetch starting`).
-            // The launch's source set is the launch's. A session the runtime *adopts* must not re-register
-            // the catalogue from whatever the loader's enabled set happens to be at that moment: the
-            // acquisition actor holds one catalogue for the runtime (`V2Acquisition.watch` replaces it), so
-            // a box's session registered 1 target over the launch's 32 and every later episode - the Main
-            // Feed's included - ran against that one (measured 2026-09-18, baseline §8.62: `catalogue=1`
-            // in the box's cold episode, where the launch's own episodes read `catalogue=32`).
+            // The process-wide source set is reused across *surface* adoption: a Bookmark Box must not
+            // replace the acquisition catalogue with a narrower selection. Imports and enablement changes
+            // invalidate `launchDescriptors` through the registry-revision observer above; only that
+            // explicit catalogue mutation causes this branch to rebuild the enabled set.
             let descriptors: [V2AcquisitionSourceDescriptor]
             if let launchDescriptors {
                 descriptors = launchDescriptors
@@ -674,6 +720,7 @@ final class MainFeedRuntime {
         composition?.removeMirrorSink()
         composition?.stopDraining()
         sessionTask?.cancel()
+        isCatalogueObservationAttached = false
         // The mode's process-wide state goes back the way it was found: the mirror sink, the drain
         // loop and the acquisition gate. Production never calls this (the process is the lifetime);
         // tests do, and a closed gate left behind would refuse the next test's legacy fetches.
