@@ -88,7 +88,7 @@ enum RuntimeModeLaunch {
     /// launch and are never persisted.
     static func argumentRequest(
         from arguments: [String],
-        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode
+        allowDeveloperOverrides: Bool = true
     ) -> RequestedFeatures? {
         // Runtime-mode launch flags are a test/development instrument, not a public process API.
         // Production rollback is the persisted request below, which is deliberate and survives a
@@ -112,7 +112,7 @@ enum RuntimeModeLaunch {
     static func decide(
         in defaults: UserDefaults = .standard,
         arguments: [String] = ProcessInfo.processInfo.arguments,
-        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode,
+        allowDeveloperOverrides: Bool = true,
         at: Date = Date()
     ) -> RuntimeLaunchDecision {
         let decision: RuntimeLaunchDecision
