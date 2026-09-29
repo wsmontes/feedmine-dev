@@ -265,6 +265,67 @@ final class SurfacePlanMigrationTests: XCTestCase {
         XCTAssertEqual(store.sourcesInFlight, 0)
     }
 
+    /// Canonical search is a view of the same durable subject the runtime's card actions update.
+    /// A bookmark/read projection therefore has to be visible on the search row without consulting the
+    /// legacy content index or rewriting canonical content.
+    func testCanonicalSearchAppliesRuntimeUserStateOverlay() async throws {
+        let store = try FeedStore(inMemory: true)
+        let sourceURL = "https://example.com/canonical.xml"
+        store.registry.sources = [Self.exampleSource(url: sourceURL)]
+        let (database, directory) = try Self.canonicalRuntimeDatabase(
+            headline: "Canonical overlay telescope",
+            summary: "Overlay summary",
+            link: "https://example.com/overlay",
+            sourceKey: sourceURL,
+            sourceTitle: "Canonical Source"
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let publishedAt = try database.read { db -> Date in
+            let milliseconds = try XCTUnwrap(
+                Int64.fetchOne(db, sql: "SELECT authored_at FROM origin_revision WHERE id = 1")
+            )
+            return Date(timeIntervalSince1970: Double(milliseconds) / 1000)
+        }
+        let subjectID = FeedItem.generateID(
+            sourceURL: sourceURL,
+            guid: nil,
+            link: "https://example.com/overlay",
+            title: "Canonical overlay telescope",
+            publishedAt: publishedAt
+        )
+        let projections = UserStateProjectionStore(database: database)
+        try projections.apply(
+            kind: .bookmark,
+            subjectID: subjectID,
+            wanted: true,
+            operationID: "search-bookmark",
+            at: Date()
+        )
+        try projections.apply(
+            kind: .read,
+            subjectID: subjectID,
+            wanted: true,
+            operationID: "search-read",
+            at: Date()
+        )
+
+        store.useCanonicalContentSearch(
+            CanonicalContentSearch(database: database, registry: store.registry)
+        )
+        store.search("telescope", includeSources: false, includeContents: true, demandOnlineContent: false)
+        await waitUntilSearchSettles(store)
+
+        let item = try XCTUnwrap(store.unifiedSearchResults.localItems.first)
+        XCTAssertTrue(item.isBookmarked)
+        XCTAssertTrue(item.isRead)
+        XCTAssertTrue(
+            item.id.hasPrefix(CanonicalContentSearch.canonicalItemIDPrefix),
+            "overlay does not require manufacturing a legacy alias for a read-only search result"
+        )
+        XCTAssertEqual(store.sourceDemandCounters.demands, 0, "the overlay is a local read")
+    }
+
     /// The mode decides the index, not its contents: a launch whose runtime owns acquisition reads the
     /// canonical index even while that index is empty — admission has not landed yet, or failed — and
     /// does not quietly answer from the legacy content database instead.
