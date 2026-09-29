@@ -276,20 +276,21 @@ struct FeedmineApp: App {
             if url.host == "source",
                let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let feedURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
-               !feedURL.isEmpty {
-                // Open the Source View for this feed URL.
-                // Post a notification — the active FeedScreen handles navigation.
+               let safeURL = InputParser.normalizeWebURL(feedURL) {
+                // Open the Source View only for an HTTP(S) endpoint. The custom URL scheme is an
+                // external input boundary; it must not smuggle file:, javascript: or arbitrary
+                // schemes into SourceFeedView's network/media paths.
                 NotificationCenter.default.post(
                     name: .openSourceView,
                     object: nil,
-                    userInfo: ["feedURL": feedURL]
+                    userInfo: ["feedURL": safeURL.absoluteString]
                 )
             } else if url.host == "import",
                let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let feedURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
-               !feedURL.isEmpty {
+               let safeURL = InputParser.normalizeWebURL(feedURL) {
                 Task {
-                    let result = await loader.importFeeds(urls: [feedURL])
+                    let result = await loader.importFeeds(urls: [safeURL.absoluteString])
                     NotificationCenter.default.post(
                         name: .feedImportCompleted,
                         object: nil,
