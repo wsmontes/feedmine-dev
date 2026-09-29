@@ -44,6 +44,31 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         )
     }
 
+    func testShippingDefaultFallsBackAtomicallyWhenV2CannotCompose() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        // RuntimeDatabase needs to create Feedmine/RuntimeV2 below Application Support. Occupying
+        // "Feedmine" with a regular file makes that composition fail deterministically without mocking
+        // the storage layer.
+        let blocker = root.appendingPathComponent("Feedmine")
+        try Data("not-a-directory".utf8).write(to: blocker)
+
+        let runtime = MainFeedRuntime.launch(
+            applicationSupportDirectory: root,
+            defaults: makeDefaults(name: "release-default-fallback"),
+            arguments: []
+        )
+        defer { runtime.stop() }
+
+        XCTAssertEqual(runtime.decision.mode, .legacy)
+        XCTAssertFalse(runtime.ownsAcquisition)
+        XCTAssertNil(runtime.presentation.store, "fallback must not leave V2 presentation in front")
+        XCTAssertFalse(LegacyAcquisitionGate.isClosed, "fallback must leave the legacy owner able to fetch")
+        XCTAssertTrue(runtime.diagnostics.contains("composition-failed="), runtime.diagnostics)
+    }
+
     func testV2PresentationRequestIsHonouredOnTheNextLaunchAndLogsItsReason() {
         let defaults = makeDefaults(name: "pr13-v2")
         // The request is written now and applies to the *next* launch: a mode change is a relaunch,
