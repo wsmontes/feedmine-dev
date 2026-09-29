@@ -18,7 +18,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
 
     func testLegacyLaunchInstallsNoMirrorSinkAndPresentsWithoutASnapshotStore() {
         let defaults = makeDefaults(name: "pr13-legacy")
-        // A legacy launch is the default: no request, no arguments.
+        RuntimeModeLaunch.request(
+            RequestedFeatures(shadow: false, v2UI: false, v2Network: false),
+            in: defaults
+        )
         let runtime = MainFeedRuntime.launch(defaults: defaults, arguments: [])
         defer { runtime.stop() }
 
@@ -26,6 +29,19 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertFalse(runtime.presentsFromV2)
         XCTAssertNil(runtime.presentation.store, "legacy must not put a V2 store in the path")
         XCTAssertNil(ShadowMirrorRegistry.current, "a legacy launch must install no mirror sink")
+    }
+
+    func testFreshInstallUsesV2FullAsTheShippingDefault() {
+        let defaults = makeDefaults(name: "release-default")
+        let decision = RuntimeModeLaunch.decide(in: defaults, arguments: [])
+
+        XCTAssertEqual(decision.mode, .v2Full)
+        XCTAssertTrue(decision.ownsAcquisition)
+        XCTAssertEqual(decision.source, .none)
+        XCTAssertEqual(
+            decision.requested,
+            RequestedFeatures(shadow: false, v2UI: true, v2Network: true)
+        )
     }
 
     func testV2PresentationRequestIsHonouredOnTheNextLaunchAndLogsItsReason() {
