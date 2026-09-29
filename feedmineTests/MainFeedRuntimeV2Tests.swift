@@ -484,6 +484,45 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertEqual(runtime.sessionSurface, .content)
     }
 
+    /// A secondary selection may keep its own legacy rows only while the adopted session has not
+    /// published. As soon as that context's snapshot arrives, the surface handoff is complete and the
+    /// legacy rows must disappear. This is the Bookmark Box failure measured in baseline §8.62.
+    func testAdoptedBookmarkContextHandsTheSurfaceToItsSessionSnapshot() throws {
+        let presentation = makePresentation()
+        let mainKey = "main-feed|preset=everything|box=-"
+        let boxKey = "main-feed|preset=everything|box=7"
+
+        presentation.beginSession(contextKey: mainKey)
+        _ = presentation.publish(makePage(items: [makeItem(id: "legacy-main")], contextKey: mainKey))
+
+        presentation.beginSession(contextKey: boxKey, drawingLegacyUntilSnapshot: true)
+        _ = presentation.publish(makePage(items: [makeItem(id: "legacy-box")], contextKey: boxKey))
+        XCTAssertEqual(presentation.pageSource, .legacyPage)
+        XCTAssertEqual(presentation.sections.flatMap(\.rows).map(\.item.id), ["legacy-box"])
+
+        let card = MainFeedCardBridge.value(
+            item: makeItem(id: "runtime-box"),
+            ordinal: 0,
+            presentation: nil,
+            band: .card
+        ).card
+        XCTAssertNotNil(
+            presentation.applySnapshot(
+                makeSnapshot(contextKey: boxKey, sequence: 1, cards: [card])
+            )
+        )
+
+        XCTAssertEqual(presentation.pageSource, .sessionSnapshot)
+        XCTAssertEqual(
+            presentation.sections.flatMap(\.rows).map(\.item.id),
+            ["card:\(card.id)"]
+        )
+        XCTAssertFalse(
+            presentation.sections.flatMap(\.rows).contains { $0.item.id == "legacy-box" },
+            "the box's compatibility page is only a bridge until its adopted session publishes"
+        )
+    }
+
     /// In every other mode the legacy page is still the page, unchanged, including `v2Presentation`,
     /// where a `FeedScreenStore` is in the path: a store in the path is not a session that owns a
     /// surface.
