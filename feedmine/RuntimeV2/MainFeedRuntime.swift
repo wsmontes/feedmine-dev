@@ -369,7 +369,7 @@ final class MainFeedRuntime {
         applicationSupportDirectory: URL = MainFeedRuntime.defaultApplicationSupportDirectory,
         defaults: UserDefaults = .standard,
         arguments: [String] = ProcessInfo.processInfo.arguments,
-        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode
+        allowDeveloperOverrides: Bool = true
     ) -> MainFeedRuntime {
         let decision = RuntimeModeLaunch.decide(
             in: defaults,
