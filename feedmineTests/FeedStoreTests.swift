@@ -4008,4 +4008,31 @@ final class FeedStoreTests: XCTestCase {
         XCTAssertNil(InputParser.normalizeWebURL("httpx://example.com/feed.xml"))
     }
 
+    func testLocaleResolutionUsesAppOwnedPreferenceBeforeSystemLanguages() {
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: "pt-BR",
+                systemPreferences: ["fr-CA", "en"]
+            ).code,
+            "pt-BR"
+        )
+    }
+
+    func testLocaleResolutionFallsBackToPublicSystemPreferenceThenEnglish() {
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: "unsupported-language",
+                systemPreferences: ["fr-CA", "en"]
+            ).code,
+            "fr-CA"
+        )
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: nil,
+                systemPreferences: ["zz-ZZ"]
+            ).code,
+            "en"
+        )
+    }
+
 }
