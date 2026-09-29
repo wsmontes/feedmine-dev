@@ -151,6 +151,47 @@ public struct UserStateProjectionStore: Sendable {
         }
     }
 
+    /// Reads one kind of overlay for a bounded set of subjects in one asynchronous pool read.
+    ///
+    /// Search and other app surfaces use this instead of issuing one synchronous SQLite read per row on
+    /// the main actor. Missing subjects are intentionally absent from the dictionary: they mean that
+    /// this projection has never observed a fact for that subject, not a stored false.
+    public func projections(
+        kind: SubjectKind,
+        subjectIDs: [String]
+    ) async throws -> [String: Projection] {
+        let ids = Array(Set(subjectIDs)).sorted()
+        guard !ids.isEmpty else { return [:] }
+        return try await database.pool.read { db in
+            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
+            var arguments: [DatabaseValueConvertible?] = [kind.rawValue]
+            arguments.append(contentsOf: ids)
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT subject_id, wanted, last_operation_id, revision, updated_at
+                    FROM user_state_projection
+                    WHERE kind = ? AND subject_id IN (\(placeholders))
+                    """,
+                arguments: StatementArguments(arguments)
+            )
+            return Dictionary(uniqueKeysWithValues: rows.map { row in
+                let subjectID: String = row["subject_id"]
+                return (
+                    subjectID,
+                    Projection(
+                        kind: kind,
+                        subjectID: subjectID,
+                        wanted: row["wanted"] as Int64 == 1,
+                        lastOperationID: row["last_operation_id"],
+                        revision: row["revision"],
+                        updatedAt: Date(timeIntervalSince1970: row["updated_at"])
+                    )
+                )
+            })
+        }
+    }
+
     public func watermark() throws -> Watermark {
         try database.read { db in
             let row = try Row.fetchOne(db, sql: "SELECT revision, updated_at FROM user_state_watermark WHERE id = 1")
