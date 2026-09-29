@@ -384,21 +384,37 @@ final class MainFeedRuntime {
             failure = "runtime-v2 composition failed: \(error.localizedDescription)"
         }
 
+        // Composition is part of the launch decision's ability to run. A requested `v2Full` whose
+        // database cannot open must not keep V2 presentation in front of the reader *and* close the
+        // legacy acquisition gate — that combination is an ownerless blank app. Fall back atomically:
+        // presentation and acquisition both remain legacy for this process, while the stored request
+        // remains V2 so the next launch retries after a transient failure.
+        let effectiveDecision: RuntimeLaunchDecision
+        if composition == nil, let failure {
+            effectiveDecision = RuntimeLaunchDecision(
+                mode: .legacy,
+                requested: decision.requested,
+                rejection: failure,
+                source: decision.source,
+                decidedAt: decision.decidedAt
+            )
+        } else {
+            effectiveDecision = decision
+        }
+
         let runtime = MainFeedRuntime(
-            decision: decision,
+            decision: effectiveDecision,
             composition: composition,
             compositionFailure: failure,
             router: router
         )
-        if decision.mode.runsShadow, let composition {
+        if effectiveDecision.mode.runsShadow, let composition {
             composition.installMirrorSink()
             composition.startDraining()
         }
-        // The one place the mode takes effect on the legacy producers (plan §13). It is installed here
-        // and not in `RuntimeCompositionRoot.compose` because composition is also what a test drives
-        // directly, and a process-wide gate installed by a test's composition would leak into every
-        // other test in the same process. `stop()` reopens it.
-        if decision.mode.ownsAcquisition {
+        // The one place the mode takes effect on the legacy producers (plan §13). Close the gate only
+        // after the acquiring runtime exists; a failed composition has deliberately fallen back above.
+        if effectiveDecision.mode.ownsAcquisition, composition?.full != nil {
             LegacyAcquisitionGate.close()
         }
         Log.feed.info("\(runtime.diagnostics)")
