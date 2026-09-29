@@ -164,8 +164,6 @@ public struct UserStateProjectionStore: Sendable {
         guard !ids.isEmpty else { return [:] }
         return try await database.pool.read { db in
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
-            var arguments: [DatabaseValueConvertible?] = [kind.rawValue]
-            arguments.append(contentsOf: ids)
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -173,7 +171,7 @@ public struct UserStateProjectionStore: Sendable {
                     FROM user_state_projection
                     WHERE kind = ? AND subject_id IN (\(placeholders))
                     """,
-                arguments: StatementArguments(arguments)
+                arguments: StatementArguments([kind.rawValue] + ids)
             )
             return Dictionary(uniqueKeysWithValues: rows.map { row in
                 let subjectID: String = row["subject_id"]
