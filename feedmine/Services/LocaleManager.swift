@@ -68,6 +68,9 @@ final class LocaleManager {
 
     /// English fallback (always first match for unsupported system languages).
     private static let english: Language = supportedLanguages.first(where: { $0.code == "en" })!
+    /// FeedMine-owned preference. We never read the system's `AppleLanguages` defaults key: the
+    /// privacy manifest's CA92.1 reason covers app-owned defaults, not values written by the system.
+    static let selectedLanguageKey = "feedmine.selectedLanguage"
 
     // MARK: - State
 
@@ -75,36 +78,39 @@ final class LocaleManager {
     var selectedLanguage: Language
 
     private init() {
-        let resolved = Self.resolveLanguage()
+        let saved = UserDefaults.standard.string(forKey: Self.selectedLanguageKey)
+        let resolved = Self.resolveLanguage(
+            savedCode: saved,
+            systemPreferences: Locale.preferredLanguages
+        )
         selectedLanguage = resolved
-        // Ensure AppleLanguages is set so the bundle loads the correct .lproj
-        if UserDefaults.standard.stringArray(forKey: "AppleLanguages") == nil {
+
+        // When the user explicitly chose a language, keep the bundle override used by the existing
+        // restart-based localization flow. This value is written into this app's own defaults domain;
+        // the system/global AppleLanguages value is never read.
+        if saved != nil {
             UserDefaults.standard.set([resolved.code], forKey: "AppleLanguages")
         }
     }
 
     // MARK: - Language Resolution
 
-    /// Resolve the effective language at launch:
-    /// 1. UserDefaults "AppleLanguages" (user's explicit in-app choice)
-    /// 2. System preferred languages chain
-    /// 3. English fallback
-    private static func resolveLanguage() -> Language {
-        // 1. Explicit user choice (saved via AppleLanguages)
-        if let saved = UserDefaults.standard.stringArray(forKey: "AppleLanguages")?.first {
-            if let match = supportedLanguages.first(where: { $0.matches(saved) }) {
-                return match
-            }
+    /// Resolve the effective language at launch from app-owned state first, then the public locale API.
+    static func resolveLanguage(
+        savedCode: String?,
+        systemPreferences: [String]
+    ) -> Language {
+        if let savedCode,
+           let match = supportedLanguages.first(where: { $0.matches(savedCode) }) {
+            return match
         }
 
-        // 2. System preferred languages chain
-        for pref in Locale.preferredLanguages {
+        for pref in systemPreferences {
             if let match = supportedLanguages.first(where: { $0.matches(pref) }) {
                 return match
             }
         }
 
-        // 3. Fallback
         return english
     }
 
@@ -113,7 +119,9 @@ final class LocaleManager {
     /// Persist a new language selection. The change takes effect on next app launch.
     func selectLanguage(_ language: Language) {
         selectedLanguage = language
+        UserDefaults.standard.set(language.code, forKey: Self.selectedLanguageKey)
+        // Bundle localization still follows the established restart-based override, but the source of
+        // truth is FeedMine's own key above. We deliberately never read the system/global value.
         UserDefaults.standard.set([language.code], forKey: "AppleLanguages")
-        UserDefaults.standard.synchronize()
     }
 }
