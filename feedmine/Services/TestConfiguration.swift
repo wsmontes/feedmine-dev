@@ -124,16 +124,22 @@ struct TestConfiguration: Sendable {
     /// Parse launch arguments into a typed configuration.
     /// Call once at app init.
     static func parse(from processInfo: ProcessInfo = .processInfo) -> TestConfiguration {
-        parse(args: processInfo.arguments)
+        parse(
+            args: processInfo.arguments,
+            isXCTestProcess: processInfo.environment["XCTestConfigurationFilePath"] != nil
+        )
     }
 
     /// Parse an explicit argument array (for testing).
-    static func parse(args: [String]) -> TestConfiguration {
+    static func parse(
+        args: [String],
+        isXCTestProcess: Bool = ProcessInfo.isTestMode
+    ) -> TestConfiguration {
         // Production ignores the entire test-control vocabulary. XCUITest launches the app as a
         // separate process, so XCTestConfigurationFilePath is not a reliable discriminator there;
         // the explicit -ui-testing flag is. A random/deep-link launch argument must never be able to
         // reset state, inject fixtures or force deterministic network/time behavior.
-        let isHarnessLaunch = ProcessInfo.isTestMode || args.contains("-ui-testing")
+        let isHarnessLaunch = isXCTestProcess || args.contains("-ui-testing")
         guard isHarnessLaunch else { return .production }
 
         if !args.isEmpty {
