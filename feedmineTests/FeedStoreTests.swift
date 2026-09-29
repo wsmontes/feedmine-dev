@@ -3954,4 +3954,41 @@ final class FeedStoreTests: XCTestCase {
             "the cached page must be published before the catalogue loads; nil means it was never published early"
         )
     }
+
+    func testProductionLaunchArgumentsCannotActivateTestControls() {
+        let config = TestConfiguration.parse(
+            args: [
+                "feedmine",
+                "-reset-test-state",
+                "-fixture-profile", "heavy",
+                "-network-profile", "offline",
+                "-UITestSkipOnboarding"
+            ],
+            isXCTestProcess: false
+        )
+
+        XCTAssertFalse(config.isUITesting)
+        XCTAssertFalse(config.resetTestState)
+        XCTAssertFalse(config.skipOnboarding)
+        XCTAssertNil(config.fixtureProfile)
+        XCTAssertNil(config.networkProfile)
+    }
+
+    func testExplicitUITestLaunchStillActivatesHarnessControls() {
+        let config = TestConfiguration.parse(
+            args: [
+                "feedmine",
+                "-ui-testing",
+                "-fixture-profile", "typical",
+                "-network-profile", "offline",
+                "-reset-test-state"
+            ],
+            isXCTestProcess: false
+        )
+
+        XCTAssertTrue(config.isUITesting)
+        XCTAssertTrue(config.resetTestState)
+        XCTAssertEqual(config.fixtureProfile, "typical")
+        XCTAssertEqual(config.networkProfile, "offline")
+    }
 }
