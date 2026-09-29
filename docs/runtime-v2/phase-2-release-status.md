@@ -30,6 +30,9 @@
 - Canonical Search now applies bookmark/read overlay from runtime state.
 - V2-only Search hits derive the same durable subject as `RuntimeCardUserActions`; the display-only `origin:*` id never becomes user-state identity.
 - Canonical Search overlay regression prepared without introducing network.
+- Fresh installs now select `v2Full` as the shipping default; legacy is an explicit compatibility/rollback request.
+- V2 composition failure now falls back **atomically** to legacy presentation + legacy acquisition instead of closing the legacy gate with no acquiring runtime.
+- Regressions are prepared for both the shipping default and the composition-failure fallback.
 
 ## Compatibility invariants
 
