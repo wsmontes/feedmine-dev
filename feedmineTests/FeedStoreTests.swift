@@ -3991,4 +3991,21 @@ final class FeedStoreTests: XCTestCase {
         XCTAssertEqual(config.fixtureProfile, "typical")
         XCTAssertEqual(config.networkProfile, "offline")
     }
+    func testImportURLBoundaryAcceptsOnlyHTTPAndHTTPS() {
+        XCTAssertEqual(
+            InputParser.normalizeWebURL("HTTPS://example.com/feed.xml")?.scheme?.lowercased(),
+            "https"
+        )
+        XCTAssertEqual(
+            InputParser.normalizeWebURL("example.com/feed")?.absoluteString,
+            "https://example.com/feed"
+        )
+
+        XCTAssertNil(InputParser.normalizeWebURL("file:///private/var/mobile/secret"))
+        XCTAssertNil(InputParser.normalizeWebURL("javascript:alert(1)"))
+        XCTAssertNil(InputParser.normalizeWebURL("ftp://example.com/feed.xml"))
+        XCTAssertNil(InputParser.normalizeWebURL("mailto:reader@example.com"))
+        XCTAssertNil(InputParser.normalizeWebURL("httpx://example.com/feed.xml"))
+    }
+
 }
