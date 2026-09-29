@@ -368,9 +368,14 @@ final class MainFeedRuntime {
     static func launch(
         applicationSupportDirectory: URL = MainFeedRuntime.defaultApplicationSupportDirectory,
         defaults: UserDefaults = .standard,
-        arguments: [String] = ProcessInfo.processInfo.arguments
+        arguments: [String] = ProcessInfo.processInfo.arguments,
+        allowDeveloperOverrides: Bool = ProcessInfo.isTestMode
     ) -> MainFeedRuntime {
-        let decision = RuntimeModeLaunch.decide(in: defaults, arguments: arguments)
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: arguments,
+            allowDeveloperOverrides: allowDeveloperOverrides
+        )
         let router = MainFeedIntentRouter()
 
         var composition: RuntimeCompositionRoot?
