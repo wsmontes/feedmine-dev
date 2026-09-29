@@ -1612,7 +1612,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         }
     }
 
-    private func makePage(items: [FeedItem]) -> MainFeedPage {
+    private func makePage(
+        items: [FeedItem],
+        contextKey: String = "main-feed|preset=everything|box=-"
+    ) -> MainFeedPage {
         let section = FeedLoader.DateSection(
             id: "ordered-results",
             title: "",
@@ -1623,7 +1626,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             sections: [section],
             cards: [],
             band: .card,
-            contextKey: "main-feed|preset=everything|box=-"
+            contextKey: contextKey
         )
     }
 
