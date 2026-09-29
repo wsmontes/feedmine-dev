@@ -211,7 +211,9 @@ struct FeedmineApp: App {
     @State private var contentFilters = ContentFilterStore.shared
     /// The launch's Runtime V2 decision and composition, resolved once, here (plan §13). Nothing else
     /// in the app may re-resolve the mode: a request written later applies on the next launch.
-    @State private var runtime = MainFeedRuntime.launch()
+    @State private var runtime = MainFeedRuntime.launch(
+        allowDeveloperOverrides: ProcessInfo.isTestMode
+    )
 
     init() {
         let testConfiguration = TestConfiguration.parse()
