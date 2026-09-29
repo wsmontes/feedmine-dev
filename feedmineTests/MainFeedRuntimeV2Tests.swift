@@ -485,6 +485,43 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         )
     }
 
+    /// The runtime's acquisition catalogue follows the user's live source registry. Imports and
+    /// enablement changes must invalidate the descriptor snapshot instead of falling through to the
+    /// legacy fetcher, whose network path is closed in v2Full.
+    func testLiveSourceCatalogueMutationRestartsTheRuntimeOwner() async {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = MainFeedRuntime.launch(
+            applicationSupportDirectory: directory,
+            defaults: makeDefaults(name: "live-catalogue"),
+            arguments: [RuntimeModeLaunch.v2UIArgument, RuntimeModeLaunch.v2NetworkArgument]
+        )
+        defer { runtime.stop() }
+
+        let store = FeedStore.empty()
+        let loader = FeedLoader(store: store)
+        runtime.attach(loader: loader)
+        XCTAssertEqual(runtime.catalogueRestartCount, 0)
+
+        store.registry.sources = [
+            FeedSource(
+                title: "Imported after launch",
+                url: "https://example.invalid/imported.xml",
+                category: "Imported",
+                region: "imported"
+            )
+        ]
+
+        let deadline = Date().addingTimeInterval(1)
+        while runtime.catalogueRestartCount == 0, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(runtime.catalogueRestartCount, 1)
+        XCTAssertTrue(runtime.ownsAcquisition)
+        XCTAssertTrue(LegacyAcquisitionGate.isClosed)
+    }
+
     /// The session owns one selection, not the screen. A reader who moves to a bookmark box, a Smart
     /// Feed or a collection is on a surface the session's plan was not built for, and that surface draws
     /// its own legacy page — which the store still holds in this mode, because `LegacyAcquisitionGate`
