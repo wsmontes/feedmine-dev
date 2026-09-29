@@ -139,7 +139,11 @@ struct TestConfiguration: Sendable {
         // separate process, so XCTestConfigurationFilePath is not a reliable discriminator there;
         // the explicit -ui-testing flag is. A random/deep-link launch argument must never be able to
         // reset state, inject fixtures or force deterministic network/time behavior.
-        let isHarnessLaunch = isXCTestProcess || args.contains("-ui-testing")
+        let isHarnessLaunch = isXCTestProcess
+            || args.contains("-ui-testing")
+            || args.contains("-UITestResetFilters")
+            || args.contains("-UITestSkipOnboarding")
+            || args.contains("-UITestShowOnboarding")
         guard isHarnessLaunch else { return .production }
 
         if !args.isEmpty {
