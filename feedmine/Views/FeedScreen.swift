@@ -52,6 +52,13 @@ struct FeedScreen: View {
     @State private var filterLensCollapseTask: Task<Void, Never>?
     @State private var engine = CircadianEngine.shared
     @AppStorage("showDebugBar") private var showDebugBar = false
+    private var debugBarEnabled: Bool {
+        #if DEBUG
+        showDebugBar
+        #else
+        false
+        #endif
+    }
     @AppStorage("nightMode") private var nightMode = false
     @AppStorage("lastScrollItemID") private var lastScrollItemID = ""
     @AppStorage("filterLensDismissedSignature") private var filterLensDismissedSignature = ""
@@ -489,7 +496,7 @@ struct FeedScreen: View {
             Color.clear.frame(height: 0)
             CompactErrorBanner()
             HStack(spacing: 8) {
-                if showDebugBar {
+                if debugBarEnabled {
                     CompactDebugInfo()
                 } else {
                     // The chip is drawn for the whole screen, so on the page the session owns it is the
@@ -529,7 +536,7 @@ struct FeedScreen: View {
                         }
                     }
                     filterButton
-                    if showDebugBar {
+                    if debugBarEnabled {
                         Button {
                             showCatalogExplore = true
                         } label: {
@@ -1761,6 +1768,13 @@ struct CompactFeedStatus: View {
     @State private var engine = CircadianEngine.shared
     @State private var showReadyPulse = false
     @AppStorage("showDebugBar") private var showDebugBar = false
+    private var debugBarEnabled: Bool {
+        #if DEBUG
+        showDebugBar
+        #else
+        false
+        #endif
+    }
 
     /// The runtime's own statement, on the one surface a launch's runtime owns (plan §17, DoD2). Nil
     /// everywhere else — `CompactFeedStatus()` is the legacy chip — and then this chip reads the loader's
@@ -1823,11 +1837,13 @@ struct CompactFeedStatus: View {
         // Secret gesture: triple-tap the feed status to toggle debug bar.
         // Not exposed in Settings — intentional, for development use only.
         .onTapGesture(count: 3) {
+            #if DEBUG
             let impact = UIImpactFeedbackGenerator(style: .medium)
             impact.impactOccurred()
             withAnimation(.easeInOut(duration: 0.3)) {
                 showDebugBar.toggle()
             }
+            #endif
         }
         .task(id: display.runwayReady) {
             guard display.runwayReady == true else { return }
