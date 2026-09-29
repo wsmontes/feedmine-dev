@@ -78,19 +78,41 @@ enum InputParser {
 
     // MARK: - URL Normalization
 
-    private static func normalize(_ raw: String) -> URL? {
+    /// Normalizes user-supplied web locations while keeping the accepted scheme vocabulary closed.
+    ///
+    /// Deep links and free-form imports share this boundary. A string that already names a non-web
+    /// scheme is rejected rather than being rewritten into an apparently-HTTPS string such as
+    /// `https://javascript:...`. Bare domains are still supported for the add-feed UI.
+    static func normalizeWebURL(_ raw: String) -> URL? {
         var str = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Case-insensitive scheme check — HTTP://EXAMPLE.COM must not become
-        // https://HTTP://EXAMPLE.COM (review finding).
-        if !str.lowercased().hasPrefix("http") {
-            // Reject email addresses and mailto: links — they produce garbage
-            // feed URLs when prefixed with https://.
+        guard !str.isEmpty else { return nil }
+
+        if let colon = str.firstIndex(of: ":") {
+            let prefix = String(str[..<colon])
+            let looksLikeScheme = !prefix.isEmpty
+                && prefix.unicodeScalars.allSatisfy {
+                    CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "+-.")).contains($0)
+                }
+            if looksLikeScheme {
+                let scheme = prefix.lowercased()
+                guard scheme == "http" || scheme == "https" else { return nil }
+            }
+        } else {
+            // Reject email addresses — they'd become URLs with userinfo rather than feed hosts.
             if str.contains("@") && !str.contains("/") { return nil }
             str = "https://\(str)"
         }
-        // Reject mailto: after scheme prefixing.
-        if let url = URL(string: str), url.scheme?.lowercased() == "mailto" { return nil }
-        return URL(string: str)
+
+        guard let url = URL(string: str),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else { return nil }
+        return url
+    }
+
+    private static func normalize(_ raw: String) -> URL? {
+        normalizeWebURL(raw)
     }
 
     // MARK: - Classification
