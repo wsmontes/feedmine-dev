@@ -214,16 +214,23 @@ struct FeedmineApp: App {
     @State private var runtime = MainFeedRuntime.launch()
 
     init() {
-        if ProcessInfo.processInfo.arguments.contains("-UITestResetFilters") {
+        let testConfiguration = TestConfiguration.parse()
+        TestConfiguration.active = testConfiguration.isUITesting || testConfiguration.isPerformanceTesting
+            ? testConfiguration
+            : nil
+        if testConfiguration.resetFilters {
             resetFiltersForUITestLaunch()
         }
-        if ProcessInfo.processInfo.arguments.contains("-UITestShowOnboarding") {
+        if testConfiguration.showOnboarding {
             UserDefaults.standard.set(false, forKey: Keys.hasSeenOnboarding)
-        } else if ProcessInfo.processInfo.arguments.contains("-UITestSkipOnboarding") {
+        } else if testConfiguration.skipOnboarding {
             UserDefaults.standard.set(true, forKey: Keys.hasSeenOnboarding)
         }
-        // Journey-only instrument (review: ignored card tap). Off unless `-UITestTapTrace` is passed.
-        TapTrace.installIfRequested(ProcessInfo.processInfo.arguments)
+        // Journey-only instrument (review: ignored card tap). Off unless an actual UI-test launch also
+        // requests `-UITestTapTrace`; production arguments cannot install a window-level recognizer.
+        TapTrace.installIfRequested(
+            testConfiguration.isUITesting ? ProcessInfo.processInfo.arguments : []
+        )
         // Nothing to hand the scheduler: the loader comes from the same provider the scheduler asks
         // (`FeedLoaderProvider`), so both see one instance with no wiring between them and no window in
         // which the task has no owner.
