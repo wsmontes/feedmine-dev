@@ -890,6 +890,11 @@ public struct PublicationRepository: Sendable {
             guard card.frozen.segmentOrdinal == request.segmentOrdinal else {
                 throw PublicationFailure.invalidComposition("a card names another segment ordinal")
             }
+            guard card.frozen.editorialRevision == request.token.editorialRevision else {
+                throw PublicationFailure.invalidComposition(
+                    "a card's editorial revision is not the publication token's"
+                )
+            }
             guard card.frozen.publicationSchemaVersion == PublicationSchema.currentVersion else {
                 throw PublicationFailure.unsupportedPublicationSchemaVersion(
                     card.frozen.publicationSchemaVersion
