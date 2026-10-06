@@ -32,6 +32,22 @@ Esperado: `Upload succeeded`, a tag local `ios/1.0-build.18-8f9e0d02` e a linha 
 
 `scripts/release-testflight.sh` re-rodado sobre o HEAD atual (`816d1dd9`, 15 consertos, barra verde `BAR OK 11:34:37`): arquivou, pareou (`PAIRING OK: TestFlight build 1.0 (18) = 816d1dd93ffee0389a0f2f2ab6a6cfccdecc9a37`) e o `AppsService` recusou de novo, com id de requisição **novo** (`U2TKFRZQO3DD3V4BJYJRHEI74E`): `403 FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`. Nada enviado, nenhuma tag criada. Não existe endpoint de API para assinar contrato — é ação do *Account Holder*.
 
+### ENVIADO — build 18 no TestFlight (13:45)
+
+Depois do contrato assinado, o mesmo comando publicou, sem nenhuma outra mudança:
+
+```
+== building 1.0 (18) from ad52a54c ==
+archived: version=1.0 build=18 sha=ad52a54c
+PAIRING OK: TestFlight build 1.0 (18) = ad52a54c2d939eabdb9b4969910e5fdc29a15ad4
+Upload succeeded.
+tag ios/1.0-build.18-ad52a54c created (local, not pushed)
+```
+
+- **`Upload succeeded`** é a confirmação da Apple (o `AppsService` aceitou o binário); o processamento do TestFlight leva alguns minutos até o build ficar selecionável.
+- **Tag local:** `ios/1.0-build.18-ad52a54c` (o script nunca pusha). O SHA `ad52a54c` é o commit de docs sobre o `816d1dd9` — o mesmo código que fechou `BAR OK 11:34:37` (611 testes ×3 + jornada 17/17).
+- **O que isso NÃO resolve:** App Privacy, metadados, screenshots, testadores e as Review Notes continuam atrás do Connect; e o dogfood em device pode ser feito pelo TestFlight agora (não precisa mais do `.ipa` de desenvolvimento).
+
 ### Enquanto o contrato está pendente: dogfood local, sem tocar no Connect
 
 O bloqueio do upload **não gasta** o archive assinado. Dele saiu um `.ipa` de **desenvolvimento**, que não fala com o `AppsService`:
