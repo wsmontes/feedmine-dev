@@ -46,6 +46,7 @@ tag ios/1.0-build.18-ad52a54c created (local, not pushed)
 
 - **`Upload succeeded`** é a confirmação da Apple (o `AppsService` aceitou o binário); o processamento do TestFlight leva alguns minutos até o build ficar selecionável.
 - **Tag local:** `ios/1.0-build.18-ad52a54c` (o script nunca pusha). O SHA `ad52a54c` é o commit de docs sobre o `816d1dd9` — o mesmo código que fechou `BAR OK 11:34:37` (611 testes ×3 + jornada 17/17).
+- **Verificação independente (App Store Connect API, só leitura, JWT ES256 com a mesma chave do script):** o build existe na conta e a Apple o processou — `version=18`, `uploadedDate=2026-10-06T13:45:57-07:00`, **`processingState=VALID`**, `expired=false`, id `dab2bae4-27f6-44d3-8735-b6768fceba85`. `VALID` é o estado bom: o binário passou o processamento (não é `INVALID`). Antes dele, o último build da conta era o 17, de 2026-09-17.
 - **O que isso NÃO resolve:** App Privacy, metadados, screenshots, testadores e as Review Notes continuam atrás do Connect; e o dogfood em device pode ser feito pelo TestFlight agora (não precisa mais do `.ipa` de desenvolvimento).
 
 ### Enquanto o contrato está pendente: dogfood local, sem tocar no Connect

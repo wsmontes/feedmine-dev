@@ -35,12 +35,12 @@
 | `35-privacy-policy-draft.md` | 2995 | 307ac65e93db |
 | `36-patch-privacy-row.md` | 2902 | 0e150abab01c |
 | `37-jornada-diagnostico.md` | 1770 | 4e56a132a127 |
-| `38-rc18-bump.md` | 7689 | 09eebe6d16d3 |
+| `38-rc18-bump.md` | 8136 | 03e5d4f3941a |
 | `39-bump-parte2-worker.md` | 2557 | 5bf0fe061fa8 |
 | `40-p01-design.md` | 2318 | 89732bcd4687 |
 | `41-c06-design.md` | 2389 | fde8004614df |
 | `42-tap-sob-carga.md` | 2014 | 5252adf06cf4 |
-| `_MANIFEST.md` | 2079 | c4375c9bf5fb |
+| `_MANIFEST.md` | 2079 | be11c268655a |
 | `_apply/README.md` | 3717 | 1eca2b62c149 |
 | `_apply/apply-adr003.sh` | 8131 | 296d21ef279c |
 | `_apply/substitutions.tsv` | 1796 | 9b50825e5e34 |
