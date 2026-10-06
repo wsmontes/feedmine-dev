@@ -1,8 +1,34 @@
 # RC 18 — o bump de build e a prova do archive (procedimento verificado)
 
-> **Consequência que decide o seu trabalho:** os **11 consertos** deste pacote estão na *árvore* (worktree), não no commit `70f7b06b`. Publicar o build **17** (já enviado, do commit `4df951c4`) significa **não embarcar nenhum deles**. Eles só entram se você escolher um build novo — 18.
+> **Consequência que decide o seu trabalho:** os **14 consertos** estão no commit **`8f9e0d02`** ("fix(release): fourteen defects from the review, and build 18"), com o build já em **18**. O build **17** (entregue de `4df951c4`) não carrega nenhum deles.
 
-## Por que 18 e não 17
+## Estado da publicação (executado em 2026-10-06, 10:2x)
+
+**RC escolhido: 18** — publicar o 17 significaria não embarcar nenhum dos 14 consertos (o 17 saiu de `4df951c4`).
+
+Feito, com evidência:
+
+1. `feedmine/Info.plist` → `CFBundleVersion` = **18** (o alvo lê esse literal: `project.pbxproj:1543,1562` → `INFOPLIST_FILE = feedmine/Info.plist`).
+2. Commit **`8f9e0d02`** — *"fix(release): fourteen defects from the review, and build 18"* (14 arquivos de código + testes + o pacote de docs desta revisão). Árvore limpa.
+3. `scripts/release-testflight.sh --dry-run` → **verde**: `archived: version=1.0 build=18 sha=8f9e0d02` e `PAIRING OK: TestFlight build 1.0 (18) = 8f9e0d029c70b90ab9081c3d6114b178aab6c9ba`.
+4. `scripts/release-testflight.sh` (envio real) → **arquivou e autenticou, e a Apple recusou por contrato**:
+
+```
+403 FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED
+'A required agreement is missing or has expired.'
+```
+
+**Nada foi enviado** (`.build/tf-export` vazio) e **nenhuma tag foi criada** — o script sai antes disso. O que falta é uma ação **só sua**, no App Store Connect: aceitar o contrato pendente (App Store Connect → *Business* → **Agreements, Tax, and Banking**, ou o banner de contrato no topo). A chave de API está boa — a resposta é regra de negócio, não 401.
+
+Depois de assinar, o mesmo comando publica:
+
+```bash
+cd /Users/wagnermontes/Documents/GitHub/feedmine
+scripts/release-testflight.sh
+```
+Esperado: `Upload succeeded`, a tag local `ios/1.0-build.18-8f9e0d02` e a linha `BUILD 1.0 (18) = 8f9e0d02…`. Nada é pushado (a tag fica local, como o próprio script documenta).
+
+
 
 | Fato | Onde |
 |---|---|
