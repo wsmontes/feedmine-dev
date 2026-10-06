@@ -1,6 +1,6 @@
 # RC 18 — o bump de build e a prova do archive (procedimento verificado)
 
-> **Consequência que decide o seu trabalho:** os **14 consertos** estão no commit **`8f9e0d02`** ("fix(release): fourteen defects from the review, and build 18"), com o build já em **18**. O build **17** (entregue de `4df951c4`) não carrega nenhum deles.
+> **Consequência que decide o seu trabalho:** os **15 consertos** estão no commit **`816d1dd9`** (`816d1dd9` = C-06; o pacote começou em `8f9e0d02` = "fix(release): fourteen defects from the review, and build 18"), com o build já em **18**. O build **17** (entregue de `4df951c4`) não carrega nenhum deles.
 
 ## Estado da publicação (executado em 2026-10-06, 10:2x)
 
@@ -27,6 +27,33 @@ cd /Users/wagnermontes/Documents/GitHub/feedmine
 scripts/release-testflight.sh
 ```
 Esperado: `Upload succeeded`, a tag local `ios/1.0-build.18-8f9e0d02` e a linha `BUILD 1.0 (18) = 8f9e0d02…`. Nada é pushado (a tag fica local, como o próprio script documenta).
+
+### Retentativa em 13:33 — mesmo bloqueio, requisição nova
+
+`scripts/release-testflight.sh` re-rodado sobre o HEAD atual (`816d1dd9`, 15 consertos, barra verde `BAR OK 11:34:37`): arquivou, pareou (`PAIRING OK: TestFlight build 1.0 (18) = 816d1dd93ffee0389a0f2f2ab6a6cfccdecc9a37`) e o `AppsService` recusou de novo, com id de requisição **novo** (`U2TKFRZQO3DD3V4BJYJRHEI74E`): `403 FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`. Nada enviado, nenhuma tag criada. Não existe endpoint de API para assinar contrato — é ação do *Account Holder*.
+
+### Enquanto o contrato está pendente: dogfood local, sem tocar no Connect
+
+O bloqueio do upload **não gasta** o archive assinado. Dele saiu um `.ipa` de **desenvolvimento**, que não fala com o `AppsService`:
+
+- **Artefato:** `.build/feedmine-1.0-18-dev.ipa` (73,7 MB, sha256 `d61cf7cb…`; a pasta `.build/` é ignorada pelo git).
+- **Verificado por dentro** (o mesmo emparelhamento do TestFlight, agora no arquivo que vai ao telefone): `CFBundleVersion = 18`, `CFBundleShortVersionString = 1.0`, **`FeedmineGitSHA = 816d1dd9`**.
+- **Assinatura:** `Apple Development: wmontes@gmail.com (BU5227WFYX)`, profile `iOS Team Provisioning Profile: *`, válido até 2027-06-07.
+- **Devices autorizados — exatamente os dois telefones do dono:**
+
+| Telefone (`devicectl`) | UDID no profile |
+|---|---|
+| Wagner's iPhone 14 Plus (`D28AP`) | `00008110-00067D861486201E` |
+| iPhone (129) — iPhone 15 (`D37AP`) | `00008120-000260903ED1A01E` |
+
+Instalação (telefone plugado; qualquer um dos dois serve):
+
+```bash
+xcrun devicectl device install app --device 00008110-00067D861486201E \
+  /Users/wagnermontes/Documents/GitHub/feedmine/.build/feedmine-1.0-18-dev.ipa
+```
+
+Isso destrava o dogfood do build 18 **sem** depender do contrato: mesma árvore, mesmo build e mesmo SHA que o TestFlight receberá quando o contrato for assinado. O que **não** substitui: revisão da App Store, App Privacy e metadados — esses continuam atrás do Connect.
 
 
 
