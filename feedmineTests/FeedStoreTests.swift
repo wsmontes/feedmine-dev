@@ -223,6 +223,101 @@ final class FeedStoreTests: XCTestCase {
         XCTAssertEqual(storedImage, repaired.imageURL)
     }
 
+    /// An Atom entry refresh rewrites the stored row through `FeedItemRecord.update`,
+    /// which writes every column. The reader's own state — read, opened, clicked,
+    /// consumed — must survive that rewrite: before the fix the record's initializer
+    /// defaults (`isRead = false`, nil stamps) were persisted and the item un-read
+    /// itself on the next fetch.
+    func testAtomEntryRefreshPreservesReaderState() async throws {
+        let store = try FeedStore(inMemory: true)
+        let published = Date(timeIntervalSince1970: 1_700_000_000)
+        let original = FeedItem(
+            id: "refresh-reader-state",
+            sourceTitle: "Feed",
+            sourceURL: "https://example.com/feed",
+            category: "News",
+            title: "Item",
+            excerpt: "Excerpt",
+            url: "https://example.com/item",
+            imageURL: nil,
+            publishedAt: published,
+            region: "global"
+        )
+        _ = await store.persistFetchedItems([original])
+
+        store.markAsRead(original.id)
+        let readPersisted = await waitUntil {
+            let isRead: Int? = try? await store.db.read { db in
+                try Int.fetchOne(
+                    db,
+                    sql: "SELECT is_read FROM feed_item WHERE id = ?",
+                    arguments: [original.id]
+                )
+            }
+            return isRead == 1
+        }
+        XCTAssertTrue(readPersisted, "markAsRead must persist is_read before the refresh")
+
+        // Same id with a newer Atom revision: the update-by-ID path.
+        let refreshed = FeedItem(
+            id: original.id,
+            sourceTitle: original.sourceTitle,
+            sourceURL: original.sourceURL,
+            category: original.category,
+            title: "Item (revised)",
+            excerpt: original.excerpt,
+            url: original.url,
+            imageURL: nil,
+            publishedAt: published,
+            region: original.region,
+            updatedAt: published.addingTimeInterval(3600)
+        )
+        _ = await store.persistFetchedItems([refreshed])
+
+        let storedRead: Int? = try await store.db.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT is_read FROM feed_item WHERE id = ?",
+                arguments: [original.id]
+            )
+        }
+        let storedConsumed: Int? = try await store.db.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT consumed_at FROM feed_item WHERE id = ?",
+                arguments: [original.id]
+            )
+        }
+        let storedTitle: String? = try await store.db.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT title FROM feed_item WHERE id = ?",
+                arguments: [original.id]
+            )
+        }
+
+        XCTAssertEqual(storedRead, 1, "an Atom refresh must not un-read the item")
+        XCTAssertNotNil(storedConsumed, "an Atom refresh must keep the consume stamp")
+        XCTAssertEqual(storedTitle, "Item (revised)", "the refresh must still update the content")
+    }
+
+    /// P-01: a store that cannot be opened must be *visible* as such. The in-memory fallback
+    /// keeps the loader constructible, and `persistenceUnavailable` is what `start()` and the
+    /// screen branch on — if the failure were swallowed again, the app would draw an empty
+    /// feed over data that still exists on disk and accept writes it discards at exit.
+    func testPersistentStoreFailureIsVisibleRatherThanSwallowed() async {
+        struct StoreFailure: Error {}
+        let loader = FeedLoader(storeFactory: { throw StoreFailure() })
+
+        XCTAssertNotNil(loader.initError, "the failure must be captured, not swallowed")
+        XCTAssertTrue(loader.persistenceUnavailable, "start() and the screen branch on this")
+
+        // The guard itself is a plain branch; this asserts the observable half — the loader
+        // still answers after a refused start instead of publishing a fallback session.
+        await loader.start()
+        XCTAssertEqual(loader.sourceCount, 0, "a refused start must not load a source registry")
+    }
+
     func testFeedItemRecordDecodesPersistedHTMLEntitiesWhenHydrating() {
         let record = FeedItemRecord(
             from: FeedItem(

@@ -279,7 +279,10 @@ public struct SqlRetentionRootProvider: RetentionRootProviding {
                 """)
         )
         if let authority {
-            subjects.formUnion((try? authority.savedBookmarkSubjects()) ?? [])
+            // The union below is deliberate (see the comment above): a subject the authority has and
+            // the projection has not is still a bookmark that exists. Swallowing this read would drop
+            // exactly that half and let a purge collect the edition holding it.
+            subjects.formUnion(try authority.savedBookmarkSubjects())
         }
         let savedPlaceholders = Array(repeating: "?", count: subjects.count).joined(separator: ", ")
 

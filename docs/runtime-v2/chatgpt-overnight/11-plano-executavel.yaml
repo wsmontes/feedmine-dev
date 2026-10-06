@@ -1,0 +1,396 @@
+version: 1
+generated_for: feedmine-runtime-v2-migration
+
+preconditions:
+  - id: P1
+    check: 'test "$(git rev-parse --short=8 HEAD)" = "70f7b06b" && echo 70f7b06b'
+    expect: '70f7b06b; otherwise re-audit paths and decisions before executing this plan.'
+  - id: P2
+    check: 'test -z "$(git status --porcelain=v1)" && echo CLEAN'
+    expect: 'CLEAN'
+  - id: P3
+    check: 'test -f Packages/FeedRuntimeV2/Package.swift && test -f TestPlans/FeedMine-RuntimeV2.xctestplan && test -f TestPlans/FeedMine-Smoke.xctestplan && echo OK'
+    expect: 'OK'
+  - id: P4
+    check: 'grep -q ''SCHEME="feedmine"'' scripts/validation/run_smoke.sh && grep -q ''PROJECT="feedmine.xcodeproj"'' scripts/validation/run_smoke.sh && echo OK'
+    expect: 'OK; confirms the repository-owned Xcode project/scheme used below.'
+  - id: P5
+    check: 'bash scripts/verify-runtime-v2-boundaries.sh'
+    expect: 'PASS: module boundaries match the plan'
+  - id: P6
+    check: 'grep -q "CREATE TABLE legacy_source_map" Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift && echo PRESENT'
+    expect: 'PRESENT; current v2_runtime_schema already creates the additive legacy bridge.'
+
+steps:
+  - id: PR-00-01
+    title: 'Incorporate the normative migration handoff and Source identity decision into ADR-003.'
+    depends_on: []
+    kind: doc_edit
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-003.md
+        change: 'Insert §17 Plano de migração normativo with M1-M8, transactional ensure/allocation, slice order, data-loss matrix, rollback rules, and human-only decisions; keep Status Proposed.'
+    verify:
+      command: 'bash scripts/verify-runtime-v2-boundaries.sh'
+      expect: 'Architecture boundary gate remains PASS; Gate 0 human review verifies the document diff itself.'
+    rollback: 'Revert only the ADR-003 documentation diff; no schema or persisted state has changed.'
+    stop_condition: 'automático: stop if the existing ADR contains a contradictory normative rule that cannot be reconciled without changing D1-D19.'
+    human_decision: null
+
+  - id: PR-00-02
+    title: 'Reconcile card, bookmark, acquisition, and test-evidence wording across the ADR set.'
+    depends_on: [PR-00-01]
+    kind: doc_edit
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-001.md
+        change: 'State that compatibility card aliases are not PublicationCardID and classify absent acceptance tests as future evidence rather than already pinned tests.'
+      - path: docs/runtime-v2/adrs/ADR-002.md
+        change: 'Classify its three audited-absent acceptance tests as required future evidence instead of claiming they already exist.'
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Make user.sqlite bookmark authority explicit and correct test-evidence status and renamed test references.'
+      - path: docs/runtime-v2/adrs/ADR-005.md
+        change: 'Scope media-speculation prohibition to Runtime V2 acquisition and update renamed test references only.'
+      - path: docs/runtime-v2/adrs/ADR-007.md
+        change: 'Restrict PublicationCardID exposure semantics to actually published cards and classify tombstone-history test as future evidence until implemented.'
+      - path: docs/runtime-v2/baseline.md
+        change: 'Remove or correct the nonexistent GeometryTests.xctestplan reference and stale renamed test identifiers.'
+      - path: docs/runtime-v2/rollout.md
+        change: 'Update stale test/file names without converting proposed behavior into landed behavior.'
+    verify:
+      command: 'bash scripts/validation/run_smoke.sh'
+      expect: 'Smoke script reports PASS with scheme feedmine and TestPlan FeedMine-Smoke.'
+    rollback: 'Revert documentation-only changes.'
+    stop_condition: 'automático: stop if a renamed test cannot be resolved to one real current test or if an absent test would be falsely described as implemented.'
+    human_decision: null
+
+  - id: PR-00-03
+    title: 'Add the two immediately testable ADR-004 migration safety proofs.'
+    depends_on: [PR-00-02]
+    kind: test
+    targets:
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/MigrationTests.swift
+        change: 'Add walAwareBackupRestoresConsistentDatabase and unknownFutureSchemaFailsControlled using the real RuntimeDatabase migrator and on-disk fixtures.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 --filter MigrationTests'
+      expect: 'MigrationTests pass; WAL-aware restore preserves committed rows and a future schema fails without erase/recreate.'
+    rollback: 'Revert the added tests; production schema is untouched.'
+    stop_condition: 'automático: stop if the production backup/open path cannot express either invariant without a new architecture decision.'
+    human_decision: null
+
+  - id: PR-00-04
+    title: 'Prove legacy_source_map is an additive and idempotent migration bridge.'
+    depends_on: [PR-00-03]
+    kind: additive_migration
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift
+        change: 'Keep legacy_source_map creation in the append-only v2_runtime_schema; never rewrite an applied migration, and append a corrective successor migration only if the supported predecessor fixture proves the table is absent.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/MigrationTests.swift
+        change: 'Add testLegacySourceMapMigrationIsIdempotent: migrate, insert a mapping, reopen/migrate again, and prove one unchanged mapping and no additional migration application.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 --filter MigrationTests/testLegacySourceMapMigrationIsIdempotent'
+      expect: 'The second migration/open leaves exactly the original legacy_source_map row and runtime_source_id unchanged.'
+    rollback: 'Revert only any newly appended migration and its test before merge; never edit or delete an already-shipped migration identifier.'
+    stop_condition: 'automático: stop if idempotence requires DROP, rekey, erase-on-schema-change, or rewriting v2_runtime_schema after it has shipped.'
+    human_decision: null
+
+  - id: PR-00-05
+    title: 'Run the complete pre-freeze Runtime V2 verification gate.'
+    depends_on: [PR-00-04]
+    kind: test
+    targets:
+      - path: TestPlans/FeedMine-RuntimeV2.xctestplan
+        change: 'Do not modify; use the existing plan as the app-target Gate 0 execution set.'
+    verify:
+      command: 'bash scripts/verify-runtime-v2-boundaries.sh && swift test --package-path Packages/FeedRuntimeV2 && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Boundary gate PASS, complete SPM package tests PASS, and FeedMine-RuntimeV2 TestPlan PASS.'
+    rollback: 'No persisted product change; revert PR-00 changes if verification fails.'
+    stop_condition: 'automático: any test failure, boundary violation, destructive migration, or false evidence statement aborts Gate 0.'
+    human_decision: null
+
+  - id: PR-00-06
+    title: 'Obtain the joint human Gate 0 sign-off for all seven ADRs.'
+    depends_on: [PR-00-05]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-001.md
+        change: 'Change status only if the human Gate 0 review approves the complete seven-ADR set.'
+      - path: docs/runtime-v2/adrs/ADR-002.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-003.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-005.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-006.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-007.md
+        change: 'Same joint status transition.'
+    verify:
+      command: 'PARADA: HUMANO — aprovar ou rejeitar Gate 0 e registrar o status escolhido para os sete ADRs'
+      expect: 'One joint decision; no partial freeze.'
+    rollback: 'If rejected, leave every ADR Proposed and make no post-freeze implementation change.'
+    stop_condition: 'humano: any reviewer rejects a boundary obligation or asks for a semantic ADR change.'
+    human_decision: H1
+
+  - id: PR-01-01
+    title: 'Make runtime Source allocation plus legacy mapping one atomic ensure operation.'
+    depends_on: [PR-00-06]
+    kind: code
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/SourceRegistry.swift
+        change: 'Expose allocation logic usable inside one caller-owned write transaction instead of forcing an independent database.write.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Ensure source allocation, lookup, conflict validation, and legacy_source_map insert commit atomically and converge under concurrent callers.'
+      - path: feedmine/RuntimeV2/V2Acquisition.swift
+        change: 'Replace terminal missing-mapping behavior with lazy ensureRuntimeSourceIdentity and typed refusal only when durable mapping cannot be established.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 --filter FeedStorageTests && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2 -only-testing:feedmineTests/LegacyIdentityMapperTests'
+      expect: 'Source allocation/mapping tests pass; no URL/digest/catalog-ID derivation appears in the runtime identity path.'
+    rollback: 'Revert ensure call sites and package API; existing legacy_source_map rows remain valid and legacy mode remains owner.'
+    stop_condition: 'automático: stop on duplicate runtime Source IDs, mapping re-point, or any cast from CatalogSourceID to FeedDomain.SourceID.'
+    human_decision: null
+
+  - id: PR-02-01
+    title: 'Backfill legacy FeedItem identity into Origin mappings without reconstruction heuristics.'
+    depends_on: [PR-01-01]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/LegacyItemMapper.swift
+        change: 'Treat historical FeedItem.id as opaque and emit mapped, low-confidence, or unresolved mappings without reconstructing GUIDs.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Run bounded resumable local backfill without enabling V2 UI or a second network owner.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Persist legacy_item_map idempotently without merging distinct legacy IDs.'
+    verify:
+      command: 'xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2 -only-testing:feedmineTests/LegacyIdentityMapperTests'
+      expect: 'Opaque historical IDs remain distinct; unresolved mappings remain explicit; replay produces no duplicate canonical identity.'
+    rollback: 'Disable the backfill caller and discard/rebuild runtime-only mappings; legacy FeedStore data is unchanged.'
+    stop_condition: 'automático: stop if any mapping requires reverse-engineering FeedItem.id or merging by title/date/URL similarity.'
+    human_decision: null
+
+  - id: PR-03-01
+    title: 'Bridge durable user state before changing any surface ownership.'
+    depends_on: [PR-02-01]
+    kind: code
+    targets:
+      - path: feedmine/Services/BookmarkStore.swift
+        change: 'Preserve bookmark authority and snapshots while exposing copy/bridge reads required by Runtime V2.'
+      - path: feedmine/Services/UserStateStore.swift
+        change: 'Preserve imported sources, collections, memberships, and source_identity keys during projection.'
+      - path: feedmine/Services/FeedStore.swift
+        change: 'Project existing read/click/consume facts without rekeying feed_item.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift
+        change: 'Use additive projection tables only; never mutate legacy primary keys.'
+    verify:
+      command: 'xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2 -only-testing:feedmineTests/RuntimeV2UserStateBridgeTests'
+      expect: 'Bookmark/read/imported-source state survives projection and a legacy rollback.'
+    rollback: 'Stop reading the runtime projection; legacy user.sqlite/feedmine.sqlite rows remain authoritative and intact.'
+    stop_condition: 'automático: any durable reference that cannot be represented is recorded unresolved and blocks later cutover.'
+    human_decision: null
+
+  - id: PR-04-01
+    title: 'Preserve raw syndication identity before FeedItem hashing discards it.'
+    depends_on: [PR-02-01]
+    kind: code
+    targets:
+      - path: feedmine/Services/RSSFetcher.swift
+        change: 'Pass raw RSS GUID/Atom id/link evidence to the Runtime V2 bridge before constructing the lossy legacy FeedItem.'
+      - path: feedmine/RuntimeV2/LegacyItemMapper.swift
+        change: 'Store opaque external identifiers byte-for-byte and use explicit versioned low-confidence fallback when absent.'
+      - path: feedmine/RuntimeV2/V2Acquisition.swift
+        change: 'Admit shared local acquisition evidence without starting a duplicate network tree.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 --filter FeedConnectorSyndicationTests && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Opaque GUID tests pass and Runtime V2 TestPlan shows no duplicate acquisition ownership.'
+    rollback: 'Remove the bridge handoff; legacy fetch behavior remains unchanged.'
+    stop_condition: 'automático: stop if GUIDs are URL-normalized or if the change introduces a second fetch for the same source.'
+    human_decision: null
+
+  - id: PR-05-01
+    title: 'Make migration completeness measurable and make unsafe cutover impossible.'
+    depends_on: [PR-03-01, PR-04-01]
+    kind: measurement
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Expose read-only counts for mapped, unresolved, conflicted, and durable-reference-at-risk bridge rows.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Compute a migration audit before any ownership transition and refuse readiness when durable-reference-at-risk is nonzero.'
+      - path: docs/runtime-v2/rollout.md
+        change: 'Record the exact audit fields and cutover gate without claiming the cutover is enabled.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 --filter FeedStorageTests && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Tests prove unresolved/conflicted durable references are observable and prevent readiness.'
+    rollback: 'Remove the readiness gate/reporting code; no legacy data changes need reversal.'
+    stop_condition: 'automático: durable-reference-at-risk > 0 or an unclassified mapping state blocks PR-06 and later.'
+    human_decision: null
+
+  - id: PR-06-01
+    title: 'Separate compatibility card identity from persisted PublicationCardID.'
+    depends_on: [PR-05-01]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/MainFeedCardBridge.swift
+        change: 'Stop presenting a deterministic hash alias as a runtime-published occurrence identity.'
+      - path: feedmine/RuntimeV2/MainFeedPresentationPipeline.swift
+        change: 'Keep legacy item identity explicit on compatibility rows and require real PublicationCardID for published rows.'
+    verify:
+      command: 'xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Runtime V2 plan passes and no compatibility-only card can enter an API requiring a published-card identity.'
+    rollback: 'Restore the compatibility bridge while keeping V2 publication ownership disabled.'
+    stop_condition: 'automático: stop if fixing identity requires another hash, ordinal, or FeedItem.id-to-PublicationCardID conversion.'
+    human_decision: null
+
+  - id: PR-07-01
+    title: 'Hand presentation, actions, restore, and exposure to real persisted publication rows.'
+    depends_on: [PR-06-01]
+    kind: code
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Publication/PublicationRepository.swift
+        change: 'Remain the only allocator of PublicationCardID and expose persisted cards to the session path.'
+      - path: feedmine/RuntimeV2/MainFeedRuntime.swift
+        change: 'Route runtime-owned sessions from publication rows rather than bridge aliases.'
+      - path: feedmine/RuntimeV2/MainFeedPresentationPipeline.swift
+        change: 'Materialize published rows with stable PublicationCardID and edition ordinals.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/PublicationRepositoryTests.swift
+        change: 'Add explicitUserPurgeRemovesPublicationAndAssets and tombstoneDoesNotDeletePublishedHistory when their owning implementation is present.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedRuntimeTests/FeedSessionTests.swift
+        change: 'Add supplyGenerationIncrementKeepsDraftValid and staleEditorialRevisionKeepsEditionDisplayableUntilExplicitRefresh.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/RetentionCoordinatorTests.swift
+        change: 'Add tombstonedOriginDoesNotDeleteExposureHistory.'
+    verify:
+      command: 'swift test --package-path Packages/FeedRuntimeV2 && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Package and app Runtime V2 suites pass with persisted card identity, edition continuity, and history invariants.'
+    rollback: 'Disable runtime-owned presentation and return the surface to compatibility/legacy ownership; preserve runtime DB for diagnosis.'
+    stop_condition: 'automático: stop on silent card-action no-op, exposure keyed by alias, or restore that swaps Edition without an explicit boundary.'
+    human_decision: null
+
+  - id: PR-08-01
+    title: 'Choose whether this release may switch the shipping default to Runtime V2.'
+    depends_on: [PR-07-01]
+    kind: measurement
+    targets:
+      - path: feedmine/RuntimeV2/RuntimeMode.swift
+        change: 'No edit until the human selects the rollout policy.'
+    verify:
+      command: 'PARADA: HUMANO — escolher prepare-only, audit-gated same-release, ou staged/feature-gated cutover'
+      expect: 'Explicit H2 decision.'
+    rollback: 'If undecided or rejected, keep stock launch legacy.'
+    stop_condition: 'humano: no cutover without explicit release ownership decision.'
+    human_decision: H2
+
+  - id: PR-08-02
+    title: 'Enable only the human-approved V2 rollout mode with a tested legacy fallback.'
+    depends_on: [PR-08-01]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/RuntimeMode.swift
+        change: 'Implement only the approved shipping-default/flag behavior.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Require migration audit readiness before composing the V2 owner.'
+      - path: feedmine/feedmineApp.swift
+        change: 'Select the approved mode without creating a second acquisition owner.'
+    verify:
+      command: 'bash scripts/validation/run_smoke.sh && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Smoke and Runtime V2 plans PASS; forced legacy mode still launches using preserved legacy state.'
+    rollback: 'Set stock/default launch back to legacy; do not delete either legacy database.'
+    stop_condition: 'automático: any migration-audit failure, duplicate acquisition owner, missing user state, or failed legacy fallback aborts rollout.'
+    human_decision: H2
+
+  - id: PR-09-01
+    title: 'Authorize the end of the legacy rollback window.'
+    depends_on: [PR-08-02]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/rollout.md
+        change: 'Record the human-approved rollback-window completion criterion before any compatibility removal.'
+    verify:
+      command: 'PARADA: HUMANO — confirmar que a janela de rollback terminou'
+      expect: 'Explicit H3 decision and its completion criterion.'
+    rollback: 'No removal occurs; compatibility paths remain.'
+    stop_condition: 'humano: if the agreed stability/release criterion has not been met, stop indefinitely.'
+    human_decision: H3
+
+  - id: PR-09-02
+    title: 'Freeze interaction-history retention before any cleanup can discard it.'
+    depends_on: [PR-09-01]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Record the human-selected retention rule for read/click/open/consume before legacy cleanup or GC changes.'
+    verify:
+      command: 'PARADA: HUMANO — escolher a política de retenção de interaction history'
+      expect: 'Explicit H4 decision.'
+    rollback: 'Leave all existing interaction state untouched.'
+    stop_condition: 'humano: without a decision, no GC/deletion of interaction facts is permitted.'
+    human_decision: H4
+
+  - id: PR-09-03
+    title: 'Remove legacy compatibility code only after rollback and retention gates are closed.'
+    depends_on: [PR-09-01, PR-09-02]
+    kind: code
+    targets:
+      - path: feedmine/Services/FeedStore.swift
+        change: 'Remove only legacy responsibilities whose Runtime V2 replacement has passed the migration and release gates; preserve any data still required by H4.'
+      - path: feedmine/Services/RSSFetcher.swift
+        change: 'Remove legacy acquisition ownership only after Runtime V2 is the sole proven owner.'
+      - path: feedmine/RuntimeV2/MainFeedCardBridge.swift
+        change: 'Remove compatibility-only identity paths after no shipping surface depends on them.'
+    verify:
+      command: 'bash scripts/validation/run_smoke.sh && swift test --package-path Packages/FeedRuntimeV2 && xcodebuild test -project feedmine.xcodeproj -scheme feedmine -destination "platform=iOS Simulator,name=iPhone 14 Plus" -testPlan FeedMine-RuntimeV2'
+      expect: 'Smoke, full package, and Runtime V2 tests PASS after compatibility removal.'
+    rollback: 'Revert the cleanup commit while retained legacy data still exists; if data deletion has already shipped, rollback requires a separately reviewed migration and this step must not proceed.'
+    stop_condition: 'automático: stop before deleting any table/data still needed for rollback, bookmarks, history, imported sources, or the chosen retention policy.'
+    human_decision: null
+
+human_decisions:
+  - id: H1
+    question: 'Com PR-00 verde, os sete ADRs podem ser congelados conjuntamente no Gate 0?'
+    options:
+      - 'APROVAR — congelar os sete como um conjunto e exigir amendment para mudança semântica.'
+      - 'REJEITAR — manter todos Proposed e registrar a decisão normativa ainda aberta.'
+    default_if_undecided: 'Manter todos Proposed; permitir apenas trabalho aditivo/reversível e nenhuma implementação pós-freeze dependente.'
+    blocks: [PR-01-01, PR-02-01, PR-03-01, PR-04-01, PR-05-01, PR-06-01, PR-07-01, PR-08-01, PR-08-02, PR-09-01, PR-09-02, PR-09-03]
+
+  - id: H2
+    question: 'Quando Runtime V2 pode virar o shipping default?'
+    options:
+      - 'PREPARE-ONLY — migrar e medir, mantendo legacy como default.'
+      - 'AUDIT-GATED — cortar no mesmo release somente com audit local verde.'
+      - 'STAGED — ativar em release/flag posterior com fallback legacy.'
+    default_if_undecided: 'PREPARE-ONLY; RuntimeMode continua resolvendo stock launch para legacy.'
+    blocks: [PR-08-02]
+
+  - id: H3
+    question: 'Quando termina a janela oficial de rollback legacy?'
+    options:
+      - 'Após uma release pública completa.'
+      - 'Após duas releases públicas.'
+      - 'Após critério quantitativo explícito de estabilidade/migração.'
+    default_if_undecided: 'A janela permanece aberta e nenhum legacy path/storage é removido.'
+    blocks: [PR-09-03]
+
+  - id: H4
+    question: 'Qual é a retenção de read/click/open/consume após content eviction?'
+    options:
+      - 'Expirar junto com o conteúdo.'
+      - 'Usar janela independente e limitada.'
+      - 'Reter indefinidamente.'
+    default_if_undecided: 'Preservar os fatos existentes e proibir GC que os descarte.'
+    blocks: [PR-09-03]
+
+  - id: H5
+    question: 'What''s New continua como surface Runtime V2?'
+    options:
+      - 'SIM — criar FeedPlan/surface próprio em trabalho posterior.'
+      - 'NÃO — retirar do roadmap Runtime V2.'
+    default_if_undecided: 'Não implementar nem remover contratos existentes; manter fora do critical path.'
+    blocks: []
+
+  - id: H6
+    question: 'O primeiro cutover V2 preserva o agrupamento temporal visível atual?'
+    options:
+      - 'SIM — preservar comportamento equivalente no primeiro cutover.'
+      - 'NÃO — usar feed contínuo.'
+      - 'ADIAR — definir nova política em outro gate de produto.'
+    default_if_undecided: 'Preservar o agrupamento atual; não combinar migração arquitetural com redesign de UX.'
+    blocks: []

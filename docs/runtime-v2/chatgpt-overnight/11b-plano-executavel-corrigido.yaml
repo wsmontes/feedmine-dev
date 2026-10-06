@@ -1,0 +1,385 @@
+version: 1
+generated_for: feedmine-runtime-v2-migration
+
+preconditions:
+  - id: P1
+    check: 'test -z "$(git status --porcelain=v1)" && echo CLEAN'
+    expect: 'CLEAN; otherwise preserve the existing worktree and do not start migration edits.'
+  - id: P2
+    check: 'test -f docs/runtime-v2/adrs/ADR-001.md && test -f docs/runtime-v2/adrs/ADR-007.md && test -f Packages/FeedRuntimeV2/Package.swift && echo OK'
+    expect: 'OK'
+  - id: P3
+    check: 'test -f scripts/validation/run_runtime_v2_tests.sh && test -f scripts/validation/run_smoke.sh && test -f scripts/verify-runtime-v2-boundaries.sh && echo OK'
+    expect: 'OK'
+  - id: P4
+    check: 'test -f TestPlans/FeedMine-RuntimeV2.xctestplan && test -f TestPlans/FeedMine-Smoke.xctestplan && echo OK'
+    expect: 'OK'
+  - id: P5
+    check: 'grep -q "CREATE TABLE legacy_source_map" Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift && grep -q "CREATE TABLE legacy_item_map" Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift && echo PRESENT'
+    expect: 'PRESENT; both legacy identity bridges already exist and must be evolved additively, not recreated destructively.'
+  - id: P6
+    check: 'grep -n "PublicationCardID(db.lastInsertedRowID)" Packages/FeedRuntimeV2/Sources/FeedStorage/Publication/PublicationRepository.swift && grep -n "cardID(forLegacyItemID" feedmine/RuntimeV2/MainFeedCardBridge.swift'
+    expect: 'PublicationCardID allocation resolves at PublicationRepository.swift:1042 within the :1009-1042 card insert path; compatibility cardID function resolves at MainFeedCardBridge.swift:234-245 with call at :188.'
+  - id: P7
+    check: 'sed -n "216,217p" feedmine/FeedEngine/SQLiteCatalogStore.swift'
+    expect: 'The catalog collision throw is present at SQLiteCatalogStore.swift:216-217.'
+
+steps:
+  - id: PR-00-01
+    title: 'Correct and freeze the documentary identity and migration contract before behavioral work.'
+    depends_on: []
+    kind: doc_edit
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-003.md
+        change: 'Insert the corrected normative migration appendix with M1-M8; do not claim an ADR §16 exists and keep status Proposed until human Gate 0 sign-off.'
+      - path: docs/runtime-v2/adrs/ADR-001.md
+        change: 'State that compatibility card identity is not PublicationCardID and use PublicationRepository.swift:1009-1042 as publication-card evidence.'
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Preserve the existing authority table: user.sqlite remains authority for durable user state; feedmine.sqlite remains legacy content/read-click state during coexistence.'
+      - path: docs/runtime-v2/adrs/ADR-005.md
+        change: 'Preserve D17 scope: legacy media probing is evidence of debt and must not be inherited by the Runtime V2 connector boundary.'
+      - path: docs/runtime-v2/adrs/ADR-007.md
+        change: 'Keep exposure identity scoped to persisted PublicationCardID and same-edition rematerialization semantics.'
+      - path: docs/runtime-v2/baseline.md
+        change: 'Correct stale paths, line references, and nominal test references without claiming unverified implementation.'
+      - path: docs/runtime-v2/rollout.md
+        change: 'Correct PublicationRepository references and other stale traceability while preserving landed-versus-proposed distinctions.'
+    verify:
+      command: 'scripts/verify-runtime-v2-boundaries.sh'
+      expect: 'PASS; documentation changes do not alter package dependency boundaries.'
+    rollback: 'Revert only the documentation diff.'
+    stop_condition: 'automático: stop if reconciliation would require changing an already-agreed architectural invariant rather than correcting wording or traceability.'
+    human_decision: null
+
+  - id: PR-00-02
+    title: 'Run the repository-owned Runtime V2 and smoke gates before Gate 0.'
+    depends_on: [PR-00-01]
+    kind: test
+    targets:
+      - path: scripts/validation/run_runtime_v2_tests.sh
+        change: 'No edit; execute the repository-owned Runtime V2 validation runner.'
+      - path: scripts/validation/run_smoke.sh
+        change: 'No edit; execute the repository-owned smoke gate.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh && scripts/validation/run_smoke.sh && scripts/validation/test_runtime_v2_boundaries.sh'
+      expect: 'Runtime V2 suite, smoke suite, and negative/positive boundary fixtures all pass.'
+    rollback: 'No product-state rollback is required; if verification fails, revert PR-00-01 and investigate before freeze.'
+    stop_condition: 'automático: any failing Runtime V2, smoke, or boundary test aborts Gate 0.'
+    human_decision: null
+
+  - id: PR-00-03
+    title: 'Obtain joint human Gate 0 approval for all seven ADRs.'
+    depends_on: [PR-00-02]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-001.md
+        change: 'Change status only if the seven-ADR set is approved jointly.'
+      - path: docs/runtime-v2/adrs/ADR-002.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-003.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-005.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-006.md
+        change: 'Same joint status transition.'
+      - path: docs/runtime-v2/adrs/ADR-007.md
+        change: 'Same joint status transition.'
+    verify:
+      command: 'PARADA: HUMANO — aprovar ou rejeitar o Gate 0 conjunto dos sete ADRs'
+      expect: 'Uma decisão única; nenhum freeze parcial.'
+    rollback: 'Se rejeitado, manter todos os ADRs Proposed e não iniciar os steps pós-freeze.'
+    stop_condition: 'humano: qualquer decisão normativa ainda aberta ou objeção de owner de boundary interrompe o freeze.'
+    human_decision: H1
+
+  - id: PR-01-01
+    title: 'Make Source allocation and legacy_source_map persistence one atomic ensure operation.'
+    depends_on: [PR-00-03]
+    kind: code
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/SourceRegistry.swift
+        change: 'Allow Source allocation/readback inside a caller-owned database write so it can share one transaction with the legacy mapping.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Add atomic ensure behavior that preserves an existing mapping, detects disagreement, and never re-points silently.'
+      - path: feedmine/RuntimeV2/V2Acquisition.swift
+        change: 'Resolve missing source mappings through ensure/allocation and refuse only when a durable unambiguous mapping cannot be established.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Runtime V2 tests pass with no derived/cast runtime Source identity and with durable mapping behavior intact.'
+    rollback: 'Revert ensure call sites and transaction API; retain any valid additive legacy_source_map rows already created.'
+    stop_condition: 'automático: stop on duplicate runtime Source IDs, mapping re-point, catalog-ID widening into FeedDomain.SourceID, or URL/digest-derived runtime identity.'
+    human_decision: null
+
+  - id: PR-01-02
+    title: 'Prove the Source bridge migration is additive and idempotent.'
+    depends_on: [PR-01-01]
+    kind: test
+    targets:
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/MigrationTests.swift
+        change: 'Add an idempotence test that migrates/reopens the same database with an existing legacy_source_map row and proves the row and runtime_source_id remain unchanged.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'The Runtime V2 suite proves repeated migration/open does not duplicate, rewrite, or discard legacy_source_map state.'
+    rollback: 'Revert the new test only; do not rewrite an already-applied migration.'
+    stop_condition: 'automático: stop if the implementation requires DROP TABLE, destructive rebuild, primary-key rewrite, or modification of feed_item.id.'
+    human_decision: null
+
+  - id: PR-02-01
+    title: 'Backfill legacy item identity into additive legacy_item_map rows without changing feed_item.id.'
+    depends_on: [PR-01-02]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/LegacyItemMapper.swift
+        change: 'Treat historical FeedItem.id as opaque and map to Origin identity only when evidence exists; otherwise preserve an explicit unresolved/low-confidence result.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Persist legacy_item_map additively without merging two distinct legacy_item_id values.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Run bounded/resumable local backfill only; do not enable V2 UI ownership or additional network acquisition.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Runtime V2 validation passes; legacy item IDs remain opaque and unchanged and unresolved identities remain explicit.'
+    rollback: 'Disable the backfill caller; runtime-only mappings may remain for diagnosis while legacy feed_item rows stay authoritative and unchanged.'
+    stop_condition: 'automático: stop if any path writes a new value into feed_item.id, derives a historical GUID from its hash, or merges identities by title/date/URL similarity.'
+    human_decision: null
+
+  - id: PR-03-01
+    title: 'Additively project durable user state without rekeying, moving, or deleting user data.'
+    depends_on: [PR-02-01]
+    kind: code
+    targets:
+      - path: feedmine/Services/BookmarkStore.swift
+        change: 'Read and bridge bookmark keys/snapshots while leaving user.sqlite rows and keys untouched.'
+      - path: feedmine/Services/UserStateStore.swift
+        change: 'Project imported sources, disabled-source state, collections, Smart Feeds, persisted searches, and aliases without changing legacy keys.'
+      - path: feedmine/Services/FeedStore.swift
+        change: 'Read/project legacy read/click/consume facts without rewriting feed_item.id or deleting feed_item rows.'
+      - path: feedmine/Services/AppSettings.swift
+        change: 'Use the existing persisted filter types at AppSettings.swift:65-92; do not change their stored representation in this migration.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Migrations/RuntimeMigrations.swift
+        change: 'Append only projection/migration structures that are absent and required; never rewrite an applied migration or legacy database schema.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh && scripts/validation/run_smoke.sh'
+      expect: 'Runtime V2 and smoke gates pass while legacy authority remains readable and unchanged.'
+    rollback: 'Stop consuming the Runtime V2 projections; all authoritative legacy rows remain in place, so no reverse migration is required.'
+    stop_condition: 'automático: stop if implementation requires rekey, MOVE, DELETE, DROP, or overwrite of user.sqlite durable rows or feed_item.id.'
+    human_decision: null
+
+  - id: PR-04-01
+    title: 'Capture raw RSS and Atom identity before legacy FeedItem reduction.'
+    depends_on: [PR-02-01]
+    kind: code
+    targets:
+      - path: feedmine/Services/RSSFetcher.swift
+        change: 'Forward raw GUID/Atom-id/link evidence to the V2 bridge before FeedItem construction without changing legacy FeedItem identity generation.'
+      - path: feedmine/RuntimeV2/LegacyItemMapper.swift
+        change: 'Keep external identifiers opaque and use explicit versioned low-confidence fallback only when strong identity is absent.'
+      - path: feedmine/RuntimeV2/V2Acquisition.swift
+        change: 'Consume shared local evidence without creating a second network owner.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh && scripts/validation/run_smoke.sh'
+      expect: 'Validation remains green and legacy acquisition behavior is unchanged while Runtime V2 receives raw identity evidence.'
+    rollback: 'Remove the V2 evidence handoff; retain the unchanged legacy fetch path.'
+    stop_condition: 'automático: stop if GUID/Atom identity is passed through source URL normalization, if OPML identity rules are applied to external keys, or if a duplicate fetch tree appears.'
+    human_decision: null
+
+  - id: PR-05-01
+    title: 'Measure migration completeness and refuse readiness when durable references are at risk.'
+    depends_on: [PR-03-01, PR-04-01]
+    kind: measurement
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Identity/LegacyMappingStore.swift
+        change: 'Expose additive/read-only counts for mapped, allocatable, unresolved, conflicted, and durable-reference-at-risk bridge states.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Compute a migration-readiness result without changing shipping mode.'
+      - path: docs/runtime-v2/rollout.md
+        change: 'Document the measured readiness fields and explicitly keep legacy authority until cutover.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Tests show unsafe or unresolved durable state prevents readiness while no legacy record is modified.'
+    rollback: 'Remove readiness/reporting code; mappings and legacy data remain untouched.'
+    stop_condition: 'automático: durable-reference-at-risk > 0, unclassified durable state, or a measurement that requires mutating legacy authority.'
+    human_decision: null
+
+  - id: PR-06-01
+    title: 'Separate compatibility card IDs from persisted publication identity.'
+    depends_on: [PR-05-01]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/MainFeedCardBridge.swift
+        change: 'Treat cardID(forLegacyItemID:) at MainFeedCardBridge.swift:234-245, called at :188, only as compatibility identity and never as persisted publication identity.'
+      - path: feedmine/RuntimeV2/MainFeedPresentationPipeline.swift
+        change: 'Require published rows to carry their real persisted PublicationCardID while compatibility rows remain explicitly legacy-identified.'
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Publication/PublicationRepository.swift
+        change: 'Preserve publication ownership: published_card INSERT is at :1009-1041 and PublicationCardID is allocated from db.lastInsertedRowID at :1042.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Runtime V2 tests pass without converting FeedItem.id or compatibility hashes into PublicationCardID.'
+    rollback: 'Restore the compatibility presentation path while keeping V2 publication ownership disabled.'
+    stop_condition: 'automático: stop if any fix relies on another hash, array ordinal, FeedItem.id cast, or synthetic PublicationCardID.'
+    human_decision: null
+
+  - id: PR-07-01
+    title: 'Complete publication-to-presentation handoff using persisted PublicationCardID.'
+    depends_on: [PR-06-01]
+    kind: code
+    targets:
+      - path: Packages/FeedRuntimeV2/Sources/FeedStorage/Publication/PublicationRepository.swift
+        change: 'Remain the sole persistence allocator for published-card occurrence IDs.'
+      - path: feedmine/RuntimeV2/MainFeedRuntime.swift
+        change: 'Route V2-owned sessions from persisted publication records.'
+      - path: feedmine/RuntimeV2/MainFeedPresentationPipeline.swift
+        change: 'Materialize published cards using persisted identity and edition ordinal; actions/exposure must not use compatibility aliases.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Runtime V2 validation proves persisted publication identity survives the publication/session boundary.'
+    rollback: 'Return presentation ownership to compatibility/legacy mode while preserving runtime database rows for diagnosis.'
+    stop_condition: 'automático: stop on silent action no-op, exposure/history keyed by compatibility alias, or publication identity synthesized outside PublicationRepository.'
+    human_decision: null
+
+  - id: PR-07-02
+    title: 'Close the remaining high-value acceptance-test gaps before release cutover.'
+    depends_on: [PR-07-01]
+    kind: test
+    targets:
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/PublicationRepositoryTests.swift
+        change: 'Add missing publication/tombstone/purge coverage where the owning behavior exists.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/MigrationTests.swift
+        change: 'Add or map WAL-aware backup and unknown-future-schema coverage to real current XCTest names.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedRuntimeTests/FeedSessionTests.swift
+        change: 'Add missing draft-validity and stale-edition-displayability proofs where not already semantically covered.'
+      - path: Packages/FeedRuntimeV2/Tests/FeedStorageTests/RetentionCoordinatorTests.swift
+        change: 'Add tombstoned-origin history preservation coverage where not already semantically covered.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh'
+      expect: 'Runtime V2 runner passes with the required behaviors mapped to real tests rather than stale nominal identifiers.'
+    rollback: 'Revert new/renamed tests only; do not change production behavior merely to preserve obsolete test names.'
+    stop_condition: 'automático: stop if an apparently missing test is discovered to be semantically covered elsewhere; update ADR traceability instead of duplicating the test.'
+    human_decision: null
+
+  - id: PR-08-01
+    title: 'Choose whether Runtime V2 may become the shipping default.'
+    depends_on: [PR-07-02]
+    kind: measurement
+    targets:
+      - path: feedmine/RuntimeV2/RuntimeMode.swift
+        change: 'Do not edit shipping-default behavior until the rollout decision is explicit.'
+    verify:
+      command: 'PARADA: HUMANO — escolher prepare-only, cutover audit-gated ou rollout staged'
+      expect: 'Explicit H2 decision.'
+    rollback: 'If undecided or rejected, stock launch remains legacy.'
+    stop_condition: 'humano: no default-mode change without explicit approval.'
+    human_decision: H2
+
+  - id: PR-08-02
+    title: 'Apply only the approved V2 rollout mode while preserving legacy authority and rollback.'
+    depends_on: [PR-08-01]
+    kind: code
+    targets:
+      - path: feedmine/RuntimeV2/RuntimeMode.swift
+        change: 'Implement only the H2-approved default/flag behavior.'
+      - path: feedmine/RuntimeV2/RuntimeCompositionRoot.swift
+        change: 'Require migration readiness before V2 ownership can compose.'
+      - path: feedmine/feedmineApp.swift
+        change: 'Select the approved runtime owner without creating concurrent legacy and V2 acquisition owners.'
+    verify:
+      command: 'scripts/validation/run_runtime_v2_tests.sh && scripts/validation/run_smoke.sh'
+      expect: 'Runtime V2 and smoke runners pass; legacy fallback remains functional and no durable legacy authority is removed.'
+    rollback: 'Restore stock launch to legacy; retain all user and legacy content data.'
+    stop_condition: 'automático: any migration-readiness failure, duplicate acquisition owner, missing durable state, or failed legacy fallback aborts the rollout.'
+    human_decision: H2
+
+  - id: PR-09-01
+    title: 'Decide when the legacy rollback window may end.'
+    depends_on: [PR-08-02]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/rollout.md
+        change: 'Record the approved rollback-window completion rule; do not remove any data or reader here.'
+    verify:
+      command: 'PARADA: HUMANO — confirmar o critério de encerramento da compatibility/rollback window'
+      expect: 'Explicit H3 decision.'
+    rollback: 'Keep the compatibility window open.'
+    stop_condition: 'humano: without explicit completion, all legacy authorities and required readers remain.'
+    human_decision: H3
+
+  - id: PR-09-02
+    title: 'Decide retention of durable interaction history before any cleanup policy changes.'
+    depends_on: [PR-08-02]
+    kind: measurement
+    targets:
+      - path: docs/runtime-v2/adrs/ADR-004.md
+        change: 'Record the approved retention policy for read/click/open/consume without deleting existing facts.'
+    verify:
+      command: 'PARADA: HUMANO — escolher a política de retenção de interaction history'
+      expect: 'Explicit H4 decision.'
+    rollback: 'Leave all existing facts and retention behavior unchanged.'
+    stop_condition: 'humano: without a decision, no cleanup may discard these durable facts.'
+    human_decision: H4
+
+  - id: PR-09-03
+    title: 'Validate release readiness without deleting or rekeying legacy user data.'
+    depends_on: [PR-09-01, PR-09-02]
+    kind: test
+    targets:
+      - path: scripts/release-acceptance.sh
+        change: 'No edit required unless the existing release gate lacks Runtime V2 coverage; this step performs validation only.'
+      - path: TestPlans/FeedMine-ReleaseValidation.xctestplan
+        change: 'Use the existing release-validation plan; no legacy-data removal is part of this step.'
+    verify:
+      command: 'scripts/release-acceptance.sh'
+      expect: 'Repository release-acceptance gate passes with the approved V2 mode and preserved legacy authority.'
+    rollback: 'No data rollback is required because this step performs no deletion, move, or rekey.'
+    stop_condition: 'automático: any release-acceptance failure, user-state mismatch, migration-risk signal, or dependency on deleting legacy data stops the release.'
+    human_decision: null
+
+human_decisions:
+  - id: H1
+    question: 'Com documentação corrigida e gates verdes, os sete ADRs podem ser congelados conjuntamente?'
+    options:
+      - 'APROVAR — congelar os sete como conjunto; mudanças semânticas posteriores exigem amendment.'
+      - 'REJEITAR — manter todos Proposed e registrar a decisão normativa ainda aberta.'
+    default_if_undecided: 'Manter todos Proposed e executar apenas trabalho aditivo/reversível que não dependa de freeze.'
+    blocks:
+      - PR-01-01
+      - PR-01-02
+      - PR-02-01
+      - PR-03-01
+      - PR-04-01
+      - PR-05-01
+      - PR-06-01
+      - PR-07-01
+      - PR-07-02
+      - PR-08-01
+      - PR-08-02
+      - PR-09-01
+      - PR-09-02
+      - PR-09-03
+
+  - id: H2
+    question: 'Quando Runtime V2 pode virar o shipping default?'
+    options:
+      - 'PREPARE-ONLY — migrar e medir mantendo legacy como default.'
+      - 'AUDIT-GATED — cutover no mesmo release apenas quando o migration audit estiver verde.'
+      - 'STAGED — ativação posterior/feature-gated com fallback legacy.'
+    default_if_undecided: 'PREPARE-ONLY; manter shipping default legacy.'
+    blocks:
+      - PR-08-02
+
+  - id: H3
+    question: 'Quando termina a compatibility/rollback window legacy?'
+    options:
+      - 'Após uma release pública completa.'
+      - 'Após duas releases públicas.'
+      - 'Após critério quantitativo explícito de estabilidade e migration coverage.'
+    default_if_undecided: 'Manter a janela aberta; não remover dados, mappings ou readers legacy.'
+    blocks: []
+
+  - id: H4
+    question: 'Qual política governa read/click/open/consume após content eviction?'
+    options:
+      - 'Expirar junto com o conteúdo.'
+      - 'Usar janela independente e limitada.'
+      - 'Reter indefinidamente.'
+    default_if_undecided: 'Preservar os fatos existentes e proibir cleanup que os descarte.'
+    blocks: []

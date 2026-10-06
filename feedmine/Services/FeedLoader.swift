@@ -668,14 +668,21 @@ final class FeedLoader {
     /// Non-nil if the default FeedStore failed to initialize.
     private(set) var initError: Error?
 
+    /// True when the SQLite store could not be opened and this loader is running on the
+    /// in-memory fallback. The fallback keeps the object constructible, not usable: the UI
+    /// must fail closed, because anything written there is discarded at exit and the
+    /// reader's saved state only *looks* missing.
+    var persistenceUnavailable: Bool { initError != nil }
+
     /// Creates a FeedLoader. Pass a custom FeedStore for testing; uses SQLite-backed
     /// store by default. If store creation fails, captures the error for UI display.
-    init(store: FeedStore? = nil) {
+    /// `storeFactory` is the seam that lets a test make the default construction throw.
+    init(store: FeedStore? = nil, storeFactory: () throws -> FeedStore = { try FeedStore() }) {
         if let store {
             self.store = store
         } else {
             do {
-                self.store = try FeedStore()
+                self.store = try storeFactory()
             } catch {
                 self.initError = error
                 Log.db.error("FeedStore init failed: \(error.localizedDescription). Using in-memory fallback.")
@@ -690,6 +697,12 @@ final class FeedLoader {
     // MARK: - Actions (delegate to store)
 
     func start() async {
+        // Fail closed. With the fallback store there is nothing real to start, and starting
+        // the pipeline would publish an empty feed on top of data that still exists on disk.
+        guard !persistenceUnavailable else {
+            Log.db.error("FeedLoader.start() refused: persistence unavailable")
+            return
+        }
         await store.start()
         if restoreImportedSources() {
             await TaxonomyStore.shared.build(

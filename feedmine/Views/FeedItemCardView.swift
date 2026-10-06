@@ -513,7 +513,13 @@ struct FeedItemCardView: View, Equatable {
             Label(String(localized: "Share as Image"), systemImage: "photo.artframe")
         }
         Button {
-            if let url = URL(string: item.url) { UIApplication.shared.open(url) }
+            // The link is third-party data: only http(s) may leave the app, so a
+            // crafted feed cannot route the reader into another app's scheme.
+            if let url = URL(string: item.url),
+               let scheme = url.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                UIApplication.shared.open(url)
+            }
         } label: {
             Label(String(localized: "Open in Safari"), systemImage: "safari")
         }

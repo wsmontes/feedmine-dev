@@ -284,10 +284,17 @@ final class FeedDisplayState {
                 mergedCards.append(card)
                 mergedItems.append(item)
             }
-            visibleCards = mergedCards
-            visibleItems = mergedItems
-            visibleItemsGeneration &+= 1
-            visibleCardsGeneration &+= 1
+            // A merge that changes nothing must not churn the visible page. Assigning and bumping
+            // both generations re-renders every card, and a re-render landing between a test's
+            // stability check and its tap is what loses the tap — recorded as
+            // `miss_cause=feed_unchanged_verified` in the release journey. The settle and the
+            // page-cache write below still run either way.
+            if mergedCards != visibleCards || mergedItems != visibleItems {
+                visibleCards = mergedCards
+                visibleItems = mergedItems
+                visibleItemsGeneration &+= 1
+                visibleCardsGeneration &+= 1
+            }
             for card in mergedCards where mediaCacheKeys[card.id] != nil {
                 visibleCardCacheKeys[card.id] = mediaCacheKeys[card.id]
             }

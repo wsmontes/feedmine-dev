@@ -308,7 +308,12 @@ final class AdaptiveScheduler {
         case .notModified:
             consecutiveFailures[sourceURL] = 0
             estimators[sourceURL, default: CadenceEstimator()].recordNoChange()
-        case .failed:
+        case .failed(let error):
+            // A cancelled request is not the source's fault: the app was backgrounded, or the filter
+            // generation moved and abandoned the fetch. Counting it would push a healthy source into
+            // the adaptive backoff (up to 24 h) for a request this app itself gave up on — the same
+            // reasoning that keeps `.legacyProducerClosed` out of the failure counter below.
+            if error is CancellationError { break }
             consecutiveFailures[sourceURL, default: 0] += 1
         case .throttled(let until):
             validators[sourceURL, default: HTTPValidators()].retryAfter = until

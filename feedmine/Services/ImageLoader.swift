@@ -53,7 +53,23 @@ enum ImageLoader {
             for candidate in ImageURLCandidates.candidates(for: url) {
                 for attempt in 0..<2 {
                     do {
-                        let (data, response) = try await session.data(from: candidate)
+                        // The URL comes from feed metadata: stream the body and cut it at a ceiling
+                        // instead of buffering an unbounded response. Same shape as URLResolver's
+                        // boundedDownload — Content-Length checked first, then chunk iteration.
+                        var request = URLRequest(url: candidate)
+                        request.timeoutInterval = 10
+                        let (asyncBytes, response) = try await session.bytes(for: request)
+                        if let http = response as? HTTPURLResponse,
+                           let declared = Int(http.value(forHTTPHeaderField: "Content-Length") ?? ""),
+                           declared > Self.maxImageBytes {
+                            break
+                        }
+                        var data = Data()
+                        data.reserveCapacity(256_000)
+                        for try await chunk in asyncBytes {
+                            data.append(chunk)
+                            if data.count >= Self.maxImageBytes { break }
+                        }
                         if let http = response as? HTTPURLResponse,
                            !(200...299).contains(http.statusCode) { break }
                         guard isValidImageData(data) else { break }
@@ -82,6 +98,11 @@ enum ImageLoader {
     }
 
     // MARK: - Private
+
+    /// Ceiling for a feed-supplied image body. Generous for real artwork (which is
+    /// downsampled right after) and bounded, so a hostile or broken feed cannot make the
+    /// app buffer an arbitrarily large response.
+    private static let maxImageBytes = 12_000_000
 
     private static let session: URLSession = {
         let config = URLSessionConfiguration.default

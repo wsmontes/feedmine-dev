@@ -129,7 +129,17 @@ struct FeedScreen: View {
                 .ignoresSafeArea()
                 .animation(reduceMotion ? nil : .easeInOut(duration: 2.0), value: engine.period)
 
-            if isSearching && hasCommittedSearch {
+            if loader.persistenceUnavailable {
+                // The store could not be opened: say so once, and do not draw a feed that
+                // would look like the reader's data is gone. Nothing is actionable here
+                // except relaunching, so no controls are offered.
+                ContentUnavailableView(
+                    "Your feed data couldn’t be opened",
+                    systemImage: "externaldrive.badge.exclamationmark",
+                    description: Text("Feedmine couldn’t open its local database. Your saved data has not been deleted. Close and reopen the app. Changes are disabled until the database opens normally.")
+                )
+                .accessibilityIdentifier("persistent-store-unavailable")
+            } else if isSearching && hasCommittedSearch {
                 unifiedSearchPanel
             } else if let session = runtime.sessionSurface {
                 sessionFeedContent(session)

@@ -224,7 +224,9 @@ struct FeedItem: Identifiable, Sendable, Codable, Equatable {
     /// Formatted duration string, e.g. "34 min".
     /// Returns nil for sub-minute durations (avoiding "0 min" labels).
     var durationFormatted: String? {
-        guard let d = duration, d >= 60 else { return nil }
+        // `d >= 60` is false for NaN but TRUE for +inf, and Int(_:) traps on infinity —
+        // episode durations arrive from feed metadata, so check finiteness explicitly.
+        guard let d = duration, d.isFinite, d >= 60 else { return nil }
         let mins = Int(d / 60)
         if mins < 60 { return "\(mins) min" }
         let hrs = mins / 60

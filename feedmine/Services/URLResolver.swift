@@ -7,6 +7,7 @@ private enum DownloadLimit {
     static let feedDiscoveryHTML = 256_000  // HTML page for feed discovery
     static let feedProbe = 64_000           // RSS/Atom/JSON feed validation
     static let opmlImport = 10_000_000      // remote OPML import
+    static let lookupJSON = 1_000_000       // iTunes lookup response — JSON, tiny
 }
 
 /// Download with a byte ceiling. Streams the response body and aborts
@@ -498,7 +499,9 @@ actor URLResolver {
 
         // iTunes Lookup API
         guard let lookupURL = URL(string: "https://itunes.apple.com/lookup?id=\(podcastID)&entity=podcast"),
-              let (data, _) = try? await session.data(from: lookupURL),
+              let (data, _) = try? await boundedDownload(
+                  from: lookupURL, maxBytes: DownloadLimit.lookupJSON, session: session
+              ),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let results = json["results"] as? [[String: Any]],
               let first = results.first,

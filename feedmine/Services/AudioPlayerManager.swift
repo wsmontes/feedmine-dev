@@ -361,7 +361,11 @@ final class AudioPlayerManager {
                       self.playbackGeneration == generation,
                       self.currentItem?.id == item.id,
                       self.completedItemID != item.id else { return }
-                self.currentTime = time.seconds
+                // AVPlayerItem.time is indefinite (NaN) before the item is ready and
+                // around seeks; storing it would reach Int(_:) in formatTime and trap.
+                if time.seconds.isFinite {
+                    self.currentTime = time.seconds
+                }
                 if self.duration == 0,
                    let dur = self.player?.currentItem?.duration.seconds,
                    dur.isFinite {
@@ -463,6 +467,9 @@ final class AudioPlayerManager {
     var durationFormatted: String { formatTime(duration) }
 
     private func formatTime(_ t: TimeInterval) -> String {
+        // Int(_:) traps on NaN/inf, and both duration and position come from
+        // player metadata (AVPlayerItem, feed-supplied episode duration).
+        guard t.isFinite else { return "0:00" }
         let mins = Int(t) / 60
         let secs = Int(t) % 60
         return String(format: "%d:%02d", mins, secs)

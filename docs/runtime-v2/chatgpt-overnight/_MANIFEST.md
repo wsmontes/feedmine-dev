@@ -1,0 +1,54 @@
+# Manifesto — 2026-10-06 (pacote ChatGPT ⇄ Feedmine)
+
+| arquivo | bytes | sha256 (12) |
+|---|---|---|
+| `00-LEIA-PRIMEIRO.md` | 29179 | 3227e5cea31b |
+| `01-plano-de-migracao.md` | 20445 | b3a514acd237 |
+| `02-identidade-source-runtime.md` | 13472 | 805b8093c448 |
+| `03-fronteira-card-identity.md` | 12322 | d5d16bed86f3 |
+| `04-revisao-adversarial-adrs.md` | 13524 | 4caddc38c3be |
+| `05-checklist-gate0.md` | 14439 | 841b6a3cc890 |
+| `06-registro-backlog.md` | 17139 | 1d631ff095a9 |
+| `07-anexo-section16.md` | 16763 | 2a66419a8148 |
+| `07b-anexo-corrigido.md` | 17503 | 0505084af6e3 |
+| `08-falsificacao-defeitos.md` | 5743 | 8035206ae991 |
+| `09-handoff-kit.md` | 12116 | 89a9ff128845 |
+| `10-lacuna-de-testes.md` | 11431 | 4c9115ec8b5c |
+| `11-plano-executavel.yaml` | 25579 | 395de003025c |
+| `11b-plano-executavel-corrigido.yaml` | 23590 | af30affe08f7 |
+| `12-errata.md` | 17099 | 8734d6587828 |
+| `15-pr00-migracao-aditiva.md` | 9235 | b7182c7e6524 |
+| `16-substituicoes.md` | 2845 | 2cc536504230 |
+| `17-mapa-plano-vs-adr003.md` | 6584 | cefef6154b5f |
+| `18-emenda-adr003.md` | 10309 | cbb2bece30f5 |
+| `19-testes-pr00-corrigidos.md` | 4825 | 4da8fd94054f |
+| `20-rastreabilidade-d20-d23.md` | 4499 | e69f4e0239e8 |
+| `21-edicoes-no-adr003.md` | 5918 | 3437ce055fbc |
+| `22-d21-final.md` | 2066 | bf1f5b8f6575 |
+| `23-correcoes-de-composicao.md` | 5758 | d96085b52202 |
+| `24-tarefa-do-chat.md` | 8349 | 14a3451fbf3b |
+| `25-roteiro-publicacao.md` | 8595 | 00099a702b19 |
+| `31-pacote-appstore.md` | 7605 | d83250af90c5 |
+| `32-pacote-parte1.md` | 3059 | 6b1f47ed297f |
+| `33-pacote-parte2.md` | 2346 | 0b8e4f7d3273 |
+| `34-pacote-parte3.md` | 1905 | dfc2dab184ae |
+| `35-privacy-policy-draft.md` | 2995 | 307ac65e93db |
+| `36-patch-privacy-row.md` | 2902 | 0e150abab01c |
+| `37-jornada-diagnostico.md` | 1770 | 4e56a132a127 |
+| `38-rc18-bump.md` | 3051 | c00e6c0b3977 |
+| `39-bump-parte2-worker.md` | 2557 | 5bf0fe061fa8 |
+| `40-p01-design.md` | 2318 | 89732bcd4687 |
+| `41-c06-design.md` | 2389 | fde8004614df |
+| `42-tap-sob-carga.md` | 2014 | 5252adf06cf4 |
+| `_MANIFEST.md` | 2079 | b8169aada2dc |
+| `_apply/README.md` | 3717 | 1eca2b62c149 |
+| `_apply/apply-adr003.sh` | 8131 | 296d21ef279c |
+| `_apply/substitutions.tsv` | 1796 | 9b50825e5e34 |
+| `_apply/traceability-rows.md` | 562 | 6ffc5f30b037 |
+| `_index.md` | 6850 | 7ebce64eda51 |
+| `_review/00-INDICE.md` | 2830 | e87b9ca74488 |
+| `_review/cr-concurrency.md` | 41753 | b3857ed9a003 |
+| `_review/cr-crash.md` | 19211 | f872c2b324b1 |
+| `_review/cr-persistence.md` | 10894 | dcec93e9fdc1 |
+| `_review/cr-security.md` | 14894 | 501cd0e441a4 |
+| `_review/defeitos.md` | 30848 | fee4689574d5 |

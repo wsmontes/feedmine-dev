@@ -915,9 +915,12 @@ struct CachedAsyncImage: View {
             // The in-flight download didn't complete in time — fall through
             // and start our own.
         }
-        // Register this download so other cards and the prefetcher skip it.
-        await ImageCache.registerDownload(for: cacheURL)
-        defer { Task { await ImageCache.unregisterDownload(for: cacheURL) } }
+        // Register this download so other cards and the prefetcher skip it. Only the
+        // caller that actually registered it may unregister: `registerDownload` returns
+        // false when another download already holds the URL, and unregistering that one
+        // would let a third caller start a duplicate it was meant to avoid.
+        let ownsDownload = await ImageCache.registerDownload(for: cacheURL)
+        defer { if ownsDownload { Task { await ImageCache.unregisterDownload(for: cacheURL) } } }
         // Tier 3: network. YouTube's sddefault thumbnail is absent for some
         // videos, so hqdefault is tried before the card is marked failed.
         if let url {

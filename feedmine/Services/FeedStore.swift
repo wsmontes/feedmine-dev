@@ -1179,15 +1179,22 @@ final class FeedStore {
                 }
             }
         }
-        // Create default "Favorites" list if not exists
-        try? db.write { db in
-            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM bookmark_list WHERE is_default = 1") ?? 0
-            if count == 0 {
-                try db.execute(sql: """
-                    INSERT INTO bookmark_list (name, sort_order, created_at, is_default)
-                    VALUES ('Favorites', 0, \(Int(Date().timeIntervalSince1970)), 1)
-                """)
+        // Create default "Favorites" list if not exists. Not `try?`: a swallowed write
+        // failure here leaves later code assuming a list that was never created, and
+        // the failure disappears from diagnostics. The block above already logs its own
+        // migration failure for the same reason.
+        do {
+            try db.write { db in
+                let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM bookmark_list WHERE is_default = 1") ?? 0
+                if count == 0 {
+                    try db.execute(sql: """
+                        INSERT INTO bookmark_list (name, sort_order, created_at, is_default)
+                        VALUES ('Favorites', 0, \(Int(Date().timeIntervalSince1970)), 1)
+                    """)
+                }
             }
+        } catch {
+            Log.db.error("default bookmark list creation failed: \(error)")
         }
         // Source health/validators are loaded in start() (deferred off the
         // init path — the synchronous GRDB read can stall first paint).
@@ -1772,9 +1779,18 @@ final class FeedStore {
 
     private func startFirstLaunchBootstrapIfNeeded() -> Task<Void, Never>? {
         guard !Settings.hasInitializedLanguageDefault else { return nil }
-        let storedItemCount = (try? db.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM feed_item") ?? 0
-        }) ?? 0
+        let storedItemCount: Int
+        do {
+            storedItemCount = try db.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM feed_item") ?? 0
+            }
+        } catch {
+            // A failed count is not an empty database. Treating it as one would
+            // rewrite the reader's language and filter preferences on an install
+            // that already has content.
+            Log.db.error("first-launch bootstrap refused: item count unreadable: \(error)")
+            return nil
+        }
         guard storedItemCount == 0 else { return nil }
 
         let language = Self.normalizedLanguageCode(
@@ -4785,7 +4801,17 @@ final class FeedStore {
                 // Phase 2: UPDATE items whose Atom entries were refreshed
                 for item in updateEnriched {
                     do {
-                        let record = FeedItemRecord(from: item, region: item.region, language: item.language)
+                        var record = FeedItemRecord(from: item, region: item.region, language: item.language)
+                        // The initializer above starts from a fresh FeedItem, and
+                        // GRDB's update writes every column — so an Atom entry refresh
+                        // would un-read the item and drop its click/consume stamps.
+                        // Carry the stored reader state across the refresh.
+                        if let stored = try FeedItemRecord.fetchOne(db, key: item.id) {
+                            record.isRead = stored.isRead
+                            record.openedAt = stored.openedAt
+                            record.clickedAt = stored.clickedAt
+                            record.consumedAt = stored.consumedAt
+                        }
                         try record.update(db)
                         ok.append(item)
                     } catch {
