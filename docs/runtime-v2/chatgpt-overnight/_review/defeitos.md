@@ -233,6 +233,36 @@ Barra: **`BAR OK 11:34:37`** — gates 611 (610 + este teste) ×3 verdes e **jor
 
 **Ambiguidade registrada, não escondida:** a primeira barra com este conserto (10:56) deu **jornada 15/17** (`03-article-reader`, `04-article-scrolled` ausentes) — o mesmo par que o CR-08 e o CR-03 provocaram; a segunda, na **mesma árvore** (11:22), deu **17/17**. Quebra determinística não passa na segunda execução, então leio a primeira como a flake documentada do tap. Mas o C-06 muda o **escalonamento** do pipeline de imagem (quem foi cancelado deixa de segurar o slot e segue), e perturbação ali é exatamente o que o registro já mediu como sensível. **Se uma barra futura falhar no passo do reader, o C-06 é o primeiro suspeito** — desfazer é um revert de dois arquivos, e o teste que fica documenta o comportamento esperado.
 
+#### O worker confirmou o suspeito, e a sonda mediu (2026-10-06, 14:00)
+
+Mandei a revisão do C-06 para o worker **na conversa do projeto Feedmine** (mensagem enviada 13:46 pela janela do Chrome, respondida em 3m27s). Veredito, em três partes:
+
+1. **O desenho é seguro**, com uma ressalva pequena: `SharedWait` com `NSLock`, `result` como árbitro único, continuation zerada antes do `resume`, e o monitor limpando `inFlight` só se o `flightID` ainda corresponde ⇒ **nenhum risco estrutural de double-resume, deadlock ou continuation vazada**. As duas corridas de cancelamento (antes e depois de instalar a continuation) ficam corretas.
+2. A resolução compartilhada continua disponível aos demais e/ou à próxima composição — o `onCancel` que completa a espera com `CancellationError` não rouba o resultado de quem ficou.
+3. **Sim, pode alargar a janela do tap, indiretamente.** Antes, um waiter cancelado segurava o slot do `AsyncLimiter` até a resolução compartilhada acabar; agora ele solta o slot na hora:
+
+   `cancel waiter → release slot → novo prepare começa → mais work sobreposto → render-ready/publication acontece mais cedo`
+
+   Ou seja, **mais concorrência efetiva no startup**, mesmo sem mexer em `httpMaximumConnectionsPerHost` — o que pode deslocar `publishCards`/reconciliação SwiftUI exatamente para a janela do tap. Receita de prova (`-UITestTapTrace`, timestamps monotônicos): `MediaAssetStore` (`flight_start`, `join`, `waiter_cancel`, `shared_complete`, `flight_clear`, `flightID/key`), `AsyncLimiter` (`acquire/release`, `inUse/queued`), `CardPreparationCoordinator` (start/end/cancel/deadline + item/contexto), `FeedDisplayState` (cada `publishCards`, gerações e IDs), `FeedItemView` (`onAppear/onDisappear` **do card que será tapado**) e os dois taps. Smoking gun:
+
+   `waiter_cancel → slot_release → novo resolve/publish → tapped-card disappear/appear ou generation bump → window tap → nenhum card tap`
+
+**Sonda de 4 execuções da jornada, na árvore com C-06 (`/tmp/journey-probe`, 13:37–13:52):** `exit=0`, `exit=0`, **`exit=1`**, `exit=0` ⇒ **3 passes, 1 falha**.
+
+Placar de hoje, mesma máquina e mesmo commit de referência:
+
+| Árvore | Jornada |
+|---|---|
+| **sem** C-06 | 17/17 (10:40), 17/17 (10:52), 17/17 (11:09) → **3/3** |
+| **com** C-06 | **15/17** (10:56), 17/17 (11:22), e a sonda: 17/17, 17/17, **15/17**, 17/17 → **2 falhas em 6** |
+
+Com n=6 vs n=3 isso é **sugestivo, não conclusivo** (e o defeito de fundo — tap engolido sob carga — é do app, não do conserto). Mas o mecanismo apontado pelo worker e o placar apontam para o mesmo lado, então a **decisão para o build 19** é uma destas duas, nunca "seguir como está":
+
+- **instrumentar** (`-UITestTapTrace`, receita acima) e fechar a ligação com dado; ou
+- **reverter o C-06** se a prioridade for a taxa da jornada antes de qualquer investigação.
+
+O que **não** se faz: culpar semanticamente a correção de cancelamento (o worker foi explícito nisso). O build 18 — já no TestFlight e `VALID` — **contém** o C-06; se o sintoma do tap aparecer no dogfood, é este o defeito de fundo, não uma regressão nova.
+
 ### Tap ignorado sob carga — parte 3 não foi pedida a tempo
 
 O composer saiu do alcance da varredura depois que a conversa cresceu; a pergunta fica registrada para o próximo round (é a menos acionável das três: exige repro com log para discriminar HID de gesto).
