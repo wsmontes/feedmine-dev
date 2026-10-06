@@ -54,7 +54,7 @@ Não editei durante a execução de `release-acceptance.sh`: as três gates dela
 
 ### Avaliado e *não* aplicado de propósito
 
-- **C-06** (`MediaAssetStore.resolve`, `MediaAssetStore.swift:52-58`): verificado por leitura — com uma task em voo para a mesma chave, o segundo chamador faz `try? await task.value` numa **task compartilhada**, e o `await` não observa o cancelamento de quem espera; quem foi cancelado continua esperando a resolução alheia (página inicial truncada, slot do limiter preso). **Não é one-liner**: o conserto correto é um helper que corra cancelamento × task compartilhada (sem cancelar a task dos outros) e um teste próprio. Remendar aqui — por exemplo cancelando a task compartilhada — quebraria os demais chamadores. Fica registrado para entrar com desenho, não com pressa.
+- **C-06** (`MediaAssetStore.resolve`, `MediaAssetStore.swift:52-58`): verificado por leitura — com uma task em voo para a mesma chave, o segundo chamador faz `try? await task.value` numa **task compartilhada**, e o `await` não observa o cancelamento de quem espera; quem foi cancelado continua esperando a resolução alheia (página inicial truncada, slot do limiter preso). **Não é one-liner**: o conserto correto é um helper que corra cancelamento × task compartilhada (sem cancelar a task dos outros) e um teste próprio. Remendar aqui — por exemplo cancelando a task compartilhada — quebraria os demais chamadores. Fica registrado para entrar com desenho, não com pressa. → **RESOLVIDO**: o desenho chegou e foi aplicado com teste de cancelamento; ver "C-06 — implementado" mais abaixo.
 
 ### S-02 — tentado, **revertido** pela própria barra (decisão de produto, não conserto)
 
@@ -214,9 +214,24 @@ Aplicado (3 edições + 1 teste):
 - `feedmine/Views/FeedScreen.swift`: ramo `if loader.persistenceUnavailable { ContentUnavailableView(...) }` antes de `isSearching && hasCommittedSearch`, com `accessibilityIdentifier("persistent-store-unavailable")` e a mensagem explicando que o dado **não** foi apagado.
 - `feedmineTests/FeedStoreTests.swift`: `testPersistentStoreFailureIsVisibleRatherThanSwallowed` — assere `initError != nil`, `persistenceUnavailable == true` e que um `start()` recusado não carrega registry. **Deliberadamente não escrevi asserção sobre a guarda do `start()`** que eu não conseguisse falsificar (um teste vazio é pior que nenhum); a guarda é verificada por leitura + compilação.
 
-### C-06 — **desenho recebido, NÃO aplicado** (`41-c06-design.md`)
+### C-06 — **implementado** (do desenho do worker), com o teste que ele mesmo exigiu
 
-O worker propôs um `SharedWait<Value>` com `withCheckedThrowingContinuation` para que o **waiter cancelado** volte imediatamente enquanto a resolução compartilhada segue para os outros. É a direção certa, e é exatamente a classe onde um "parece certo" produz **hang**: continuations, ordem de resume, cancelamento concorrente. Não entra sem teste dedicado de cancelamento (dois waiters, um cancelado, um não) e sem revisão — fica como desenho registrado para uma sessão focada.
+O worker propôs um `SharedWait<Value>` com `withCheckedThrowingContinuation` para que o **waiter cancelado** volte imediatamente enquanto a resolução compartilhada segue para os outros; implementei isso, com uma diferença: o helper ficou em **escopo de arquivo e `internal`**, para o teste exercitá-lo direto (mesma convenção de `boundedDownload`/`DownloadLimit`). O que o desenho pedia e foi seguido: **nunca** `onCancel: { shared.cancel() }` — quem desiste não cancela o trabalho dos outros.
+
+Mudanças em `feedmine/Services/MediaAssetStore.swift`:
+- `awaitSharedTaskRespectingCancellation(_:)` + `SharedWait` (primeira conclusão vence; a continuation nunca resume duas vezes);
+- `resolve(request:)` usa o helper nos **dois** caminhos (waiter e criador);
+- `inFlight` passa a guardar `InFlight { id, task }` e a entrada é removida por **quem termina a tarefa** (um monitor), não por quem está esperando — porque agora o criador pode sair cedo. O `id` impede que o monitor apague a entrada de uma resolução posterior da mesma chave (`Task` não é `Equatable`).
+
+Teste: `MediaAssetStoreSharedWaitTests.test_cancelledWaiterReturnsBeforeSharedResolutionAndDoesNotCancelIt` — gate fechado + dois waiters; cancela um e exige que ele volte **antes** de o gate abrir; depois abre o gate e exige o valor para o outro, com `shared.isCancelled == false`.
+
+**Falsificabilidade medida (o teste não é vazio):** com o helper neutralizado para `await shared.value` (a semântica antiga), ele **falha em 5,060 s** com a mensagem certa — e falha **por asserção, não por pendurar**, porque o teste carrega um "gate de segurança" de 5 s que abre o gate; isso é necessário porque a suíte roda **sem** timeout de teste (`xcodebuild test-without-building`, sem `-test-timeouts-enabled`), então um teste que pendura penduraria a barra inteira. Com o helper correto: **passa em 0,004 s**.
+
+Onde o teste vive: anexado a `feedmineTests/CardPreparationCoordinatorTests.swift` (que já constrói um `MediaAssetStore`). **Motivo:** o alvo de testes **não** é regenerado por XcodeGen na prática — `xcodegen generate` produz 914 linhas de diff no `project.pbxproj` **e reescreve o `Info.plist` mantido à mão** (tentado: apagou `BGTaskSchedulerPermittedIdentifiers` e resetou o build 18 → 17; revertido com `git checkout`). Arquivo novo exigiria cirurgia no pbxproj; anexar a um arquivo já no alvo evita isso.
+
+Barra: **`BAR OK 11:34:37`** — gates 611 (610 + este teste) ×3 verdes e **jornada 17/17**.
+
+**Ambiguidade registrada, não escondida:** a primeira barra com este conserto (10:56) deu **jornada 15/17** (`03-article-reader`, `04-article-scrolled` ausentes) — o mesmo par que o CR-08 e o CR-03 provocaram; a segunda, na **mesma árvore** (11:22), deu **17/17**. Quebra determinística não passa na segunda execução, então leio a primeira como a flake documentada do tap. Mas o C-06 muda o **escalonamento** do pipeline de imagem (quem foi cancelado deixa de segurar o slot e segue), e perturbação ali é exatamente o que o registro já mediu como sensível. **Se uma barra futura falhar no passo do reader, o C-06 é o primeiro suspeito** — desfazer é um revert de dois arquivos, e o teste que fica documenta o comportamento esperado.
 
 ### Tap ignorado sob carga — parte 3 não foi pedida a tempo
 

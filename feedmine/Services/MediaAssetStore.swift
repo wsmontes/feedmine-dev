@@ -11,7 +11,16 @@ actor MediaAssetStore {
     private let diskCache = DiskImageCache()
     private let db: DatabaseQueue
 
-    private var inFlight: [ImageAssetKey: Task<ResolvedImageAsset?, Error>] = [:]
+    /// Keyed by every distinct request whose resolution is still running. The entry is removed by
+    /// whoever *finishes* the shared work, not by the caller that happens to be waiting: a waiter
+    /// can now leave early (cancellation) while the resolution continues for the others.
+    private var inFlight: [ImageAssetKey: InFlight] = [:]
+    private var nextInFlightID: UInt64 = 0
+
+    private struct InFlight {
+        let id: UInt64
+        let task: Task<ResolvedImageAsset?, Error>
+    }
 
     /// Compressed-transfer ceiling. This is enforced while bytes arrive, not
     /// after URLSession has buffered the response.
@@ -51,18 +60,30 @@ actor MediaAssetStore {
             return await loadAssetMetadata(cacheKey: memKey)
         }
 
-        if let task = inFlight[key] {
-            return try? await task.value
+        if let entry = inFlight[key] {
+            return try? await awaitSharedTaskRespectingCancellation(entry.task)
         }
 
+        nextInFlightID &+= 1
+        let id = nextInFlightID
         let task = Task<ResolvedImageAsset?, Error> { [weak self] in
             try Task.checkCancellation()
             return await self?.performResolution(request)
         }
-        inFlight[key] = task
-        let result = try? await task.value
-        inFlight[key] = nil
-        return result
+        inFlight[key] = InFlight(id: id, task: task)
+
+        // The entry outlives any single waiter: the caller that created it can leave early
+        // (cancellation), and the resolution it started still belongs to everyone else.
+        Task { [weak self] in
+            _ = try? await task.value
+            await self?.finishInFlight(key: key, id: id)
+        }
+
+        return try? await awaitSharedTaskRespectingCancellation(task)
+    }
+
+    private func finishInFlight(key: ImageAssetKey, id: UInt64) {
+        if inFlight[key]?.id == id { inFlight[key] = nil }
     }
 
     func diskData(for key: String) async -> Data? {
@@ -309,5 +330,62 @@ enum ImageCacheKey {
             hash = hash &* 0x0000_0100_0000_01b3
         }
         return "img_\(String(hash, radix: 16))"
+    }
+}
+
+/// One waiter's share of a task that several callers await.
+///
+/// `Task.value` ignores the awaiting context's cancellation, so a caller that goes away kept
+/// waiting for work it no longer needs — holding its limiter slot and whatever sequencing
+/// depended on it (the first-page render did) until the resolution finished, up to the 20 s
+/// resource timeout. This box lets that caller leave at once **without** cancelling the work the
+/// callers that stay still want.
+///
+/// One `value()` call per box: a second would overwrite the stored continuation.
+final class SharedWait<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    /// First completion wins; later ones are dropped so a continuation can never resume twice.
+    func complete(_ outcome: Result<Value, Error>) {
+        lock.lock()
+        guard result == nil else { lock.unlock(); return }
+        result = outcome
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: outcome)
+    }
+
+    func value() async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let result = self.result {
+                lock.unlock()
+                continuation.resume(with: result)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+}
+
+/// Awaits `shared` on behalf of *this* caller only: cancellation ends this caller's wait and
+/// leaves the shared task running for everyone else.
+func awaitSharedTaskRespectingCancellation<T: Sendable>(
+    _ shared: Task<T, Error>
+) async throws -> T {
+    let wait = SharedWait<T>()
+    return try await withTaskCancellationHandler {
+        try Task.checkCancellation()
+        Task {
+            do { wait.complete(.success(try await shared.value)) }
+            catch { wait.complete(.failure(error)) }
+        }
+        return try await wait.value()
+    } onCancel: {
+        wait.complete(.failure(CancellationError()))
     }
 }
