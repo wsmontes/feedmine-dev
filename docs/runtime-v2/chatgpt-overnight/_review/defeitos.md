@@ -136,6 +136,21 @@ Placar do prune, dentro da barra: **sem = 2/2 jornada 17/17; com = 2/2 jornada 1
 
 **Achado próprio que sobra:** a jornada falha no passo do reader **quando roda depois dos três unit gates**, e passa isolada. Vale investigar um dia (a barra limpa o contêiner entre gates, mas algo entre gates e jornada degrada o passo do artigo); por ora, quem usar a barra como critério deve repetir o *passo* que falhou, não o bar inteiro, e nunca tratar falha isolada como verde nem como regressão.
 
+### CR-08 — re-testado depois do conserto do churn (2026-10-06, 10:28/10:52)
+
+O placar acima admitia uma dúvida legítima: se o prune só falhava **por causa** do churn do `FeedDisplayState` (conserto 13), ele estaria exonerado. Re-testei com o churn já consertado e o build em 18, sobre o **mesmo base commit** (`17b48a78`, o que vai embarcar):
+
+| Execução | Código | Unit gates | Jornada |
+|---|---|---|---|
+| 10:28 | churn consertado **+ prune** | 610/0 ×3 | **15/17** — ausentes `03-article-reader`, `04-article-scrolled` |
+| 10:52 | churn consertado, **sem prune** | 610/0 ×3 | **17/17** ✓ |
+
+**Veredito: a poda não foi exonerada; ela tem mecanismo próprio.** Com o conserto 13 no lugar, o passo que falha continua sendo o do reader — e o único delta entre as duas execuções é o prune.
+
+Mecanismo provável (não medido linha a linha): `pruneIfNeeded()` roda na entrada de `imageURLs(for:replacing:)` e poda `resolved`/`misses` por **chave arbitrária**; o mapa tem a URL de todo artigo já visto, então a chave evictada pode ser a do artigo **aberto agora**, cuja re-resolução cai dentro da janela do passo 03. É a diferença entre "cache descartável" (minha hipótese de 06:14) e "cache que a superfície em uso depende ter quente" (o que a medição mostra).
+
+Consequência: **CR-08 segue fora**, agora com dois conjuntos independentes de medição, e a poda não entra nem como melhoria de qualidade. O teto que *importa* naqueles caminhos já existe (`session.bytes` + `maxHTMLBytes` + `DownloadLimit`), então o crescimento residual é proporcional ao número de artigos abertos — memória, não vazamento de arquivo ou de socket.
+
 ## Quarta leva — os corpos de rede sem teto (CR-03, CR-09), pela convenção que já existia
 
 O repo **já tinha** o mecanismo: `URLResolver.swift` declara `DownloadLimit` (tetos por tipo: HTML de descoberta 256 KB, probe de feed 64 KB, import OPML 10 MB) e um `boundedDownload(from:maxBytes:session:)` que checa `Content-Length` **antes** do primeiro byte e streama com corte. O defeito era **uso inconsistente**: o próprio arquivo bypassava o helper na linha do iTunes Lookup, e o `ImageLoader` baixava imagem com `session.data` sem teto.
@@ -161,6 +176,8 @@ Placar dentro da barra — sempre o mesmo par de superfícies do reader:
 | + prune (CR-08) | 15/17 (05:42), 15/17 (06:02) |
 | + teto de imagem (CR-03) | 15/17 (06:27) |
 | teto de imagem revertido | **17/17 (06:39)** ✓ |
+| + prune (CR-08), **com o churn já consertado, build 18** | 15/17 (10:28) |
+| nada, com o churn consertado, build 18 | **17/17 (10:52)** ✓ |
 
 3/3 de falha quando eu mexo no caminho de imagem, 3/3 de passe quando não mexo — padrão consistente **dentro da barra**. As jornadas isoladas passavam com o prune (17/17 ×2), o que diz que a degradação precisa do estado/pressão acumulados pelos três unit gates, e que qualquer perturbação de tempo no caminho de imagem a inclina.
 

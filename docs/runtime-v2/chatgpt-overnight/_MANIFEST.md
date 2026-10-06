@@ -51,4 +51,4 @@
 | `_review/cr-crash.md` | 19211 | f872c2b324b1 |
 | `_review/cr-persistence.md` | 10894 | dcec93e9fdc1 |
 | `_review/cr-security.md` | 14894 | 501cd0e441a4 |
-| `_review/defeitos.md` | 30848 | fee4689574d5 |
+| `_review/defeitos.md` | 32664 | 38757dab255b |
