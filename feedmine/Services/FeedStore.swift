@@ -3201,6 +3201,13 @@ final class FeedStore {
                 // Run filter off main actor — keeps UI responsive during scroll-driven appends.
                 let filtered = await self.applyFiltersAsync(upcoming)
                 guard !Task.isCancelled, ctx.epoch == self.presentationEpoch else { return }
+                // The appended page is the reader's next page, so it goes through the same editorial policy
+                // every other publish uses (`flushPendingReservoir`, `.refresh` and `reloadFromSQLite` all
+                // sequence before publishing). Without it the append kept the reservoir's raw order and a
+                // prolific publisher arrived as a run of its own cards — measured on the running app: three
+                // episodes of one show in a row, and a cold starter page of nineteen cards from a single
+                // magazine. The sequencer drops nothing; it reorders so one provider cannot own the screen.
+                let editorial = EditorialSequencer.sequence(filtered)
 
                 if self.usePreparedPipeline {
                     // New pipeline: CardPreparationCoordinator handles everything.
@@ -3208,7 +3215,7 @@ final class FeedStore {
                     // runway, and promotes render-ready cards — all async.
                     // visibleItems and visibleCards are set atomically inside
                     // promotePreparedCards when the contiguous prefix is ready.
-                    self.setVisibleItems(filtered, isAppend: true)
+                    self.setVisibleItems(editorial, isAppend: true)
                     // The publish runs in `cardPreparationTask`; awaiting it here makes this append
                     // observable, which is what the load-more path needs to decide between "served" and
                     // "the page did not move" (the second one used to be indistinguishable, and the
@@ -3228,9 +3235,9 @@ final class FeedStore {
                     self.cardQueue.enqueue(upcoming)
                     await self.cardQueue.waitForReady(count: min(Reservoir.pageSize, upcoming.count))
                     let presMap = Dictionary(uniqueKeysWithValues: self.cardQueue.presentations.map { ($0.id, $0) })
-                    self.setVisibleItems(filtered, isAppend: true)
-                    display.setVisibleCards(filtered.compactMap { presMap[$0.id] })
-                    self.enqueueFailedCardsForRetry(presMap: presMap, filtered: filtered)
+                    self.setVisibleItems(editorial, isAppend: true)
+                    display.setVisibleCards(editorial.compactMap { presMap[$0.id] })
+                    self.enqueueFailedCardsForRetry(presMap: presMap, filtered: editorial)
                 }
                 self.reservoirCount = self.reservoir.reservoirCount
             }
