@@ -630,7 +630,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// surface.
     func testEveryModeThatOwnsNoAcquisitionKeepsTheLegacyPage() {
         for (name, request) in [
-            ("dod2-legacy", nil),
+            ("dod2-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false)),
             ("dod2-v2presentation", RequestedFeatures(shadow: false, v2UI: true, v2Network: false)),
         ] as [(String, RequestedFeatures?)] {
             let defaults = makeDefaults(name: name)
@@ -793,7 +793,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// counters exactly as it did before this entry point existed.
     func testEveryModeAndEverySelectionThatOwnsNoSessionKeepsTheLegacyLoadingRunway() async throws {
         for (name, request) in [
-            ("loading-legacy", nil),
+            ("loading-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false)),
             ("loading-v2presentation", RequestedFeatures(shadow: false, v2UI: true, v2Network: false)),
         ] as [(String, RequestedFeatures?)] {
             let defaults = makeDefaults(name: name)
@@ -984,7 +984,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// loader properties it read before this entry point existed.
     func testEveryModeAndEverySelectionThatOwnsNoSessionKeepsTheLegacyEmptySurface() async throws {
         for (name, request, mode) in [
-            ("empty-legacy", nil, RuntimeMode.legacy),
+            ("empty-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false), RuntimeMode.legacy),
             (
                 "empty-mirroredshadow",
                 RequestedFeatures(shadow: true, v2UI: false, v2Network: false),
@@ -1245,7 +1245,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// same loader properties it read before this entry point existed.
     func testEveryModeAndEverySelectionThatOwnsNoSessionKeepsTheLegacyHeaderChip() async throws {
         for (name, request, mode) in [
-            ("chip-legacy", nil, RuntimeMode.legacy),
+            ("chip-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false), RuntimeMode.legacy),
             (
                 "chip-mirroredshadow",
                 RequestedFeatures(shadow: true, v2UI: false, v2Network: false),
@@ -1421,7 +1421,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// is the legacy call there, with the same id the screen passed before it existed.
     func testEveryModeThatOwnsNoAcquisitionKeepsTheLegacyReadStateWrite() {
         for (name, request) in [
-            ("exposure-legacy", nil),
+            ("exposure-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false)),
             ("exposure-v2presentation", RequestedFeatures(shadow: false, v2UI: true, v2Network: false)),
         ] as [(String, RequestedFeatures?)] {
             let defaults = makeDefaults(name: name)
@@ -1610,7 +1610,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
     /// only owner of read state.
     func testEveryModeThatOwnsNoAcquisitionKeepsTheLegacyOpenWrite() {
         for (name, request) in [
-            ("open-legacy", nil),
+            ("open-legacy", RequestedFeatures(shadow: false, v2UI: false, v2Network: false)),
             ("open-v2presentation", RequestedFeatures(shadow: false, v2UI: true, v2Network: false)),
         ] as [(String, RequestedFeatures?)] {
             let defaults = makeDefaults(name: name)

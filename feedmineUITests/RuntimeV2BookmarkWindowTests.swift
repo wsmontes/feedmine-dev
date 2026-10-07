@@ -35,7 +35,7 @@ final class RuntimeV2BookmarkWindowTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = [
             "-AppleLanguages", "(en)",
-            "-UITestResetFilters", "-UITestSkipOnboarding",
+            "-ui-testing", "-UITestResetFilters", "-UITestSkipOnboarding",
             // v2Full resolves from UI + network with shadow *off* (`RuntimeModeResolver.resolve`):
             // passing `-RuntimeV2Shadow` would resolve to `mirroredShadow` instead.
             "-RuntimeV2UI", "-RuntimeV2Network",
@@ -94,6 +94,7 @@ final class RuntimeV2BookmarkWindowTests: XCTestCase {
         executionTimeAllowance = 300
         let app = XCUIApplication()
         app.launchArguments = [
+            "-ui-testing",
             "-AppleLanguages", "(en)",
             "-UITestResetFilters", "-UITestSkipOnboarding",
             "-RuntimeV2UI", "-RuntimeV2Network",

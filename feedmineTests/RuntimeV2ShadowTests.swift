@@ -875,15 +875,16 @@ final class RuntimeV2ShadowTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        // No request at all: legacy, and the decision is recorded.
+        // No request at all: Runtime V2 is the shipping path now (the worker's own change), and the
+        // decision is recorded.
         let firstLaunch = RuntimeModeLaunch.decide(in: defaults, arguments: [], at: fixedDate)
-        XCTAssertEqual(firstLaunch.mode, .legacy)
+        XCTAssertEqual(firstLaunch.mode, .v2Full)
         XCTAssertEqual(firstLaunch.source, .none)
-        XCTAssertNil(firstLaunch.rejection, "legacy by default is not a rejection")
+        XCTAssertNil(firstLaunch.rejection, "the shipping default is not a rejection")
 
         // Asking for the shadow does not change the mode this launch runs.
         RuntimeModeLaunch.request(RequestedFeatures(shadow: true, v2UI: false, v2Network: false), in: defaults)
-        XCTAssertEqual(RuntimeModeLaunch.current(in: defaults).mode, .legacy)
+        XCTAssertEqual(RuntimeModeLaunch.current(in: defaults).mode, .v2Full)
 
         // The next launch resolves it.
         let secondLaunch = RuntimeModeLaunch.decide(in: defaults, arguments: [], at: fixedDate.addingTimeInterval(60))

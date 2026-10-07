@@ -10,7 +10,7 @@ final class FeedmineUITests: XCTestCase {
         continueAfterFailure = true
         app.launchArguments = [
             "-AppleLanguages", "(en)",
-            "-UITestResetFilters", "-UITestSkipOnboarding",
+            "-ui-testing", "-UITestResetFilters", "-UITestSkipOnboarding",
         ]
         app.launch()
     }
@@ -18,6 +18,7 @@ final class FeedmineUITests: XCTestCase {
     func testCuratedOnboardingCreatesAnInspectableFeedFromRealStories() {
         app.terminate()
         app.launchArguments = [
+            "-ui-testing",
             "-AppleLanguages", "(en)",
             "-UITestResetFilters", "-UITestShowOnboarding",
         ]
@@ -728,6 +729,7 @@ final class FeedmineUITests: XCTestCase {
                 app.terminate()
                 usleep(1_000_000)
                 app.launchArguments = [
+                    "-ui-testing",
                     "-AppleLanguages", "(en)",
                     "-UITestResetFilters", "-UITestSkipOnboarding",
                 ]

@@ -12,6 +12,15 @@ import FeedRuntime
 @MainActor
 final class BackgroundRefreshDemandTests: XCTestCase {
 
+    /// These tests drive the **legacy** producers on purpose. The unit-test host *is* the app, and its own
+    /// launch now composes Runtime V2 by default — which closes the process-wide gate and would refuse
+    /// every request here, so the suite would measure the gate instead of the demand path. The gate's own
+    /// API is the sanctioned way back (`Tests use it to leave the process as they found it`).
+    override func setUp() async throws {
+        LegacyAcquisitionGate.open()
+        try await super.setUp()
+    }
+
     private let endpointA = "https://a.example.test/feed.xml"
     private let endpointB = "https://b.example.test/feed.xml"
 

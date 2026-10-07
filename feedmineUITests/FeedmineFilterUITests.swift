@@ -15,7 +15,7 @@ final class FeedmineFilterUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = true
-        app.launchArguments = ["-AppleLanguages", "(en)", "-UITestResetFilters", "-UITestSkipOnboarding"]
+        app.launchArguments = ["-AppleLanguages", "(en)", "-ui-testing", "-UITestResetFilters", "-UITestSkipOnboarding"]
         app.launch()
     }
 
@@ -611,7 +611,7 @@ final class FeedmineFilterUITests: XCTestCase {
             : (coldPrecondition.containerFound ? "verified-no-page" : "unverified-container-unreadable")
         print("READY cold_precondition=\(coldLabel) \(coldPrecondition.evidence)")
 
-        app.launchArguments = ["-AppleLanguages", "(en)", "-UITestResetFilters", "-UITestSkipOnboarding"]
+        app.launchArguments = ["-AppleLanguages", "(en)", "-ui-testing", "-UITestResetFilters", "-UITestSkipOnboarding"]
         let coldStart = Date()
         app.launch()
         let coldReturned = Date()

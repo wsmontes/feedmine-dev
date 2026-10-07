@@ -138,12 +138,10 @@ struct TestConfiguration: Sendable {
         // Production ignores the entire test-control vocabulary. XCUITest launches the app as a
         // separate process, so XCTestConfigurationFilePath is not a reliable discriminator there;
         // the explicit -ui-testing flag is. A random/deep-link launch argument must never be able to
-        // reset state, inject fixtures or force deterministic network/time behavior.
-        let isHarnessLaunch = isXCTestProcess
-            || args.contains("-ui-testing")
-            || args.contains("-UITestResetFilters")
-            || args.contains("-UITestSkipOnboarding")
-            || args.contains("-UITestShowOnboarding")
+        // reset state, inject fixtures or force deterministic network/time behavior — and the
+        // `-UITest…` vocabulary is exactly what a deep link can carry, so it does **not** open the
+        // harness on its own: only an XCTest process or the explicit `-ui-testing` flag does.
+        let isHarnessLaunch = isXCTestProcess || args.contains("-ui-testing")
         guard isHarnessLaunch else { return .production }
 
         if !args.isEmpty {
