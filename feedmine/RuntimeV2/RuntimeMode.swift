@@ -7,7 +7,7 @@ enum RuntimeModeRequestSource: String, Sendable {
     case launchArguments
     /// The request persisted by a previous launch.
     case stored
-    /// Nothing was requested: the legacy mode.
+    /// Nothing was explicitly requested: the shipping default is Runtime V2 full.
     case none
 }
 
@@ -86,7 +86,15 @@ enum RuntimeModeLaunch {
 
     /// A request spelled as launch arguments. Presence of a flag is `true`; the flags describe one
     /// launch and are never persisted.
-    static func argumentRequest(from arguments: [String]) -> RequestedFeatures? {
+    static func argumentRequest(
+        from arguments: [String],
+        allowDeveloperOverrides: Bool = true
+    ) -> RequestedFeatures? {
+        // Runtime-mode launch flags are a test/development instrument, not a public process API.
+        // Production rollback is the persisted request below, which is deliberate and survives a
+        // relaunch. A crafted process/deep-link launch must not be able to downgrade the shipping
+        // runtime or create a shadow owner.
+        guard allowDeveloperOverrides else { return nil }
         let names = [shadowArgument, v2UIArgument, v2NetworkArgument]
         guard arguments.contains(where: names.contains) else { return nil }
         return RequestedFeatures(
@@ -104,16 +112,25 @@ enum RuntimeModeLaunch {
     static func decide(
         in defaults: UserDefaults = .standard,
         arguments: [String] = ProcessInfo.processInfo.arguments,
+        allowDeveloperOverrides: Bool = true,
         at: Date = Date()
     ) -> RuntimeLaunchDecision {
         let decision: RuntimeLaunchDecision
-        if let features = argumentRequest(from: arguments) {
+        if let features = argumentRequest(
+            from: arguments,
+            allowDeveloperOverrides: allowDeveloperOverrides
+        ) {
             decision = decide(features, source: .launchArguments, at: at)
         } else if let features = storedRequest(in: defaults) {
             decision = decide(features, source: .stored, at: at)
         } else {
+            // Runtime V2 is the shipping path. Explicit launch arguments and a stored request still
+            // provide the compatibility/rollback modes, but a fresh install must not silently boot the
+            // architecture we are retiring. RuntimeCompositionRoot remains the failure boundary: if
+            // the V2 database/composition cannot be opened, launch records that refusal and takes the
+            // documented compatibility fallback rather than running two acquisition owners.
             decision = decide(
-                RequestedFeatures(shadow: false, v2UI: false, v2Network: false),
+                RequestedFeatures(shadow: false, v2UI: true, v2Network: true),
                 source: .none,
                 at: at
             )
@@ -139,7 +156,8 @@ enum RuntimeModeLaunch {
 
     /// The mode this process runs: the decision taken at launch, never a fresh resolution. A mode
     /// request written after launch therefore takes effect on the next launch only. Before the first
-    /// launch ever decided, this is `legacy`.
+    /// launch ever decided there is no process decision yet, so this diagnostic accessor returns legacy;
+    /// `decide()` establishes the shipping `v2Full` decision at launch.
     static func current(in defaults: UserDefaults = .standard) -> RuntimeLaunchDecision {
         guard let record = defaults.dictionary(forKey: lastDecisionKey),
               let rawMode = record["mode"] as? String,

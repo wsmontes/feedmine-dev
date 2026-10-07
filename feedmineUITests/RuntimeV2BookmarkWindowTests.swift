@@ -139,19 +139,15 @@ final class RuntimeV2BookmarkWindowTests: XCTestCase {
         print("=== box-window: after the tap, the page draws \(afterTap.count) card(s), "
               + "box control present: \(drawn) ===")
         print("=== box-window: ids=\(afterTap.map { String($0.suffix(24)) }) ===")
-        guard drawn else {
-            // Measured, not swallowed: the box's session does compose and its page does reach the screen
-            // (`page-source=session-snapshot selection=…box=1` is in this launch's log, baseline §8.62),
-            // but the composition it lands is empty. Two defects stand between the two facts, both
-            // measured that day: a successor composition under the repetition policy excludes the whole
-            // saved set (`decision=empty`), and a session's `watch` replaces the shared acquisition
-            // catalogue (32 targets became 1). This test goes green again when the box's own composition
-            // keeps its cards; until then the skip states the defect instead of hiding it.
-            throw XCTSkip(
-                "the box's own composition published no cards (baseline §8.62: decision=empty under the "
-                    + "repetition policy, and a session's watch shrinking the acquisition catalogue)"
-            )
-        }
+        // Baseline §8.62 records that the two defects this test used to skip over were fixed:
+        // saved-subject selections no longer exclude their own published set, and a session no longer
+        // shrinks the launch's shared acquisition catalogue. A missing box control is therefore a
+        // regression in the shipping composition path and must fail the suite instead of becoming a skip.
+        XCTAssertTrue(
+            drawn,
+            "A bookmark-box selection must render the session-owned saved cards with the box control"
+        )
+        guard drawn else { return }
         // The box's page draws the reader's saved cards, each with the box's own control. The feed's
         // toggle is the wrong contract to count here (it does not exist inside a box), which is what the
         // earlier runs measured.

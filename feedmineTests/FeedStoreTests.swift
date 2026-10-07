@@ -4356,4 +4356,84 @@ final class FeedStoreTests: XCTestCase {
             "the podcast counters must follow ingestion (got items=\(store.podcastItemCount) sources=\(store.podcastSourceCount))"
         )
     }
+    func testProductionLaunchArgumentsCannotActivateTestControls() {
+        let config = TestConfiguration.parse(
+            args: [
+                "feedmine",
+                "-reset-test-state",
+                "-fixture-profile", "heavy",
+                "-network-profile", "offline",
+                "-UITestSkipOnboarding"
+            ],
+            isXCTestProcess: false
+        )
+
+        XCTAssertFalse(config.isUITesting)
+        XCTAssertFalse(config.resetTestState)
+        XCTAssertFalse(config.skipOnboarding)
+        XCTAssertNil(config.fixtureProfile)
+        XCTAssertNil(config.networkProfile)
+    }
+
+    func testExplicitUITestLaunchStillActivatesHarnessControls() {
+        let config = TestConfiguration.parse(
+            args: [
+                "feedmine",
+                "-ui-testing",
+                "-fixture-profile", "typical",
+                "-network-profile", "offline",
+                "-reset-test-state"
+            ],
+            isXCTestProcess: false
+        )
+
+        XCTAssertTrue(config.isUITesting)
+        XCTAssertTrue(config.resetTestState)
+        XCTAssertEqual(config.fixtureProfile, "typical")
+        XCTAssertEqual(config.networkProfile, "offline")
+    }
+    func testImportURLBoundaryAcceptsOnlyHTTPAndHTTPS() {
+        XCTAssertEqual(
+            InputParser.normalizeWebURL("HTTPS://example.com/feed.xml")?.scheme?.lowercased(),
+            "https"
+        )
+        XCTAssertEqual(
+            InputParser.normalizeWebURL("example.com/feed")?.absoluteString,
+            "https://example.com/feed"
+        )
+
+        XCTAssertNil(InputParser.normalizeWebURL("file:///private/var/mobile/secret"))
+        XCTAssertNil(InputParser.normalizeWebURL("javascript:alert(1)"))
+        XCTAssertNil(InputParser.normalizeWebURL("ftp://example.com/feed.xml"))
+        XCTAssertNil(InputParser.normalizeWebURL("mailto:reader@example.com"))
+        XCTAssertNil(InputParser.normalizeWebURL("httpx://example.com/feed.xml"))
+    }
+
+    func testLocaleResolutionUsesAppOwnedPreferenceBeforeSystemLanguages() {
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: "pt-BR",
+                systemPreferences: ["fr-CA", "en"]
+            ).code,
+            "pt-BR"
+        )
+    }
+
+    func testLocaleResolutionFallsBackToPublicSystemPreferenceThenEnglish() {
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: "unsupported-language",
+                systemPreferences: ["fr-CA", "en"]
+            ).code,
+            "fr-CA"
+        )
+        XCTAssertEqual(
+            LocaleManager.resolveLanguage(
+                savedCode: nil,
+                systemPreferences: ["zz-ZZ"]
+            ).code,
+            "en"
+        )
+    }
+
 }

@@ -291,7 +291,7 @@ extension LocalAssetStore: PublishedAssetCommitting {
     }
 
     /// The digest of a lowercase hex string, in the shape `PublishedAssetRequest` guarantees.
-    static func digest(hex: String) throws -> ContentDigest {
+    public static func digest(hex: String) throws -> ContentDigest {
         guard hex.count == ContentDigest.byteCount * 2 else {
             throw PublishedAssetCommitError.invalidDigest(hex)
         }

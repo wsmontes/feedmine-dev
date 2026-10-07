@@ -66,6 +66,11 @@ make_fixture "$domain_grdb" 'import Foundation
 import GRDB' 'import Foundation'
 expect "FeedDomain importing GRDB fails" 1 "$domain_grdb"
 
+scoped_domain_grdb="$TMP_DIR/scoped-domain-grdb"
+make_fixture "$scoped_domain_grdb" 'import Foundation
+public import GRDB' 'import Foundation'
+expect "scoped import cannot bypass FeedDomain GRDB rule" 1 "$scoped_domain_grdb"
+
 runtime_grdb="$TMP_DIR/runtime-grdb"
 make_fixture "$runtime_grdb" 'import Foundation' 'import Foundation
 import GRDB'
@@ -114,6 +119,33 @@ let package = Package(
 )
 '
 expect "manifest edge from FeedDomain to FeedStorage fails" 1 "$manifest_sibling"
+
+ui_storage="$TMP_DIR/ui-storage"
+mkdir -p "$ui_storage/Sources/FeedDomain" "$ui_storage/Sources/FeedStorage" \
+  "$ui_storage/Sources/FeedRuntime" "$ui_storage/Sources/FeedUIBridge"
+cat > "$ui_storage/Package.swift" <<'MANIFEST'
+ // swift-tools-version: 6.0
+ import PackageDescription
+
+ let package = Package(
+     name: "Fixture",
+     targets: [
+         .target(name: "FeedDomain", dependencies: [], path: "Sources/FeedDomain"),
+         .target(name: "FeedStorage", dependencies: ["FeedDomain"], path: "Sources/FeedStorage"),
+         .target(name: "FeedRuntime", dependencies: ["FeedDomain", "FeedStorage"], path: "Sources/FeedRuntime"),
+         .target(
+             name: "FeedUIBridge",
+             dependencies: ["FeedDomain", "FeedRuntime", "FeedStorage"],
+             path: "Sources/FeedUIBridge"
+         ),
+     ]
+ )
+MANIFEST
+printf 'import Foundation\n' > "$ui_storage/Sources/FeedDomain/Domain.swift"
+printf 'import Foundation\nimport FeedDomain\n' > "$ui_storage/Sources/FeedStorage/Storage.swift"
+printf 'import Foundation\nimport FeedDomain\nimport FeedStorage\n' > "$ui_storage/Sources/FeedRuntime/Runtime.swift"
+printf 'import Foundation\nimport FeedDomain\nimport FeedRuntime\nimport FeedStorage\n' > "$ui_storage/Sources/FeedUIBridge/UI.swift"
+expect "FeedUIBridge cannot depend on FeedStorage" 1 "$ui_storage"
 
 echo ""
 echo "=== the real package ==="

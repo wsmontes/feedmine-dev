@@ -211,19 +211,31 @@ struct FeedmineApp: App {
     @State private var contentFilters = ContentFilterStore.shared
     /// The launch's Runtime V2 decision and composition, resolved once, here (plan §13). Nothing else
     /// in the app may re-resolve the mode: a request written later applies on the next launch.
-    @State private var runtime = MainFeedRuntime.launch()
+    @State private var runtime: MainFeedRuntime
 
     init() {
-        if ProcessInfo.processInfo.arguments.contains("-UITestResetFilters") {
+        let testConfiguration = TestConfiguration.parse()
+        TestConfiguration.active = testConfiguration.isUITesting || testConfiguration.isPerformanceTesting
+            ? testConfiguration
+            : nil
+        _runtime = State(initialValue: MainFeedRuntime.launch(
+            allowDeveloperOverrides: testConfiguration.isUITesting
+                || testConfiguration.isPerformanceTesting
+                || ProcessInfo.isTestMode
+        ))
+        if testConfiguration.resetFilters {
             resetFiltersForUITestLaunch()
         }
-        if ProcessInfo.processInfo.arguments.contains("-UITestShowOnboarding") {
+        if testConfiguration.showOnboarding {
             UserDefaults.standard.set(false, forKey: Keys.hasSeenOnboarding)
-        } else if ProcessInfo.processInfo.arguments.contains("-UITestSkipOnboarding") {
+        } else if testConfiguration.skipOnboarding {
             UserDefaults.standard.set(true, forKey: Keys.hasSeenOnboarding)
         }
-        // Journey-only instrument (review: ignored card tap). Off unless `-UITestTapTrace` is passed.
-        TapTrace.installIfRequested(ProcessInfo.processInfo.arguments)
+        // Journey-only instrument (review: ignored card tap). Off unless an actual UI-test launch also
+        // requests `-UITestTapTrace`; production arguments cannot install a window-level recognizer.
+        TapTrace.installIfRequested(
+            testConfiguration.isUITesting ? ProcessInfo.processInfo.arguments : []
+        )
         // Nothing to hand the scheduler: the loader comes from the same provider the scheduler asks
         // (`FeedLoaderProvider`), so both see one instance with no wiring between them and no window in
         // which the task has no owner.
@@ -267,20 +279,21 @@ struct FeedmineApp: App {
             if url.host == "source",
                let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let feedURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
-               !feedURL.isEmpty {
-                // Open the Source View for this feed URL.
-                // Post a notification — the active FeedScreen handles navigation.
+               let safeURL = InputParser.normalizeWebURL(feedURL) {
+                // Open the Source View only for an HTTP(S) endpoint. The custom URL scheme is an
+                // external input boundary; it must not smuggle file:, javascript: or arbitrary
+                // schemes into SourceFeedView's network/media paths.
                 NotificationCenter.default.post(
                     name: .openSourceView,
                     object: nil,
-                    userInfo: ["feedURL": feedURL]
+                    userInfo: ["feedURL": safeURL.absoluteString]
                 )
             } else if url.host == "import",
                let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let feedURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
-               !feedURL.isEmpty {
+               let safeURL = InputParser.normalizeWebURL(feedURL) {
                 Task {
-                    let result = await loader.importFeeds(urls: [feedURL])
+                    let result = await loader.importFeeds(urls: [safeURL.absoluteString])
                     NotificationCenter.default.post(
                         name: .feedImportCompleted,
                         object: nil,

@@ -82,17 +82,26 @@ final class RuntimeCompositionRoot: @unchecked Sendable {
             // One transport for the whole process: the connector's body reads and anything a later
             // slice fetches go through the same policy-enforcing boundary, so "every production fetch
             // passes `EndpointPolicy`" is a property of the composition and not of each caller.
+            let transport = PolicyEnforcingHTTPTransport()
+            let clock = SystemEditorialClock()
             let acquisition = V2Acquisition(
                 database: database,
-                transport: PolicyEnforcingHTTPTransport(),
-                clock: SystemEditorialClock()
+                transport: transport,
+                clock: clock
             )
+            let assetRoot = directory.appendingPathComponent("Assets", isDirectory: true)
             return RuntimeCompositionRoot(
                 decision: decision,
                 outcome: .fullComposed(databaseDirectory: directory),
                 shadow: nil,
                 shadowDatabase: nil,
-                full: V2FullRuntime(database: database, acquisition: acquisition),
+                full: V2FullRuntime(
+                    database: database,
+                    acquisition: acquisition,
+                    transport: transport,
+                    assetRoot: assetRoot,
+                    clock: clock
+                ),
                 userState: userState
             )
         }

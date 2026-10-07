@@ -1,10 +1,10 @@
 import Foundation
 import GRDB
 
-/// Typed shape of `user_operation.payload_json` for `bookmark.set` operations.
-/// Decoding it as JSON — instead of scanning the payload text for a substring —
-/// keeps `listID` correct regardless of field order.
-private struct BookmarkOperationPayload: Codable {
+/// Typed shape of `user_operation.payload_json` for `bookmark.set` operations. Decoding it as JSON —
+/// instead of scanning the payload text for a substring — keeps `listID` correct regardless of the field
+/// order (review S22; the worker's own recovery work landed the same fix independently).
+private struct StoredBookmarkOperationPayload: Decodable, Sendable {
     let listID: Int64
     let wanted: Bool
 }
@@ -94,6 +94,21 @@ final class BookmarkStore {
             try BookmarkItemRecord
                 .filter(Column("list_id") == targetListID && Column("item_id") == itemID)
                 .fetchCount(db) > 0
+        }
+    }
+
+    /// Whether the item exists in at least one bookmark list.
+    ///
+    /// The runtime's top-level bookmark overlay is global across boxes, while list membership is
+    /// tracked separately. Removing an item from one box must therefore not make it look unbookmarked
+    /// when another box still contains it.
+    func isBookmarkedAnywhere(itemID: String) async throws -> Bool {
+        try await userDB.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT 1 FROM bookmark_item WHERE item_id = ? LIMIT 1",
+                arguments: [itemID]
+            ) != nil
         }
     }
 
@@ -310,7 +325,7 @@ final class BookmarkStore {
                        applied_at, failure_reason
                 FROM user_operation
                 WHERE state != ?
-                ORDER BY created_at ASC, operation_id ASC
+                ORDER BY created_at ASC, rowid ASC
                 """, arguments: [BookmarkOperationState.applied.rawValue]).map(Self.operationRecord(from:))
         }) ?? []
     }
@@ -325,10 +340,33 @@ final class BookmarkStore {
                        applied_at, failure_reason
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (
-                        PARTITION BY subject_id ORDER BY created_at DESC, operation_id DESC
+                        PARTITION BY subject_id ORDER BY created_at DESC, rowid DESC
                     ) AS row_number
                     FROM user_operation WHERE kind = ?
                 ) WHERE row_number = 1
+                """, arguments: [kind]).map(Self.operationRecord(from:))
+        }) ?? []
+    }
+
+    /// The newest operation for each (subject, list) pair.
+    ///
+    /// List membership is not the same state as "bookmarked anywhere": one item can belong to more
+    /// than one box, and recovery must be able to replay a removal from one box without erasing the
+    /// other. JSON is queried only here, in the user-state compatibility store; it never enters a
+    /// Runtime V2 hot path.
+    func newestOperationsBySubjectAndList(kind: String = "bookmark.set") async -> [BookmarkOperationRecord] {
+        (try? await userDB.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT operation_id, kind, subject_id, payload_json, state, created_at,
+                       applied_at, failure_reason
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY subject_id, json_extract(payload_json, '$.listID')
+                        ORDER BY created_at DESC, rowid DESC
+                    ) AS row_number
+                    FROM user_operation WHERE kind = ?
+                ) WHERE row_number = 1
+                ORDER BY subject_id, json_extract(payload_json, '$.listID')
                 """, arguments: [kind]).map(Self.operationRecord(from:))
         }) ?? []
     }
@@ -390,10 +428,7 @@ final class BookmarkStore {
 
     private nonisolated static func operationRecord(from row: Row) -> BookmarkOperationRecord {
         let payload = row["payload_json"] as String
-        let decoded: BookmarkOperationPayload? = {
-            guard let data = payload.data(using: .utf8) else { return nil }
-            return try? JSONDecoder().decode(BookmarkOperationPayload.self, from: data)
-        }()
+        let decoded = try? JSONDecoder().decode(StoredBookmarkOperationPayload.self, from: Data(payload.utf8))
         return BookmarkOperationRecord(
             operationID: row["operation_id"],
             kind: row["kind"],

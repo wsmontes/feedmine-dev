@@ -32,10 +32,12 @@ final class CanonicalContentSearch {
     private let database: RuntimeDatabase
     private let registry: SourceRegistry
     private let repository = CanonicalSearchRepository()
+    private let userState: UserStateProjectionStore
 
     init(database: RuntimeDatabase, registry: SourceRegistry) {
         self.database = database
         self.registry = registry
+        self.userState = UserStateProjectionStore(database: database)
     }
 
     /// The rows the canonical index matched, in the order it returns them (newest first).
@@ -53,7 +55,35 @@ final class CanonicalContentSearch {
             Log.db.error("canonical content search failed: \(error.localizedDescription)")
             return []
         }
-        return hits.map(item(for:))
+        let baseItems = hits.map(item(for:))
+        let subjectIDs = baseItems.map(Self.userStateSubjectID(for:))
+        async let bookmarkTask = userState.projections(kind: .bookmark, subjectIDs: subjectIDs)
+        async let readTask = userState.projections(kind: .read, subjectIDs: subjectIDs)
+        let bookmarks = (try? await bookmarkTask) ?? [:]
+        let reads = (try? await readTask) ?? [:]
+
+        return zip(baseItems, subjectIDs).map { item, subjectID in
+            var overlaid = item
+            overlaid.isBookmarked = bookmarks[subjectID]?.wanted == true
+            overlaid.isRead = reads[subjectID]?.wanted == true
+            return overlaid
+        }
+    }
+
+    /// The durable subject used by runtime user actions.
+    ///
+    /// A V2-only hit has no `legacy_item_map` row until an action needs one. The action bridge derives
+    /// that subject from source + link/title/date, so Search must use the same derivation instead of its
+    /// display-only `origin:<record>` id. Once an alias exists, `item.id` is already that same subject.
+    private static func userStateSubjectID(for item: FeedItem) -> String {
+        if !item.id.hasPrefix(canonicalItemIDPrefix) { return item.id }
+        return FeedItem.generateID(
+            sourceURL: item.sourceURL,
+            guid: nil,
+            link: item.url.isEmpty ? nil : item.url,
+            title: item.title,
+            publishedAt: item.publishedAt
+        )
     }
 
     /// One canonical hit in the shape the search list renders.

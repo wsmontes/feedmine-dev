@@ -300,6 +300,86 @@ final class MediaPreparationTests: XCTestCase {
 
     // MARK: the accepted path
 
+    func testCandidatePreparationDerivesIdentityFromDownloadedBytes() async {
+        let fixture = MediaPipelineFixture()
+        let body = Data("candidate-image-bytes".utf8)
+        await fixture.transport.respond(with: body)
+
+        let prepared = await awaitValue {
+            try await fixture.preparation.prepareCandidate(
+                MediaCandidatePreparationRequest(
+                    url: MediaFixture.mediaURL,
+                    role: .image,
+                    targetWidth: 300,
+                    mediaTypeHint: "image/png",
+                    deadline: MediaInstant.at(60)
+                )
+            )
+        }
+
+        guard let prepared else { return }
+        XCTAssertEqual(prepared.descriptor.contentDigest, ContentDigest.sha256(body))
+        XCTAssertEqual(prepared.descriptor.byteCount, body.count)
+        XCTAssertFalse(prepared.servedFromLocalAsset)
+        await expectEqual(
+            fixture.publisher.bytes(for: prepared.descriptor.assetVersionID),
+            body
+        )
+        await expectEqual(fixture.transport.callCount, 1)
+    }
+
+    func testLocalMaterializationReadsDurableBytesWithoutNetwork() async throws {
+        let directory = try makeTemporaryDirectory()
+        let store = LocalAssetStore(rootDirectory: directory.url)
+        let firstTransport = SpyHTTPTransport()
+        await firstTransport.respond(with: MediaFixture.pngBytes)
+        let clock = MediaClock(now: MediaInstant.epoch)
+        let firstCache = DecodedImageCache(
+            limits: MediaCacheLimits(decodedBytes: 1 << 20, unpublishedBytes: 1 << 20),
+            clock: clock,
+            reclaim: { await store.reclaim($0) }
+        )
+        let first = MediaPreparation(
+            transport: firstTransport,
+            budget: .current,
+            decoder: ImageIODecoder(),
+            store: store,
+            cache: firstCache,
+            clock: clock
+        )
+        let prepared = try await first.prepareCandidate(
+            MediaCandidatePreparationRequest(
+                url: MediaFixture.mediaURL,
+                role: .image,
+                targetWidth: 3,
+                mediaTypeHint: "image/png",
+                deadline: MediaInstant.at(60)
+            )
+        )
+
+        let secondTransport = SpyHTTPTransport()
+        let secondCache = DecodedImageCache(
+            limits: MediaCacheLimits(decodedBytes: 1 << 20, unpublishedBytes: 1 << 20),
+            clock: clock,
+            reclaim: { await store.reclaim($0) }
+        )
+        let second = MediaPreparation(
+            transport: secondTransport,
+            budget: .current,
+            decoder: ImageIODecoder(),
+            store: store,
+            cache: secondCache,
+            clock: clock
+        )
+
+        let image = try await second.materializeLocal(prepared.descriptor.identity)
+
+        XCTAssertNotNil(image)
+        XCTAssertEqual(image?.pixelWidth, 3)
+        await expectEqual(secondTransport.callCount, 0)
+        await expectNotNil(secondCache.decoded(prepared.descriptor.assetVersionID))
+    }
+
     func testAcceptedPayloadIsPublishedUnderItsDigestAndDownsampled() async {
         let decoder = SpyImageDecoder(metadata: ImageMetadata(pixelWidth: 600, pixelHeight: 200, mimeType: "image/png"))
         let fixture = MediaPipelineFixture(decoder: decoder)

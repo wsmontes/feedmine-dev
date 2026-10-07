@@ -18,7 +18,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
 
     func testLegacyLaunchInstallsNoMirrorSinkAndPresentsWithoutASnapshotStore() {
         let defaults = makeDefaults(name: "pr13-legacy")
-        // A legacy launch is the default: no request, no arguments.
+        RuntimeModeLaunch.request(
+            RequestedFeatures(shadow: false, v2UI: false, v2Network: false),
+            in: defaults
+        )
         let runtime = MainFeedRuntime.launch(defaults: defaults, arguments: [])
         defer { runtime.stop() }
 
@@ -26,6 +29,68 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertFalse(runtime.presentsFromV2)
         XCTAssertNil(runtime.presentation.store, "legacy must not put a V2 store in the path")
         XCTAssertNil(ShadowMirrorRegistry.current, "a legacy launch must install no mirror sink")
+    }
+
+    func testProductionLaunchArgumentsCannotOverrideRuntimeMode() {
+        let defaults = makeDefaults(name: "release-mode-arguments")
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: ["feedmine", RuntimeModeLaunch.shadowArgument],
+            allowDeveloperOverrides: false
+        )
+
+        XCTAssertEqual(decision.mode, .v2Full)
+        XCTAssertEqual(decision.source, .none)
+    }
+
+    func testHarnessLaunchArgumentsCanStillSelectRuntimeMode() {
+        let defaults = makeDefaults(name: "test-mode-arguments")
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: ["feedmine", RuntimeModeLaunch.shadowArgument],
+            allowDeveloperOverrides: true
+        )
+
+        XCTAssertEqual(decision.mode, .mirroredShadow)
+        XCTAssertEqual(decision.source, .launchArguments)
+    }
+
+    func testFreshInstallUsesV2FullAsTheShippingDefault() {
+        let defaults = makeDefaults(name: "release-default")
+        let decision = RuntimeModeLaunch.decide(in: defaults, arguments: [])
+
+        XCTAssertEqual(decision.mode, .v2Full)
+        XCTAssertTrue(decision.ownsAcquisition)
+        XCTAssertEqual(decision.source, .none)
+        XCTAssertEqual(
+            decision.requested,
+            RequestedFeatures(shadow: false, v2UI: true, v2Network: true)
+        )
+    }
+
+    func testShippingDefaultFallsBackAtomicallyWhenV2CannotCompose() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        // RuntimeDatabase needs to create Feedmine/RuntimeV2 below Application Support. Occupying
+        // "Feedmine" with a regular file makes that composition fail deterministically without mocking
+        // the storage layer.
+        let blocker = root.appendingPathComponent("Feedmine")
+        try Data("not-a-directory".utf8).write(to: blocker)
+
+        let runtime = MainFeedRuntime.launch(
+            applicationSupportDirectory: root,
+            defaults: makeDefaults(name: "release-default-fallback"),
+            arguments: []
+        )
+        defer { runtime.stop() }
+
+        XCTAssertEqual(runtime.decision.mode, .legacy)
+        XCTAssertFalse(runtime.ownsAcquisition)
+        XCTAssertNil(runtime.presentation.store, "fallback must not leave V2 presentation in front")
+        XCTAssertFalse(LegacyAcquisitionGate.isClosed, "fallback must leave the legacy owner able to fetch")
+        XCTAssertTrue(runtime.diagnostics.contains("composition-failed="), runtime.diagnostics)
     }
 
     func testV2PresentationRequestIsHonouredOnTheNextLaunchAndLogsItsReason() {
@@ -155,6 +220,63 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertEqual(value.mediaSlot, .local(RenderImage(cacheKey: item.id, image: image)))
         XCTAssertEqual(value.card.media, .local(assetDigest: item.id))
         XCTAssertEqual(value.card.absoluteOrdinal, 3)
+    }
+
+    func testSessionLocalMediaDrawsThePrewarmedImage() throws {
+        let presentation = makePresentation()
+        let key = "main-feed|preset=everything|box=-"
+        presentation.beginSession(contextKey: key)
+        let cardID = try PublicationCardID(41)
+        let image = UIImage()
+        let rendered = RenderImage(cacheKey: "digest_r1", image: image)
+        let card = CardPresentation(
+            id: cardID,
+            absoluteOrdinal: 0,
+            title: "Prepared",
+            subtitle: nil,
+            media: .local(assetDigest: "digest"),
+            layout: .hero,
+            isBookmarked: false,
+            isRead: false
+        )
+
+        XCTAssertNotNil(presentation.applySnapshot(
+            makeSnapshot(contextKey: key, sequence: 1, cards: [card]),
+            localMedia: [cardID: rendered]
+        ))
+
+        XCTAssertEqual(
+            presentation.sections.first?.rows.first?.mediaSlot,
+            .local(rendered),
+            "a local publication reaches SwiftUI as the exact prewarmed pixels"
+        )
+    }
+
+    func testMissingPublishedBytesBecomeAPlaceholderNeverAnEmptyFrame() throws {
+        let presentation = makePresentation()
+        let key = "main-feed|preset=everything|box=-"
+        presentation.beginSession(contextKey: key)
+        let card = CardPresentation(
+            id: try PublicationCardID(42),
+            absoluteOrdinal: 0,
+            title: "Evicted",
+            subtitle: nil,
+            media: .local(assetDigest: "missing-digest"),
+            layout: .hero,
+            isBookmarked: false,
+            isRead: false
+        )
+
+        XCTAssertNotNil(presentation.applySnapshot(
+            makeSnapshot(contextKey: key, sequence: 1, cards: [card]),
+            localMedia: [:]
+        ))
+
+        XCTAssertEqual(
+            presentation.sections.first?.rows.first?.mediaSlot,
+            .placeholder(.article),
+            "published identity without local bytes degrades deterministically; the renderer never waits"
+        )
     }
 
     func testCardIdentityIsStableAcrossPublicationsAndDistinctPerItem() {
@@ -363,6 +485,43 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         )
     }
 
+    /// The runtime's acquisition catalogue follows the user's live source registry. Imports and
+    /// enablement changes must invalidate the descriptor snapshot instead of falling through to the
+    /// legacy fetcher, whose network path is closed in v2Full.
+    func testLiveSourceCatalogueMutationRestartsTheRuntimeOwner() async {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = MainFeedRuntime.launch(
+            applicationSupportDirectory: directory,
+            defaults: makeDefaults(name: "live-catalogue"),
+            arguments: [RuntimeModeLaunch.v2UIArgument, RuntimeModeLaunch.v2NetworkArgument]
+        )
+        defer { runtime.stop() }
+
+        let store = FeedStore.empty()
+        let loader = FeedLoader(store: store)
+        runtime.attach(loader: loader)
+        XCTAssertEqual(runtime.catalogueRestartCount, 0)
+
+        store.registry.sources = [
+            FeedSource(
+                title: "Imported after launch",
+                url: "https://example.invalid/imported.xml",
+                category: "Imported",
+                region: "imported"
+            )
+        ]
+
+        let deadline = Date().addingTimeInterval(1)
+        while runtime.catalogueRestartCount == 0, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(runtime.catalogueRestartCount, 1)
+        XCTAssertTrue(runtime.ownsAcquisition)
+        XCTAssertTrue(LegacyAcquisitionGate.isClosed)
+    }
+
     /// The session owns one selection, not the screen. A reader who moves to a bookmark box, a Smart
     /// Feed or a collection is on a surface the session's plan was not built for, and that surface draws
     /// its own legacy page — which the store still holds in this mode, because `LegacyAcquisitionGate`
@@ -425,6 +584,45 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         await waitForPageSource(.sessionSnapshot, in: runtime.presentation)
         XCTAssertEqual(runtime.presentation.sections.flatMap(\.rows).map(\.item.id), ["card:\(card.id)"])
         XCTAssertEqual(runtime.sessionSurface, .content)
+    }
+
+    /// A secondary selection may keep its own legacy rows only while the adopted session has not
+    /// published. As soon as that context's snapshot arrives, the surface handoff is complete and the
+    /// legacy rows must disappear. This is the Bookmark Box failure measured in baseline §8.62.
+    func testAdoptedBookmarkContextHandsTheSurfaceToItsSessionSnapshot() throws {
+        let presentation = makePresentation()
+        let mainKey = "main-feed|preset=everything|box=-"
+        let boxKey = "main-feed|preset=everything|box=7"
+
+        presentation.beginSession(contextKey: mainKey)
+        _ = presentation.publish(makePage(items: [makeItem(id: "legacy-main")], contextKey: mainKey))
+
+        presentation.beginSession(contextKey: boxKey, drawingLegacyUntilSnapshot: true)
+        _ = presentation.publish(makePage(items: [makeItem(id: "legacy-box")], contextKey: boxKey))
+        XCTAssertEqual(presentation.pageSource, .legacyPage)
+        XCTAssertEqual(presentation.sections.flatMap(\.rows).map(\.item.id), ["legacy-box"])
+
+        let card = MainFeedCardBridge.value(
+            item: makeItem(id: "runtime-box"),
+            ordinal: 0,
+            presentation: nil,
+            band: .card
+        ).card
+        XCTAssertNotNil(
+            presentation.applySnapshot(
+                makeSnapshot(contextKey: boxKey, sequence: 1, cards: [card])
+            )
+        )
+
+        XCTAssertEqual(presentation.pageSource, .sessionSnapshot)
+        XCTAssertEqual(
+            presentation.sections.flatMap(\.rows).map(\.item.id),
+            ["card:\(card.id)"]
+        )
+        XCTAssertFalse(
+            presentation.sections.flatMap(\.rows).contains { $0.item.id == "legacy-box" },
+            "the box's compatibility page is only a bridge until its adopted session publishes"
+        )
     }
 
     /// In every other mode the legacy page is still the page, unchanged, including `v2Presentation`,
@@ -1518,7 +1716,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         }
     }
 
-    private func makePage(items: [FeedItem]) -> MainFeedPage {
+    private func makePage(
+        items: [FeedItem],
+        contextKey: String = "main-feed|preset=everything|box=-"
+    ) -> MainFeedPage {
         let section = FeedLoader.DateSection(
             id: "ordered-results",
             title: "",
@@ -1529,7 +1730,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             sections: [section],
             cards: [],
             band: .card,
-            contextKey: "main-feed|preset=everything|box=-"
+            contextKey: contextKey
         )
     }
 

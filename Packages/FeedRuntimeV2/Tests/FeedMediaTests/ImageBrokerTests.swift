@@ -78,6 +78,45 @@ final class ImageBrokerTests: XCTestCase {
         XCTAssertFalse(materialized.isPlaceholder)
     }
 
+    func testPrewarmLocalMaterializesDurableBytesWithoutNetwork() async throws {
+        let directory = try TemporaryDirectory()
+        defer { directory.remove() }
+        let store = LocalAssetStore(rootDirectory: directory.url)
+        let body = MediaFixture.pngBytes
+        let digest = ContentDigest.sha256(body)
+        let identity = MediaAssetIdentity(
+            assetVersionID: AssetVersionID(contentDigest: digest, recipeVersion: .sourceBytes),
+            pixelWidth: 6,
+            pixelHeight: 4,
+            mimeType: "image/png"
+        )
+        let descriptor = MediaAssetDescriptor(identity: identity, byteCount: body.count)
+        _ = try store.commit(bytes: body, expecting: descriptor)
+
+        let transport = SpyHTTPTransport()
+        let clock = MediaClock(now: MediaInstant.epoch)
+        let cache = DecodedImageCache(
+            limits: MediaCacheLimits(decodedBytes: 1 << 20, unpublishedBytes: 1 << 20),
+            clock: clock,
+            reclaim: { await store.reclaim($0) }
+        )
+        let preparation = MediaPreparation(
+            transport: transport,
+            budget: .current,
+            decoder: ImageIODecoder(),
+            store: store,
+            cache: cache,
+            clock: clock
+        )
+        let broker = ImageBroker(preparation: preparation, cache: cache)
+
+        let materialized = await broker.prewarmLocal(identity)
+
+        XCTAssertNotNil(materialized.decodedImage)
+        await expectEqual(transport.callCount, 0)
+        await expectNotNil(cache.decoded(identity.assetVersionID))
+    }
+
     // MARK: single-flight
 
     func testTwoConcurrentPreparationsOfTheSameAssetCauseOneTransportCallAndOneDecode() async {

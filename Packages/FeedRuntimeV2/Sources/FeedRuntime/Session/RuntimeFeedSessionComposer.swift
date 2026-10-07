@@ -51,6 +51,19 @@ public protocol FeedCompositionAcquiring: Sendable {
     ) async -> AcquisitionRunSummary?
 }
 
+/// Prepares the selected sequence for publication without exposing media/network implementation to
+/// FeedRuntime. The app composition root is the only place that can see FeedStorage and FeedMedia
+/// together, so it implements this port and returns protocol-free publication plans.
+///
+/// A failed candidate is represented by a placeholder/no-media entry in its returned plan; media
+/// failure never erases otherwise publishable text.
+public protocol FeedCompositionMediaPreparing: Sendable {
+    func prepareMedia(
+        for sequence: EditorialSequence,
+        at: Date
+    ) async -> [PublishedCardMediaPlan]
+}
+
 public enum FeedSessionComposerError: Error, Equatable, Sendable {
     /// The composition root has no plan for this context. Composing would mean selecting under a plan
     /// nobody declared.
@@ -76,9 +89,10 @@ public enum FeedSessionComposerError: Error, Equatable, Sendable {
 /// the edition the snapshot names is read back after the commit, so the session is never handed a
 /// composition that was not durable.
 ///
-/// The composer deliberately prepares no media: a declared renderable candidate publishes as a
-/// deterministic placeholder (ADR-001 D14), which is what keeps the renderer free of network and keeps
-/// a launch's first page from waiting on bytes.
+/// Media is prepared through an injected port before publication. FeedRuntime never imports FeedMedia:
+/// the composition root performs that boundary crossing and returns protocol-free media plans. A
+/// candidate that cannot be prepared still becomes a deterministic placeholder, so media failure never
+/// makes text disappear and the renderer remains network-free.
 /// One composition decision, reported so a publication path is never silent.
 ///
 /// An episode that appends an edition is the most consequential thing the runtime does, and until this
@@ -143,6 +157,7 @@ public struct RuntimeFeedSessionComposer: FeedSessionComposer {
     private let repository: PublicationRepository
     private let plans: FeedPlanSource
     private let acquisition: (any FeedCompositionAcquiring)?
+    private let media: (any FeedCompositionMediaPreparing)?
     private let engine: SelectionEngine
     private let sequencer: EditorialSequencer
     private let coordinator: PublicationCoordinator
@@ -157,6 +172,7 @@ public struct RuntimeFeedSessionComposer: FeedSessionComposer {
         plans: FeedPlanSource,
         coordinator: PublicationCoordinator,
         acquisition: (any FeedCompositionAcquiring)? = nil,
+        media: (any FeedCompositionMediaPreparing)? = nil,
         engine: SelectionEngine = SelectionEngine(),
         sequencer: EditorialSequencer = EditorialSequencer(),
         observe: (@Sendable (FeedCompositionEvent) -> Void)? = nil
@@ -166,6 +182,7 @@ public struct RuntimeFeedSessionComposer: FeedSessionComposer {
         self.plans = plans
         self.coordinator = coordinator
         self.acquisition = acquisition
+        self.media = media
         self.engine = engine
         self.sequencer = sequencer
         self.supply = SelectionSupplyRepository()
@@ -275,13 +292,17 @@ public struct RuntimeFeedSessionComposer: FeedSessionComposer {
             : nil
         let sequence = sequencer.sequence(draft: draft, plan: input.plan, history: history ?? .empty)
 
-        // 6. Append. `nothingToPublish` is not a failure: an edition whose supply is short publishes
+        // 6. Prepare media outside the publication transaction. The port returns one plan per selected
+        //    revision; failed candidates stay explicit placeholders rather than becoming renderer work.
+        let mediaPlans = await media?.prepareMedia(for: sequence, at: at) ?? []
+
+        // 7. Append. `nothingToPublish` is not a failure: an edition whose supply is short publishes
         //    the segment it can and reports the shortfall.
         let outcome = await coordinator.publish(PublicationRequest(
             plan: input.plan,
             sequence: sequence,
             token: token,
-            media: [],
+            media: mediaPlans,
             activation: opened.activation
         ))
         switch outcome {
@@ -293,7 +314,7 @@ public struct RuntimeFeedSessionComposer: FeedSessionComposer {
             throw FeedSessionComposerError.publicationFailed(failure.description)
         }
 
-        // 7. Read back what is now durable: the edition row after the commit and the cards of that
+        // 8. Read back what is now durable: the edition row after the commit and the cards of that
         //    edition. The session's window is materialized from these rows and nothing else.
         guard let edition = try repository.edition(opened.edition.editionID) else {
             throw FeedSessionComposerError.editionUnavailable(opened.edition.editionID)

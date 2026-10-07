@@ -196,6 +196,83 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
         )
     }
 
+    func testBookmarkOperationRoundTripsTheListItBelongsTo() async throws {
+        let article = item(id: "item-operation-list")
+        let listID = try await store.bookmarkStore.createBookmarkList(name: "Operation list")
+
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-list-roundtrip",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+
+        let operation = try XCTUnwrap(
+            await store.bookmarkStore.newestOperationsBySubject().first {
+                $0.operationID == "op-list-roundtrip"
+            }
+        )
+        XCTAssertEqual(operation.listID, listID, "the operation payload must round-trip its list identity")
+        XCTAssertTrue(operation.wanted)
+    }
+
+    func testRemovingOneBoxDoesNotClearGlobalBookmarkWhileAnotherBoxStillOwnsIt() async throws {
+        let article = item(id: "item-multi-list")
+        let defaultList = store.bookmarkStore.defaultListID()
+        let secondList = try await store.bookmarkStore.createBookmarkList(name: "Second box")
+
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-multi-default",
+            listID: defaultList,
+            snapshot: BookmarkSnapshot(item: article, listID: defaultList, at: fixedDate),
+            at: fixedDate
+        )
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-multi-second",
+            listID: secondList,
+            snapshot: BookmarkSnapshot(item: article, listID: secondList, at: fixedDate),
+            at: fixedDate.addingTimeInterval(1)
+        )
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-multi-remove-default",
+            listID: defaultList,
+            at: fixedDate.addingTimeInterval(2)
+        )
+
+        XCTAssertTrue(
+            try await store.bookmarkStore.isBookmarkedAnywhere(itemID: article.id),
+            "the durable authority still has the item in the second box"
+        )
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.wanted,
+            true,
+            "bookmark overlay is global across boxes; removing one membership must not clear another"
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: defaultList),
+                subjectID: article.id
+            )?.wanted,
+            false
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: secondList),
+                subjectID: article.id
+            )?.wanted,
+            true
+        )
+    }
+
     // MARK: - Crash between the two databases
 
     func testCrashBetweenTheDatabasesIsRepairedByReconcile() async throws {
@@ -223,6 +300,135 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
 
         let secondReport = await bridge.reconcile(at: fixedDate.addingTimeInterval(1))
         XCTAssertEqual(secondReport, ReplayReport(applied: 0, failed: 0), "reconciling twice is not two writes")
+    }
+
+    func testLaunchReconcileRepairsBothBookmarkProjectionAndListMembership() async throws {
+        let article = item(id: "item-launch-reconcile")
+
+        // Simulate a process dying after user.sqlite committed but before either runtime projection.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-launch-reconcile",
+            snapshot: snapshot(article, at: fixedDate),
+            at: fixedDate
+        )
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertNil(try projections.projection(kind: .bookmark, subjectID: article.id))
+        let listID = await store.bookmarkStore.defaultListID()
+        XCTAssertNil(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )
+        )
+
+        let report = await bridge.reconcileForLaunch(at: fixedDate)
+
+        XCTAssertEqual(report, ReplayReport(applied: 2, failed: 0))
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.lastOperationID,
+            "op-launch-reconcile"
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.lastOperationID,
+            "op-launch-reconcile"
+        )
+        XCTAssertEqual(
+            await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1)),
+            ReplayReport(applied: 0, failed: 0),
+            "the launch repair is idempotent across both projections"
+        )
+    }
+
+    func testLaunchReconcileRemovesAStaleListMembershipAfterCrash() async throws {
+        let article = item(id: "item-stale-membership")
+        let listID = store.bookmarkStore.defaultListID()
+
+        _ = await bridge.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-membership-add",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+        XCTAssertEqual(
+            try UserStateProjectionStore(database: runtimeDatabase).listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            true
+        )
+
+        // Simulate the process dying after the authoritative removal committed but before the
+        // runtime projections were updated.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-membership-remove",
+            listID: listID,
+            at: fixedDate.addingTimeInterval(1)
+        )
+
+        _ = await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(2))
+
+        XCTAssertEqual(
+            try UserStateProjectionStore(database: runtimeDatabase).listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            false,
+            "launch recovery must replay removals, not only memberships that still exist"
+        )
+    }
+
+    func testSameSecondOperationsReplayInCommitOrderNotOperationIDOrder() async throws {
+        let article = item(id: "item-same-second")
+        let listID = store.bookmarkStore.defaultListID()
+
+        // Both operations deliberately share the same second. The ids are reverse-lexical relative to
+        // commit order so an ORDER BY operation_id tie-break picks the wrong one.
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: true,
+            operationID: "op-z-add",
+            listID: listID,
+            snapshot: BookmarkSnapshot(item: article, listID: listID, at: fixedDate),
+            at: fixedDate
+        )
+        _ = try await store.bookmarkStore.setBookmarked(
+            itemID: article.id,
+            wanted: false,
+            operationID: "op-a-remove",
+            listID: listID,
+            at: fixedDate
+        )
+
+        let newest = try XCTUnwrap(
+            await store.bookmarkStore.newestOperationsBySubject().first {
+                $0.subjectID == article.id
+            }
+        )
+        XCTAssertEqual(newest.operationID, "op-a-remove")
+        XCTAssertFalse(newest.wanted)
+
+        _ = await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1))
+        let projections = UserStateProjectionStore(database: runtimeDatabase)
+        XCTAssertEqual(
+            try projections.projection(kind: .bookmark, subjectID: article.id)?.wanted,
+            false
+        )
+        XCTAssertEqual(
+            try projections.listMembership(
+                listKey: UserStateBridge.listKey(for: listID),
+                subjectID: article.id
+            )?.wanted,
+            false
+        )
     }
 
     func testOnlyTheNewestOperationPerSubjectDecidesTheProjection() async throws {

@@ -98,6 +98,26 @@ public actor ImageBroker {
         )
     }
 
+    /// Prepares a published asset for presentation using only durable local bytes.
+    ///
+    /// This is intentionally separate from `prepare`: it has no URL and therefore cannot cross the
+    /// network boundary. A warm launch calls it before exposing a card whose publication names local
+    /// media, so the renderer later hits the decoded cache synchronously from its point of view.
+    public func prewarmLocal(_ identity: MediaAssetIdentity) async -> MaterializedImage {
+        if let image = await cache.decoded(identity.assetVersionID) {
+            return .image(image)
+        }
+        if let image = try? await preparation.materializeLocal(identity) {
+            return .image(image)
+        }
+        return .placeholder(
+            PlaceholderRecipe(
+                assetVersionID: identity.assetVersionID,
+                aspectRatio: identity.aspectRatio
+            )
+        )
+    }
+
     /// The only media path that may download. Concurrent requests for the same asset and size share
     /// one preparation.
     public func prepare(_ request: MediaPreparationRequest) async throws -> PreparedMedia {

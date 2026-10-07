@@ -370,9 +370,14 @@ final class MainFeedRuntime {
     static func launch(
         applicationSupportDirectory: URL = MainFeedRuntime.defaultApplicationSupportDirectory,
         defaults: UserDefaults = .standard,
-        arguments: [String] = ProcessInfo.processInfo.arguments
+        arguments: [String] = ProcessInfo.processInfo.arguments,
+        allowDeveloperOverrides: Bool = true
     ) -> MainFeedRuntime {
-        let decision = RuntimeModeLaunch.decide(in: defaults, arguments: arguments)
+        let decision = RuntimeModeLaunch.decide(
+            in: defaults,
+            arguments: arguments,
+            allowDeveloperOverrides: allowDeveloperOverrides
+        )
         let router = MainFeedIntentRouter()
 
         var composition: RuntimeCompositionRoot?
@@ -386,28 +391,37 @@ final class MainFeedRuntime {
             failure = "runtime-v2 composition failed: \(error.localizedDescription)"
         }
 
+        // Composition is part of the launch decision's ability to run. A requested `v2Full` whose
+        // database cannot open must not keep V2 presentation in front of the reader *and* close the
+        // legacy acquisition gate — that combination is an ownerless blank app. Fall back atomically:
+        // presentation and acquisition both remain legacy for this process, while the stored request
+        // remains V2 so the next launch retries after a transient failure.
+        let effectiveDecision: RuntimeLaunchDecision
+        if composition == nil, let failure {
+            effectiveDecision = RuntimeLaunchDecision(
+                mode: .legacy,
+                requested: decision.requested,
+                rejection: failure,
+                source: decision.source,
+                decidedAt: decision.decidedAt
+            )
+        } else {
+            effectiveDecision = decision
+        }
+
         let runtime = MainFeedRuntime(
-            decision: decision,
+            decision: effectiveDecision,
             composition: composition,
             compositionFailure: failure,
             router: router
         )
-        if decision.mode.runsShadow, let composition {
+        if effectiveDecision.mode.runsShadow, let composition {
             composition.installMirrorSink()
             composition.startDraining()
         }
-        // The one place the mode takes effect on the legacy producers (plan §13). It is installed here
-        // and not in `RuntimeCompositionRoot.compose` because composition is also what a test drives
-        // directly, and a process-wide gate installed by a test's composition would leak into every
-        // other test in the same process. `stop()` reopens it.
-        //
-        // The owner is the runtime that *composed*, not the mode that asked for one: a `v2Full` launch
-        // whose composition threw has no `V2FullRuntime` to acquire with, and closing its producers there
-        // would leave the launch with no owner at all — the cached page on screen and nothing able to
-        // fill it. `ownsAcquisition` is the same statement every other effect in this type routes by
-        // (`attach`, `adoptSelectionIfNeeded`, `handle`), and the shadow's install above is guarded the
-        // same way.
-        if runtime.ownsAcquisition {
+        // The one place the mode takes effect on the legacy producers (plan §13). Close the gate only
+        // after the acquiring runtime exists; a failed composition has deliberately fallen back above.
+        if effectiveDecision.mode.ownsAcquisition, composition?.full != nil {
             LegacyAcquisitionGate.close()
         }
         Log.feed.info("\(runtime.diagnostics)")
@@ -457,6 +471,12 @@ final class MainFeedRuntime {
             presentation.attach(loader)
             return
         }
+        // The source registry is live user state: imports and enable/disable changes after launch must
+        // replace the acquisition owner's catalogue. Observe its two revisions rather than individual
+        // UI commands so every mutation path has the same effect.
+        isCatalogueObservationAttached = true
+        armCatalogueObservation()
+
         // The session's plan is built from the loader's own selectors, so the selection it owns is known
         // before the catalogue arrives — and it is claimed before the legacy page is followed, or the
         // cached page would be materialized for a surface the session is about to own.
@@ -485,13 +505,55 @@ final class MainFeedRuntime {
     /// Whether the claim above is a bookmark box, so closing one adopts the unboxed feed back.
     private var claimedSelectionWasBox = false
 
-    /// The source set the launch registered, reused by every session the runtime adopts.
+    /// The current source-catalogue snapshot registered with the one acquisition owner.
     ///
-    /// `V2Acquisition.watch` *replaces* the one catalogue the runtime's acquisition actor holds, so a
-    /// session that watched a narrower set would shrink the launch's acquisition for good (baseline §8.62:
-    /// a bookmark box's session registered 1 target over the launch's 32). The launch's set is stated once,
-    /// from the loader's catalogue load, and every later session states the same one.
+    /// It is reused across context/session switches so a Bookmark Box cannot accidentally shrink the
+    /// process-wide watch to the subjects visible in that box. It is invalidated only when
+    /// `SourceRegistry.sourceRevision` or `enablementRevision` changes, at which point the same owner
+    /// re-registers the new full enabled set.
     private var launchDescriptors: [V2AcquisitionSourceDescriptor]?
+    private var isCatalogueObservationAttached = false
+    /// Observable proof for tests/diagnostics that a live catalogue mutation restarted the owner rather
+    /// than falling through to the gated legacy fetch path.
+    private(set) var catalogueRestartCount = 0
+
+    /// Re-arms observation of the source catalogue after each mutation.
+    ///
+    /// `withObservationTracking` fires once, so the callback must re-arm itself. Only revisions are
+    /// observed; deriving `enabledSources` here would allocate the complete source array on every
+    /// observation pass.
+    private func armCatalogueObservation() {
+        guard isCatalogueObservationAttached, let loader else { return }
+        withObservationTracking {
+            _ = loader.sourceRegistry.sourceRevision
+            _ = loader.sourceRegistry.enablementRevision
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isCatalogueObservationAttached else { return }
+                self.sourceCatalogueDidChange()
+                self.armCatalogueObservation()
+            }
+        }
+    }
+
+    /// Invalidates the acquisition owner's catalogue after an import, removal or enablement change.
+    ///
+    /// If the reader is currently on a compatibility surface, only the cached descriptor set is
+    /// invalidated; returning to a runtime-owned surface will rebuild it then. If the runtime-owned
+    /// surface is visible now, its session is restarted through the same owner so the new source set is
+    /// effective immediately without ever opening the legacy acquisition gate.
+    private func sourceCatalogueDidChange() {
+        launchDescriptors = nil
+        guard ownsAcquisition,
+              presentation.selectionContextKey == claimedSelection,
+              let full = composition?.full,
+              let loader
+        else { return }
+
+        catalogueRestartCount += 1
+        let surface = surfaceContexts.mainFeed(loader: loader)
+        startSession(full: full, surface: surface, loader: loader)
+    }
 
     /// Adopts a selection the reader moved to, when its cards are ones the runtime can compose.
     ///
@@ -541,12 +603,10 @@ final class MainFeedRuntime {
             // no sources, registers no acquisition target, and delivers an empty first edition; that is
             // exactly what a simulator launch showed (an edition and zero `acquisition_target` rows,
             // 35 s before `progressiveFetch starting`).
-            // The launch's source set is the launch's. A session the runtime *adopts* must not re-register
-            // the catalogue from whatever the loader's enabled set happens to be at that moment: the
-            // acquisition actor holds one catalogue for the runtime (`V2Acquisition.watch` replaces it), so
-            // a box's session registered 1 target over the launch's 32 and every later episode - the Main
-            // Feed's included - ran against that one (measured 2026-09-18, baseline §8.62: `catalogue=1`
-            // in the box's cold episode, where the launch's own episodes read `catalogue=32`).
+            // The process-wide source set is reused across *surface* adoption: a Bookmark Box must not
+            // replace the acquisition catalogue with a narrower selection. Imports and enablement changes
+            // invalidate `launchDescriptors` through the registry-revision observer above; only that
+            // explicit catalogue mutation causes this branch to rebuild the enabled set.
             let descriptors: [V2AcquisitionSourceDescriptor]
             if let launchDescriptors {
                 descriptors = launchDescriptors
@@ -573,8 +633,8 @@ final class MainFeedRuntime {
                     self.acquisitionReport = report
                     self.sessionState = .acquiring(sources: descriptors.count)
                 },
-                onSnapshot: { [weak self] snapshot in
-                    self?.presentation.applySnapshot(snapshot)
+                onSnapshot: { [weak self] snapshot, localMedia in
+                    self?.presentation.applySnapshot(snapshot, localMedia: localMedia)
                 }
             )
             // A session the runtime *adopts* composes on its own: opening one whose context has no stored
@@ -607,12 +667,11 @@ final class MainFeedRuntime {
             bookmarks: bookmarks,
             projections: UserStateProjectionStore(database: full.database)
         )
-        // The launch pass for the list membership. It is fired here, at the one moment the bridge and
-        // the loader exist together, and it is fire-and-forget because nothing waits on it: a box that
-        // opens before the pass finishes shows what the save path wrote, and the pass makes it whole.
-        // The whole-set `reconcile()` is *not* wired: it has no caller today, which §8.60 records.
+        // Repair both runtime projections from the durable user authority. This is deliberately
+        // fire-and-forget: current content can render immediately, while a crash that landed the
+        // user.sqlite operation but not one of the runtime projections is repaired idempotently.
         Task { @MainActor in
-            _ = await bridge.reconcileListMemberships()
+            _ = await bridge.reconcileForLaunch()
         }
         return RuntimeCardUserActions(
             cards: full.repository,
@@ -653,6 +712,7 @@ final class MainFeedRuntime {
         composition?.removeMirrorSink()
         composition?.stopDraining()
         sessionTask?.cancel()
+        isCatalogueObservationAttached = false
         // The mode's process-wide state goes back the way it was found: the mirror sink, the drain
         // loop and the acquisition gate. Production never calls this (the process is the lifetime);
         // tests do, and a closed gate left behind would refuse the next test's legacy fetches.
