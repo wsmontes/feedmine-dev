@@ -2872,6 +2872,14 @@ final class FeedStore {
         // "No articles found for" at 41 s while the fetch that would fill it kept running past 60 s.
         // The display still honours `settlesPhase` (it is the caller's statement); this layer is where the
         // caller's own preparation state is known.
+        //
+        // It is *not* bounded by a timer: a bound was tried here and it reintroduces a measured bug — the
+        // guard's own comment above cites a run where an empty publication settled `.empty` at 16 s and the
+        // surface claimed "No articles found for" while the fetch that would fill it kept running. The
+        // composition's own verdict (the cold-start attempt limit, the flush tail) is what answers, and it
+        // arrives: measured with an `Acoustics & Sound` filter over a database with no matching row —
+        // `.empty` at ~24 s, the surface naming the filter, and the background fill bringing 480 items
+        // afterwards.
         if items.isEmpty, settlesPhase, isPreparingInitialRunway, !isUserInitiated {
             Log.feed.info("[SetVisible] refused an empty answer while the initial runway is still preparing")
             return
