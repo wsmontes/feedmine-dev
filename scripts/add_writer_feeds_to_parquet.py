@@ -47,10 +47,10 @@ def main():
     df = table.to_pandas()
     print(f"Existing rows: {len(df)}")
 
-    # Dedup by canonical_xml_url
-    existing_canonical = set()
-    for url in df["canonical_xml_url"]:
-        existing_canonical.add(str(url).strip().lower())
+    # Dedup by canonical_xml_url.  ``canonical_url`` already case-folds the
+    # host; the case of path/query is part of the feed's identity, so it must
+    # not be folded again here.
+    existing_canonical = {str(url).strip() for url in df["canonical_xml_url"]}
 
     # Collect writer feeds from cache
     new_rows = []
@@ -64,7 +64,7 @@ def main():
             url = feed.get("url", "").strip()
             if not url:
                 continue
-            canonical = compute_canonical_xml_url(url).lower()
+            canonical = compute_canonical_xml_url(url)
             if canonical in existing_canonical or canonical in seen:
                 continue
             seen.add(canonical)

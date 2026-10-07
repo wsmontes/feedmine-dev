@@ -129,20 +129,26 @@ class YouTubeAPISource:
                     channel_country = channel_info.get("country", "")
 
                     rss_url = self._channel_rss_url(cid)
-                    # Country-aware: accept if channel country matches
-                    # profile's ISO2 or if no country filter is set
-                    if region_code and channel_country and channel_country.upper() != region_code.upper():
-                        # Channel is from a different country -- still include
-                        # but mark as non-national for sub-region classification
-                        pass
+                    # Country-aware: regionCode is search relevance, not proof
+                    # that the channel is national. A channel whose declared
+                    # country differs from the profile's region stays in the
+                    # list but is marked non-national, so it cannot be promoted
+                    # as a local source; the reason keeps both codes for review.
+                    mismatch = bool(
+                        region_code and channel_country
+                        and channel_country.upper() != region_code.upper()
+                    )
 
                     candidates.append(Candidate(
                         url=rss_url,
                         category="YouTube",
                         title=title,
                         genre="",
-                        national=True,
-                        national_reason=f"youtube_api:{channel_country}",
+                        national=not mismatch,
+                        national_reason=(
+                            f"youtube_api:{channel_country}!={region_code.upper()}"
+                            if mismatch else f"youtube_api:{channel_country}"
+                        ),
                     ))
         except Exception:
             pass

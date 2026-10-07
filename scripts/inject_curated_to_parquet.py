@@ -161,18 +161,14 @@ def main():
                     continue
 
                 canonical = compute_canonical_xml_url(url)
-                if canonical in seen_canonical:
-                    continue
-                seen_canonical.add(canonical)
-
                 sid = compute_source_id(url)
                 fetch_url = request_url(url)
                 title = (feed.get("title") or url)[:300]
                 source_page = feed.get("source_page", "") or ""
                 genre = feed.get("genre", "") or config["subcategory"]
 
-                # Source row
-                new_sources.append({
+                # Source row — one per canonical URL, built regardless of placement.
+                source_row = {
                     "source_id": sid,
                     "source_title": str(title),
                     "xml_url": fetch_url,
@@ -199,10 +195,15 @@ def main():
                     "oldest_item_at": None,
                     "ai_description": "",
                     "ai_tags": "",
-                })
-                cat_sources += 1
+                }
 
-                # Membership row
+                if canonical not in seen_canonical:
+                    seen_canonical.add(canonical)
+                    new_sources.append(source_row)
+                    cat_sources += 1
+
+                # Membership row — every unique placement is emitted, including one
+                # that adds a second country/category to an already-known source.
                 opml_file = f"90_countries/{country_fs}/{country_fs}.opml"
                 mid = make_membership_id(
                     source_id=sid,
@@ -247,7 +248,7 @@ def main():
         print(f"  {cat}: +{stats['sources']} sources, +{stats['memberships']} memberships")
     print(f"\n  TOTAL: +{total_sources} sources, +{total_memberships} memberships")
 
-    if total_sources == 0:
+    if total_sources == 0 and total_memberships == 0:
         print("\n  Nothing to inject!")
         return
 

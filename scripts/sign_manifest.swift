@@ -38,6 +38,17 @@ struct SignedManifest: Codable {
 
 // MARK: - Helpers
 
+/// Canonical form of the signed payload: compact JSON with lexicographically
+/// sorted keys and unescaped slashes. Signing and verification must use exactly
+/// these bytes — the same encoder on the same `UnsignedManifest` shape — or a
+/// valid signature can be rejected in another process or build. Any other
+/// verifier (the app's CatalogUpdateService) must reproduce this canonical form.
+let canonicalEncoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return encoder
+}()
+
 func printUsage() {
     let name = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "sign_manifest.swift"
     print("Usage:")
@@ -66,8 +77,13 @@ func signManifest(_ url: URL, privateKeyHex: String) throws {
     let unsigned = try JSONDecoder().decode(UnsignedManifest.self, from: data)
 
     // Sign the unsigned payload (excludes signature field)
-    let payload = try JSONEncoder().encode(unsigned)
+    let payload = try canonicalEncoder.encode(unsigned)
     let signature = try privateKey.signature(for: payload)
+    // Self-check: the canonical bytes must verify with the matching public key,
+    // otherwise the manifest is signed over a payload nobody can reproduce.
+    guard privateKey.publicKey.isValidSignature(signature, for: payload) else {
+        throw AppError.verificationFailed("self-check failed for the canonical payload")
+    }
 
     let signed = SignedManifest(
         schemaVersion: unsigned.schemaVersion,
@@ -114,7 +130,7 @@ func verifyManifest(_ url: URL, publicKeyHex: String) throws {
             UnsignedManifest.CatalogFile(path: $0.path, sha256: $0.sha256, bytes: $0.bytes)
         }
     )
-    let payload = try JSONEncoder().encode(unsigned)
+    let payload = try canonicalEncoder.encode(unsigned)
 
     guard publicKey.isValidSignature(sigData, for: payload) else {
         throw AppError.verificationFailed("signature is INVALID — manifest may be tampered")

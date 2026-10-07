@@ -5,9 +5,14 @@ Convert string_template.json + per-language translation files → Localizable.xc
 Usage:
   python3 scripts/translate.py [--lang pt-BR,es,...]
 
+``--lang`` defaults to ``all``: every language with a translation file is
+emitted.  Keys and localizations already present in the current catalog are
+preserved, so regenerating never drops hand-added strings or locales.
+
 Reads:
   - feedmine/Resources/string_template.json  (master list of all strings)
   - feedmine/Resources/translations/{lang}.json  (per-language translations)
+  - feedmine/Resources/Localizable.xcstrings  (current catalog, for preservation)
 
 Produces:
   - feedmine/Resources/Localizable.xcstrings
@@ -38,6 +43,26 @@ def load_template() -> dict:
         return json.load(f)
 
 
+def load_existing_catalog() -> dict:
+    """Return the ``strings`` map of the catalog currently on disk."""
+    if not OUTPUT_PATH.exists():
+        return {}
+    try:
+        with open(OUTPUT_PATH) as f:
+            return json.load(f).get("strings", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def catalog_units(strings: dict) -> set[tuple[str, str]]:
+    """Every (key, language) pair present in a catalog ``strings`` map."""
+    return {
+        (key, lang)
+        for key, entry in strings.items()
+        for lang in entry.get("localizations", {})
+    }
+
+
 def load_translations(lang: str) -> dict:
     """Load a translation file, return {key: value} dict."""
     path = TRANSLATIONS_DIR / f"{lang}.json"
@@ -51,8 +76,15 @@ def load_translations(lang: str) -> dict:
     return data
 
 
-def build_xcstrings(template: dict, langs: list[str]) -> dict:
-    """Build the full .xcstrings structure from template + translation files."""
+def build_xcstrings(template: dict, langs: list[str], existing: dict | None = None) -> dict:
+    """Build the full .xcstrings structure from template + translation files.
+
+    ``existing`` is the catalog currently on disk.  Keys it holds that the
+    template no longer lists are carried over verbatim, and localizations
+    without a translation file are kept, so regeneration never shrinks the
+    shipped catalog.
+    """
+    existing = existing or {}
     xcstrings = {
         "sourceLanguage": "en",
         "strings": {},
@@ -93,7 +125,17 @@ def build_xcstrings(template: dict, langs: list[str]) -> dict:
                     }
                 }
 
+        # Localizations present in the catalog but not covered by a
+        # translation file must not disappear.
+        for lang, localization in existing.get(key, {}).get("localizations", {}).items():
+            entry["localizations"].setdefault(lang, localization)
+
         xcstrings["strings"][key] = entry
+
+    # Keys that exist only in the current catalog are preserved unchanged.
+    for key, entry in existing.items():
+        if key not in strings:
+            xcstrings["strings"][key] = entry
 
     return xcstrings
 
@@ -101,8 +143,8 @@ def build_xcstrings(template: dict, langs: list[str]) -> dict:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Generate Localizable.xcstrings")
-    parser.add_argument("--lang", type=str, default="pt-BR,es",
-                        help="Comma-separated language codes to include")
+    parser.add_argument("--lang", type=str, default="all",
+                        help="Comma-separated language codes to include (default: all)")
     args = parser.parse_args()
 
     target_langs = [l.strip() for l in args.lang.split(",")]
@@ -118,8 +160,21 @@ def main():
     template = load_template()
     print(f"  {len(template['strings'])} strings in template")
 
+    existing = load_existing_catalog()
+    if existing:
+        print(f"  Current catalog: {len(existing)} strings (preserved)")
+
     print(f"Loading translations for: {', '.join(target_langs)}")
-    xcstrings = build_xcstrings(template, target_langs)
+    xcstrings = build_xcstrings(template, target_langs, existing)
+
+    # Never overwrite the shipped catalog with a narrower one.
+    lost_keys = set(existing) - set(xcstrings["strings"])
+    lost_units = catalog_units(existing) - catalog_units(xcstrings["strings"])
+    if lost_keys or lost_units:
+        raise SystemExit(
+            f"refusing to write {OUTPUT_PATH}: would drop {len(lost_keys)} key(s) "
+            f"and {len(lost_units)} key/language pair(s)"
+        )
 
     # Count coverage
     total = len(xcstrings["strings"])

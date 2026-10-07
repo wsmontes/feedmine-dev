@@ -100,12 +100,24 @@ def _build_country_qid_map(countries: dict, fresh: bool = False) -> dict[str, st
     return qid_map
 
 
+def _load_cached(path: Path) -> list[dict]:
+    """Return the last valid cached payload for a country, or [] when there is none."""
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def _fetch_universities_for_country(
     country_qid: str, country_name: str, country_slug: str
-) -> list[dict]:
+) -> list[dict] | None:
     """Query Wikidata for all universities in a given country.
 
-    Returns list of {name, website, youtube, instagram, twitter, wikipedia_url}.
+    Returns list of {name, website, youtube, instagram, twitter, wikipedia_url},
+    or None when the SPARQL request failed — a transient failure must not be cached
+    as "this country has no universities".
     """
     query = f"""
     SELECT DISTINCT ?item ?itemLabel ?website ?youtube ?instagram ?twitter ?wikipedia
@@ -140,7 +152,7 @@ def _fetch_universities_for_country(
             data = json.loads(resp.read())
     except Exception as e:
         print(f"  ✗ SPARQL query failed for {country_name}: {e}", file=sys.stderr)
-        return []
+        return None
 
     bindings = data.get("results", {}).get("bindings", [])
     unis: list[dict] = []
@@ -216,13 +228,14 @@ def build_university_list(
     for i, (slug, cdata) in enumerate(countries.items()):
         iso2 = cdata["iso2"].upper()
         country_qid = qid_map.get(iso2)
+        cache_path = by_country_dir / f"{slug}.json"
+
         if not country_qid:
             print(f"  [{i+1}/{total_countries}] ⚠ {cdata['name']}: no Q-ID, skipping", file=sys.stderr)
-            all_results[slug] = []
+            all_results[slug] = _load_cached(cache_path)
             continue
 
         # Check cache
-        cache_path = by_country_dir / f"{slug}.json"
         if not fresh and cache_path.exists():
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             print(f"  [{i+1}/{total_countries}] ✓ {cdata['name']}: {len(cached)} universities (cached)", file=sys.stderr)
@@ -231,6 +244,11 @@ def build_university_list(
 
         print(f"  [{i+1}/{total_countries}] Fetching universities in {cdata['name']}...", file=sys.stderr)
         unis = _fetch_universities_for_country(country_qid, cdata["name"], slug)
+        if unis is None:
+            # Transient failure: keep the last valid answer, never cache [].
+            print(f"    ✗ fetch failed — keeping previous data for {cdata['name']}", file=sys.stderr)
+            all_results[slug] = _load_cached(cache_path)
+            continue
         print(f"    → {len(unis)} universities found", file=sys.stderr)
 
         # Save per-country cache
@@ -240,15 +258,23 @@ def build_university_list(
         if i < total_countries - 1:
             time.sleep(0.5)  # Rate limit
 
-    # Write combined file
+    # Write combined file — merged over countries this run did not process, so a
+    # single-country run (--country X) never drops the rest of the aggregate.
     combined_path = DATA_DIR / "all_universities.json"
-    combined_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False), encoding="utf-8")
+    combined: dict[str, list[dict]] = {}
+    if combined_path.exists():
+        try:
+            combined = json.loads(combined_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            combined = {}
+    combined.update(all_results)
+    combined_path.write_text(json.dumps(combined, indent=2, ensure_ascii=False), encoding="utf-8")
 
     # Stats
-    total = sum(len(v) for v in all_results.values())
-    with_websites = sum(1 for v in all_results.values() for u in v if u["website"])
-    with_youtube = sum(1 for v in all_results.values() for u in v if u["youtube"])
-    print(f"\nTotal: {total} universities across {len(all_results)} countries", file=sys.stderr)
+    total = sum(len(v) for v in combined.values())
+    with_websites = sum(1 for v in combined.values() for u in v if u["website"])
+    with_youtube = sum(1 for v in combined.values() for u in v if u["youtube"])
+    print(f"\nTotal: {total} universities across {len(combined)} countries", file=sys.stderr)
     print(f"  With websites: {with_websites}", file=sys.stderr)
     print(f"  With YouTube:  {with_youtube}", file=sys.stderr)
     print(f"  Output: {combined_path}", file=sys.stderr)

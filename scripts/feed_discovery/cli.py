@@ -6,6 +6,7 @@ from pathlib import Path
 
 import aiohttp
 
+from ..catalog_collections import PRODUCTION_COUNTRY_COLLECTION
 from . import registry, report
 from .opml import emit_opml, existing_feed_urls
 from .pipeline import Config, candidates_to_opml_map, process_country
@@ -13,7 +14,7 @@ from .pipeline import Config, candidates_to_opml_map, process_country
 PKG_DIR = Path(__file__).resolve().parent
 DATA = PKG_DIR / "data"
 REPO_ROOT = PKG_DIR.parents[1]
-COUNTRIES_DIR = REPO_ROOT / "feedmine" / "Resources" / "Feeds" / "countries"
+COUNTRIES_DIR = REPO_ROOT / "feedmine" / "Resources" / "Feeds" / PRODUCTION_COUNTRY_COLLECTION
 
 
 def _parse_args(argv):

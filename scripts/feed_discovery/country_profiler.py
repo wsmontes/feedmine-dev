@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -15,6 +15,8 @@ from .sources._base import ProbeResult
 DEGRADE_AFTER_N_FAILURES = 3
 DISABLE_AFTER_N_FAILURES = 5
 PRIORITY_PENALTY = 5
+# A disabled source is re-probed after this window so it can recover.
+RECOVERY_BACKOFF_HOURS = 24
 
 
 class CountryProfiler:
@@ -131,6 +133,7 @@ class CountryProfiler:
                 profile, source_name,
                 success=result.success,
                 result_count=result.result_count,
+                latency_ms=result.latency_ms,
             )
 
         # Save
@@ -149,20 +152,26 @@ class CountryProfiler:
         profile.generation_version += 1
         profile.generated_at = datetime.now(timezone.utc).isoformat()
 
-        # Probe sources that are degraded to see if they recovered
+        # Re-probe degraded sources — and disabled ones whose backoff elapsed —
+        # so a source that recovers is not blocked forever.
+        now = datetime.now(timezone.utc)
         for name, metrics in profile.source_performance.items():
-            if name in profile.disabled_sources:
+            disabled = name in profile.disabled_sources
+            if disabled:
+                if not self._recovery_due(metrics, now):
+                    continue
+            elif metrics.success_rate >= 0.5 or metrics.total_calls == 0:
                 continue
-            if metrics.success_rate < 0.5 and metrics.total_calls > 0:
-                # Re-probe degraded sources periodically
-                source = self._source_instances.get(name)
-                if source and hasattr(source, "enabled") and source.enabled:
-                    cfg = profile.sources.get(name, SourceConfig(priority=99))
-                    try:
-                        result = await source.probe(profile, cfg, session)
-                        self._record_probe(profile, name, result.success, result.result_count)
-                    except Exception:
-                        self._record_probe(profile, name, False, 0)
+            source = self._source_instances.get(name)
+            if source and hasattr(source, "enabled") and source.enabled:
+                cfg = profile.sources.get(name, SourceConfig(priority=99))
+                try:
+                    result = await source.probe(profile, cfg, session)
+                    self._record_probe(
+                        profile, name, result.success, result.result_count, result.latency_ms
+                    )
+                except Exception:
+                    self._record_probe(profile, name, False, 0)
 
         save_profile(profile, output_dir=self.profiles_dir)
         return profile
@@ -217,6 +226,7 @@ class CountryProfiler:
         source_name: str,
         success: bool,
         result_count: int,
+        latency_ms: float = 0.0,
     ):
         """Record a probe result and apply degradation logic."""
         if source_name not in profile.source_performance:
@@ -225,14 +235,21 @@ class CountryProfiler:
         m = profile.source_performance[source_name]
         m.total_calls += 1
         m.total_results += result_count
+        m.total_latency_ms += latency_ms
         if success:
             m.success_count += 1
+            m.consecutive_failures = 0
         else:
             m.failure_count += 1
+            m.consecutive_failures += 1
         m.last_probe = datetime.now(timezone.utc).isoformat()
 
         # Degradation logic
         if source_name in profile.disabled_sources:
+            if success:
+                # The failure streak is what disabled it; a healthy probe clears
+                # the streak and restarts the backoff clock.
+                profile.disabled_sources.discard(source_name)
             return
 
         consecutive_failures = self._consecutive_zero_results(profile, source_name)
@@ -247,8 +264,21 @@ class CountryProfiler:
                 cfg.priority = max_priority + PRIORITY_PENALTY
 
     def _consecutive_zero_results(self, profile: CountryProfile, source_name: str) -> int:
-        """Count consecutive zero-result probes. Simplified: uses failure_count."""
+        """Consecutive failed probes for a source; a success resets the streak."""
         m = profile.source_performance.get(source_name)
         if m is None:
             return 0
-        return m.failure_count  # Simplified — in production would track streak
+        return m.consecutive_failures
+
+    @staticmethod
+    def _recovery_due(metrics: SourceMetrics, now: datetime) -> bool:
+        """True when a disabled source may be probed again."""
+        if not metrics.last_probe:
+            return True
+        try:
+            last_probe = datetime.fromisoformat(metrics.last_probe)
+        except ValueError:
+            return True
+        if last_probe.tzinfo is None:
+            last_probe = last_probe.replace(tzinfo=timezone.utc)
+        return now - last_probe >= timedelta(hours=RECOVERY_BACKOFF_HOURS)

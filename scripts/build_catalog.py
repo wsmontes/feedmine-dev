@@ -127,6 +127,19 @@ def media_kind_for_url(xml_url: str, default: str) -> str:
     return default
 
 
+# Every outline in the tree carries feedmineMediaKind. "text" is the generic
+# default the curation pipeline writes for whatever it has not classified, so
+# URL/filename evidence still wins for it; audio/video/forum are editorial
+# decisions and must not be overridden by the filename/podcast-host guess.
+EXPLICIT_MEDIA_KINDS = frozenset({"audio", "video", "forum"})
+
+
+def declared_media_kind(element: ET.Element) -> str | None:
+    """Explicit editorial media kind, when it is more than the generic default."""
+    raw = (element.attrib.get("feedmineMediaKind") or "").strip().lower()
+    return raw if raw in EXPLICIT_MEDIA_KINDS else None
+
+
 def append_file_node(nodes: list[InputNode], file_name: str, kind: int) -> None:
     key = slug(file_name)
     if nodes and nodes[-1].key == key:
@@ -240,7 +253,7 @@ def iter_outline_occurrences(
         )
         node_path = folder + category_nodes
         title = name or (stack[-1][0] if stack else fallback_category)
-        media_kind = media_kind_for_url(xml_url, default_media_kind)
+        media_kind = declared_media_kind(element) or media_kind_for_url(xml_url, default_media_kind)
         yield Occurrence(
             title=title,
             declared_url=xml_url,

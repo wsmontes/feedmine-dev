@@ -5,7 +5,8 @@ Distribute YouTube channels from wikipedia scraping into country OPMLs.
 Maps Wikipedia languages → countries via countries.json, then adds YouTube
 RSS feeds into each country's OPML file under a <outline text="YouTube"> section.
 
-Also updates the main youtube.opml with all channels.
+The aggregate youtube.opml/youtube_news.opml files were removed when the tree
+was reorganized into topic subdirectories; country OPMLs are the only target.
 
 Usage:
     python3 scripts/youtube_opml_distributor.py           # dry-run (show what would change)
@@ -20,13 +21,18 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import defaultdict
 
+try:
+    from scripts.catalog_collections import PRODUCTION_COUNTRY_COLLECTION
+except ModuleNotFoundError:  # Direct ``python3 scripts/...`` execution.
+    from catalog_collections import PRODUCTION_COUNTRY_COLLECTION
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHANNELS_JSON = PROJECT_ROOT / "scripts/feed_discovery/data/youtube_channels_wikipedia.json"
-COUNTRIES_JSON = Path(".claude/worktrees/feed-discovery/scripts/feed_discovery/data/countries.json")
-COUNTRIES_OPML_DIR = PROJECT_ROOT / "feedmine/Resources/Feeds/countries"
-MAIN_YOUTUBE_OPML = PROJECT_ROOT / "feedmine/Resources/Feeds/youtube.opml"
-MAIN_YOUTUBE_NEWS_OPML = PROJECT_ROOT / "feedmine/Resources/Feeds/youtube_news.opml"
+COUNTRIES_JSON = PROJECT_ROOT / "scripts/feed_discovery/data/countries.json"
+COUNTRIES_OPML_DIR = (
+    PROJECT_ROOT / "feedmine/Resources/Feeds" / PRODUCTION_COUNTRY_COLLECTION
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -245,66 +251,6 @@ def main():
             print(f"  {slug}: +{s['added']} channels {'[DRY RUN]' if dry_run else '✓'}", file=sys.stderr)
             total_added += s["added"]
     print(f"  Total additions: {total_added} (across {sum(1 for s in country_stats.values() if s['added']>0)} countries)", file=sys.stderr)
-
-    # ── Update main youtube.opml ───────────────────────────────────────────
-    print(f"\n{'='*60}", file=sys.stderr)
-    print("Main youtube.opml update:", file=sys.stderr)
-
-    yt_tree = parse_opml(MAIN_YOUTUBE_OPML)
-    if yt_tree is not None:
-        yt_body = yt_tree.getroot().find("body")
-        yt_existing = get_existing_urls(yt_body) if yt_body is not None else set()
-
-        # Collect ALL unique channels (deduped by feed_url)
-        seen_feeds: set[str] = set()
-        all_unique: list[dict] = []
-        for ch in ready:
-            feed = ch.get("feed_url", "")
-            if feed and feed not in seen_feeds:
-                seen_feeds.add(feed)
-                all_unique.append(ch)
-
-        # Create a "Wikipedia Most Subscribed" section
-        wiki_section = None
-        for outline in yt_body.findall("outline"):
-            if outline.get("text") == "Wikipedia Most Subscribed":
-                wiki_section = outline
-                break
-
-        if wiki_section is None:
-            wiki_section = ET.SubElement(yt_body, "outline", {"text": "Wikipedia Most Subscribed"})
-
-        yt_added = add_channels_to_section(wiki_section, all_unique, yt_existing)
-        print(f"  youtube.opml: +{yt_added} new channels {'[DRY RUN]' if dry_run else '✓'}", file=sys.stderr)
-
-        if yt_added > 0 and write_mode:
-            write_opml_simple(yt_tree, MAIN_YOUTUBE_OPML)
-    else:
-        print(f"  ⚠ Could not parse {MAIN_YOUTUBE_OPML}", file=sys.stderr)
-
-    # ── Update youtube_news.opml ───────────────────────────────────────────
-    yt_news_tree = parse_opml(MAIN_YOUTUBE_NEWS_OPML)
-    if yt_news_tree is not None:
-        ytn_body = yt_news_tree.getroot().find("body")
-        ytn_existing = get_existing_urls(ytn_body) if ytn_body is not None else set()
-
-        # Find channels that appear to be news-related (heuristic-based)
-        news_keywords = ["news", "notícias", "noticias", "journal", "tv", "channel",
-                         "times", "today", "news24", "news18", "aaj tak", "abp",
-                         "ndtv", "bbc", "cnn", "wion", "republic", "times now",
-                         "india today", "zeenews"]
-        news_channels = []
-        for ch in ready:
-            name_lower = ch["channel_name"].lower()
-            if any(kw in name_lower for kw in news_keywords):
-                news_channels.append(ch)
-
-        if news_channels:
-            news_section = find_or_create_yt_section(ytn_body)
-            n_added = add_channels_to_section(news_section, news_channels, ytn_existing)
-            print(f"  youtube_news.opml: +{n_added} news channels {'[DRY RUN]' if dry_run else '✓'}", file=sys.stderr)
-            if n_added > 0 and write_mode:
-                write_opml_simple(yt_news_tree, MAIN_YOUTUBE_NEWS_OPML)
 
     print(f"\n{'='*60}", file=sys.stderr)
     if dry_run:

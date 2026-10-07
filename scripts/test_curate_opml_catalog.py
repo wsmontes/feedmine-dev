@@ -201,6 +201,24 @@ class CurateOPMLCatalogTests(unittest.TestCase):
         self.assertEqual(normalize_language("Portuguese"), "pt")
         self.assertEqual(normalize_language("pt_br"), "pt-BR")
 
+    def test_language_scripts_survive_normalization(self):
+        self.assertEqual(normalize_language("zh-Hans"), "zh-Hans")
+        self.assertEqual(normalize_language("zh-Hant"), "zh-Hant")
+        self.assertEqual(normalize_language("zh-hant-HK"), "zh-Hant-HK")
+        self.assertEqual(normalize_language("sr-Latn"), "sr-Latn")
+        self.assertEqual(normalize_language("en-US"), "en-US")
+        self.assertEqual(normalize_language("es-419"), "es-419")
+        self.assertEqual(normalize_language("eng"), "eng")
+        # Deprecated ISO 639 spellings are mapped to their current form.
+        self.assertEqual(normalize_language("in"), "id")
+        self.assertEqual(normalize_language("iw"), "he")
+
+    def test_non_language_text_is_not_sliced_into_a_tag(self):
+        self.assertEqual(normalize_language("english junk"), None)
+        self.assertEqual(normalize_language("nan"), None)
+        self.assertEqual(normalize_language(""), None)
+        self.assertEqual(normalize_language(None), None)
+
     def test_source_identity_matches_runtime_normalization(self):
         variants = [
             "http://www.Example.com/feed/",

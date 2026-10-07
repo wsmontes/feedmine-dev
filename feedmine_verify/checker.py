@@ -162,7 +162,7 @@ async def _check_single(
 
     # ---- Depth 3: Freshness ---------------------------------------------------
     fresh = await check_freshness(session, url, timeout)
-    result.newest_post_date = fresh.get("newest_post_date")  # type: ignore[arg-type]
+    result.newest_post_date = fresh.get("newest_post_date")
     result.days_since_last_post = fresh.get("days_since_last_post")
     result.freshness_status = fresh["freshness_status"]
 

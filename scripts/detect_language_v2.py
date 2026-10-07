@@ -6,8 +6,9 @@ Strategy:
   2. Fall back to feed_title + feed_description from parquet if no articles.
   3. Run langdetect on the combined text for each feed.
   4. Write language attribute on each <outline type="rss"> element in OPMLs.
-  5. Also update feed_reported_language in the parquet.
-  6. Only write when confidence >= 0.9.
+  5. The corpus parquet is read-only here: feed_reported_language is refreshed by
+     the fetch/enrich pipeline, not by this script.
+  6. Only write when confidence >= 0.9; weaker inferences are reported as proposals.
 
 Usage:
   python3 scripts/detect_language_v2.py          # dry-run
@@ -224,6 +225,7 @@ def main():
         "by_language": defaultdict(int),
         "by_method": defaultdict(int),
         "changes": [],
+        "proposals": [],
     }
 
     for opml_path in opml_files:
@@ -260,6 +262,23 @@ def main():
                         report["skipped"] += 1
                         if report["skipped"] <= 5:
                             print(f"  SKIP  [{country or 'topic':20s}] {feed_title[:60]}")
+                        continue
+
+                    # Documented contract: only write at or above MIN_CONFIDENCE.
+                    # Weaker inferences are proposals for review, never mutations.
+                    if confidence < MIN_CONFIDENCE:
+                        report["skipped"] += 1
+                        report["proposals"].append({
+                            "country": country or "topic",
+                            "title": feed_title[:100],
+                            "old_lang": existing_lang,
+                            "proposed_language": lang,
+                            "confidence": round(confidence, 3),
+                            "method": method,
+                        })
+                        if len(report["proposals"]) <= 5:
+                            print(f"  PROPOSE [{country or 'topic':20s}] {feed_title[:60]}  "
+                                  f"→ {lang} conf={confidence:.2f} ({method}, below {MIN_CONFIDENCE})")
                         continue
 
                     if lang_base(lang) == lang_base(existing_lang):
@@ -300,7 +319,8 @@ def main():
     print(f"Total feeds:    {report['total_feeds']:6d}")
     print(f"Detected:       {report['detected']:6d} (new/changed language)")
     print(f"Unchanged:      {report['unchanged']:6d}")
-    print(f"Skipped:        {report['skipped']:6d} (insufficient text)")
+    print(f"Skipped:        {report['skipped']:6d} (insufficient text / below conf {MIN_CONFIDENCE})")
+    print(f"Proposals:      {len(report['proposals']):6d} (not written)")
     print(f"\nBy method:")
     for method, count in sorted(report["by_method"].items(), key=lambda x: -x[1]):
         print(f"  {method}: {count:5d}")

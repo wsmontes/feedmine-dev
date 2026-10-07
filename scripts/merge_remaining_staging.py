@@ -94,12 +94,20 @@ def main():
         p_body = p_root.find("body")
         if p_body is None: continue
 
-        existing_urls = set()
+        # Canonical source identity: dedupe against production *and* within this batch.
+        existing_ids = set()
         for o in p_body.iter("outline"):
             u = o.get("xmlUrl", "")
-            if u: existing_urls.add(u.strip().rstrip("/").lower())
+            if u: existing_ids.add(compute_source_id(u))
 
-        truly_new = [f for f in staging_feeds if f["url"].strip().rstrip("/").lower() not in existing_urls]
+        truly_new = []
+        for f in staging_feeds:
+            sid = compute_source_id(f["url"])
+            if sid in existing_ids:
+                skipped_existing += 1
+                continue
+            existing_ids.add(sid)
+            truly_new.append(f)
         if not truly_new: continue
 
         lang = infer_lang(slug, enriched)

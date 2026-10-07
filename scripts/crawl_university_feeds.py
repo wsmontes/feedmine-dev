@@ -264,10 +264,9 @@ async def crawl_all_countries(
             continue
 
         output_file = OUTPUT_DIR / f"{slug}_feeds.json"
-        if skip_existing and output_file.exists():
-            existing = json.loads(output_file.read_text(encoding="utf-8"))
-            n = existing.get("universities_processed", 0)
-            f = len(existing.get("feeds", []))
+        # --fresh invalidates both cache levels: the per-country output files and
+        # the per-university crawl cache used below.
+        if skip_existing and not fresh and output_file.exists():
             skipped += 1
             continue
 
@@ -454,8 +453,9 @@ def main():
     parser.add_argument("--max", type=int, help="Max universities per country")
     parser.add_argument("--fresh", action="store_true", help="Ignore caches and re-crawl")
     parser.add_argument("--timeout", type=int, default=20, help="Per-request timeout in seconds")
-    parser.add_argument("--skip-existing", action="store_true", default=True,
-                        help="Skip countries that already have output files")
+    parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True,
+                        help="Skip countries that already have output files "
+                             "(use --no-skip-existing to force a re-crawl)")
     args = parser.parse_args()
 
     if args.all:

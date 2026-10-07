@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .constants import PERMANENT_DEAD_STATUSES
 from .models import CheckResult
 
 
 def clean_dead_feeds(results: list[CheckResult], root_dir: Path) -> int:
     """Remove feeds whose final status is ``dead`` from their OPML files.
 
-    Only touches files that actually contain dead feeds.  Returns the number
-    of files modified.
+    Only feeds the server confirmed are *permanently* gone (404/410) are
+    removed.  Unresolved DNS/TLS failures, rate limits and 5xx responses are
+    transient, so those outlines are left in place for manual review.
+
+    Only touches files that actually contain removable feeds.  Returns the
+    number of files modified.
     """
     # Build: file → set of dead URLs
     dead_by_file: dict[str, set[str]] = {}
     for r in results:
-        if r.status == "dead":
+        if r.status == "dead" and r.status_code in PERMANENT_DEAD_STATUSES:
             for sf in r.source_files:
                 dead_by_file.setdefault(sf, set()).add(r.url)
 
@@ -67,7 +73,11 @@ def _strip_feeds(path: Path, dead_urls: set[str]) -> bool:
 
 
 def _write_opml(tree: ET.ElementTree, path: Path) -> None:
-    """Write *tree* back to *path* with decent formatting."""
+    """Write *tree* back to *path* with decent formatting.
+
+    Written through a sibling temporary file and ``os.replace`` so an
+    interrupted run can never leave a half-written catalog file behind.
+    """
     root = tree.getroot()
 
     # Indent for readability
@@ -79,7 +89,9 @@ def _write_opml(tree: ET.ElementTree, path: Path) -> None:
     if not text.startswith("<?xml"):
         text = '<?xml version="1.0" encoding="UTF-8"?>\n' + text
 
-    path.write_text(text, encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _indent(elem: ET.Element, level: int = 0) -> None:

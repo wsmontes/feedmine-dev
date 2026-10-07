@@ -86,7 +86,7 @@ def enrich(opml_base: Path, countries_json: Path, output_path: Path) -> dict:
     """Scan OPML directories and produce countries_enriched.json.
 
     Args:
-        opml_base: Path to feedmine/Resources/Feeds/countries/
+        opml_base: Path to feedmine/Resources/Feeds/90_countries/
         countries_json: Path to countries.json
         output_path: Where to write countries_enriched.json
 

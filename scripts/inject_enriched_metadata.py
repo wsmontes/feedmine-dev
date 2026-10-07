@@ -36,6 +36,26 @@ except ModuleNotFoundError:
 # Helpers (mirroring curate_opml_catalog.py logic)
 # ---------------------------------------------------------------------------
 
+def _as_aware_utc(value: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC (naive values are read as UTC)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_now(value: str | None) -> datetime:
+    """Parse the --now argument (ISO-8601) into an aware UTC datetime."""
+    if not value:
+        return datetime.now(timezone.utc)
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return _as_aware_utc(datetime.fromisoformat(text))
+    except ValueError as exc:
+        raise SystemExit(f"--now is not a valid ISO-8601 timestamp: {value!r}") from exc
+
+
 def activity_for(latest_item_at_str: str | None, articles_fetched: int, now: datetime) -> str:
     """Classify activity: prolific, active, quiet, dormant."""
     if not latest_item_at_str or articles_fetched < 1:
@@ -44,11 +64,11 @@ def activity_for(latest_item_at_str: str | None, articles_fetched: int, now: dat
         ts = latest_item_at_str
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
-        latest = datetime.fromisoformat(ts)
+        latest = _as_aware_utc(datetime.fromisoformat(ts))
     except (ValueError, TypeError):
         return "dormant"
 
-    age = now - latest
+    age = _as_aware_utc(now) - latest
     if age <= timedelta(days=14) and articles_fetched >= 5:
         return "prolific"
     if age <= timedelta(days=90):
@@ -128,7 +148,7 @@ def language_label(lang: str | None) -> str:
 def inject(args: argparse.Namespace) -> dict:
     sources_path: Path = args.parquet
     feeds_root: Path = args.feeds_root
-    now = args.now or datetime.now(timezone.utc)
+    now = _parse_now(args.now)
 
     if not sources_path.exists():
         raise FileNotFoundError(f"Parquet not found: {sources_path}")
@@ -163,13 +183,16 @@ def inject(args: argparse.Namespace) -> dict:
 
     # ── 2. Scan OPML files and update ─────────────────────────────────────
     updated_count = 0
+    unchanged_count = 0
     skipped_count = 0
     not_found = 0
     files_touched = set()
 
-    # Backup first
-    backup_dir = feeds_root.parent / "Feeds.backup.inject"
-    if not args.no_backup:
+    # Backup first. A dry run writes nothing, so it takes no backup and restores nothing.
+    if args.dry_run:
+        print("Dry run: the feeds tree will not be touched")
+    elif not args.no_backup:
+        backup_dir = feeds_root.parent / "Feeds.backup.inject"
         if backup_dir.exists():
             shutil.rmtree(backup_dir)
         shutil.copytree(feeds_root, backup_dir)
@@ -184,7 +207,7 @@ def inject(args: argparse.Namespace) -> dict:
 
         # Find all outline elements and check if they match our enriched sources
         def replace_outline(match):
-            nonlocal modified
+            nonlocal modified, updated_count, unchanged_count, skipped_count
             element_str = match.group(0)
 
             # Extract xmlUrl
@@ -200,7 +223,8 @@ def inject(args: argparse.Namespace) -> dict:
             if data is None:
                 return element_str
 
-            # Skip if already has a substantial enriched description (not a generic placeholder)
+            # Keep a substantial, non-generic curated description; every other attribute
+            # is derived from the parquet and is refreshed field by field below.
             desc_match = re.search(r'description="([^"]*)"', element_str)
             existing_desc = desc_match.group(1) if desc_match else ""
             # Generic placeholders that should be replaced
@@ -210,10 +234,9 @@ def inject(args: argparse.Namespace) -> dict:
                 existing_desc.startswith("Artist blog") or
                 len(existing_desc) < 30
             )
-            if not is_generic and existing_desc and len(existing_desc) >= 30:
-                nonlocal skipped_count
+            keep_description = bool(existing_desc) and not is_generic and len(existing_desc) >= 30
+            if keep_description:
                 skipped_count += 1
-                return element_str
 
             # Compute metadata
             activity = activity_for(data["latest_item_at"], data["articles_fetched"], now)
@@ -225,33 +248,29 @@ def inject(args: argparse.Namespace) -> dict:
             lang_match = re.search(r'language="([^"]*)"', element_str)
             lang = language_label(data["language"] or (lang_match.group(1) if lang_match else ""))
 
-            # Build new attributes
-            new_attrs = []
-            new_attrs.append(f'description="{_escape_xml(data["description"])}"')
-            new_attrs.append(f'category="{_escape_xml(data["tags"])}"')
-            new_attrs.append(f'feedmineNature="{nature}"')
-            new_attrs.append(f'feedmineActivity="{activity}"')
-            new_attrs.append(f'feedmineArticlesFetched="{data["articles_fetched"]}"')
-            new_attrs.append(f'feedmineQualityScore="{score}"')
-            new_attrs.append(f'feedmineDefaultEnabled="{enabled}"')
-
+            # Build new attributes (name, value) — existing values are replaced in place
+            new_attrs: list[tuple[str, str]] = []
+            if not keep_description:
+                new_attrs.append(("description", _escape_xml(data["description"])))
+            new_attrs.append(("category", _escape_xml(data["tags"])))
+            new_attrs.append(("feedmineNature", nature))
+            new_attrs.append(("feedmineActivity", activity))
+            new_attrs.append(("feedmineArticlesFetched", str(data["articles_fetched"])))
+            new_attrs.append(("feedmineQualityScore", str(score)))
+            new_attrs.append(("feedmineDefaultEnabled", enabled))
             if lang:
-                new_attrs.append(f'language="{lang}"')
+                new_attrs.append(("language", lang))
             if data["site_url"] and "htmlUrl=" not in element_str:
-                new_attrs.append(f'htmlUrl="{_escape_xml(data["site_url"])}"')
+                new_attrs.append(("htmlUrl", _escape_xml(data["site_url"])))
 
-            # Inject before the closing />
-            attr_str = element_str.rstrip("/>").rstrip()
-            # Avoid duplicating existing attrs
-            existing_attr_names = set(re.findall(r'(\S+)="[^"]*"', element_str))
-            for attr in new_attrs:
-                attr_name = attr.split("=")[0]
-                if attr_name not in existing_attr_names:
-                    attr_str += " " + attr
+            attr_str = element_str
+            for attr_name, attr_value in new_attrs:
+                attr_str = _set_attr(attr_str, attr_name, attr_value)
 
-            attr_str += " />"
+            if attr_str == element_str:
+                unchanged_count += 1
+                return element_str
             modified = True
-            nonlocal updated_count
             updated_count += 1
             return attr_str
 
@@ -259,8 +278,9 @@ def inject(args: argparse.Namespace) -> dict:
         new_content = re.sub(r'<outline[^>]+/>', replace_outline, content)
 
         if modified:
-            opml_path.write_text(new_content, encoding="utf-8")
             files_touched.add(str(opml_path.relative_to(feeds_root)))
+            if not args.dry_run:
+                opml_path.write_text(new_content, encoding="utf-8")
 
     # ── 3. Report ─────────────────────────────────────────────────────────
     # Check for not-found
@@ -277,23 +297,33 @@ def inject(args: argparse.Namespace) -> dict:
     print(f"\n{'='*60}")
     print(f"INJECTION RESULTS:")
     print(f"  Updated:  {updated_count}")
-    print(f"  Skipped (had desc): {skipped_count}")
+    print(f"  Unchanged: {unchanged_count}")
+    print(f"  Kept editorial desc: {skipped_count}")
     print(f"  Not found in OPML: {not_found}")
     print(f"  Files touched: {len(files_touched)}")
 
     if args.dry_run:
-        print("\n  DRY RUN — no files were modified")
-        # Restore backup if dry run
-        if not args.no_backup and backup_dir.exists():
-            shutil.rmtree(feeds_root)
-            shutil.move(str(backup_dir), str(feeds_root))
+        print("\n  DRY RUN — no files were modified (nothing written, deleted or restored)")
 
-    return {"updated": updated_count, "skipped": skipped_count, "not_found": not_found}
+    return {
+        "updated": updated_count,
+        "unchanged": unchanged_count,
+        "skipped": skipped_count,
+        "not_found": not_found,
+    }
 
 
 def _escape_xml(s: str) -> str:
     """Escape special XML characters."""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _set_attr(element_str: str, name: str, value: str) -> str:
+    """Replace an attribute value in place, or append the attribute before ``/>``."""
+    pattern = re.compile(rf'(?<=\s){re.escape(name)}="[^"]*"')
+    if pattern.search(element_str):
+        return pattern.sub(f'{name}="{value}"', element_str, count=1)
+    return element_str.rstrip("/>").rstrip() + f' {name}="{value}" />'
 
 
 def parse_args() -> argparse.Namespace:

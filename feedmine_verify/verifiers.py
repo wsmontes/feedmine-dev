@@ -80,6 +80,19 @@ async def _get_reachability(
 # Depth 2 — Content Validity
 # ---------------------------------------------------------------------------
 
+async def _read_capped(content: aiohttp.StreamReader, limit: int) -> bytes:
+    """Read up to *limit* bytes, tolerating short reads from the stream."""
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = await content.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 async def check_content_validity(
     session: aiohttp.ClientSession,
     url: str,
@@ -92,7 +105,7 @@ async def check_content_validity(
             timeout=aiohttp.ClientTimeout(total=timeout_sec),
             allow_redirects=True,
         ) as resp:
-            body = await resp.content.read(MAX_BODY_BYTES)
+            body = await _read_capped(resp.content, MAX_BODY_BYTES)
             content_type = resp.content_type or ""
             body_size = len(body)
             is_valid = _is_feed_xml(body)
@@ -107,15 +120,24 @@ async def check_content_validity(
 
 
 def _is_feed_xml(data: bytes) -> bool:
-    """Try to parse *data* as XML and check the root element."""
+    """Check the document's first element without requiring the whole body.
+
+    Only the root start tag is inspected, so a feed larger than
+    ``MAX_BODY_BYTES`` (truncated by design) is still recognised.  XML bytes
+    are handed to the parser unchanged, so the encoding declared by the
+    document is honoured instead of forcing UTF-8.
+    """
     if not data:
         return False
+    parser = ET.XMLPullParser(events=("start",))
     try:
-        root = ET.fromstring(data[:MAX_BODY_BYTES].decode("utf-8", errors="replace"))
-        tag = root.tag.lower().split("}")[-1]  # strip namespace
-        return tag in FEED_ROOT_TAGS
-    except (ET.ParseError, UnicodeDecodeError, LookupError):
+        parser.feed(data[:MAX_BODY_BYTES])
+        for _event, element in parser.read_events():
+            tag = element.tag.lower().split("}")[-1]  # strip namespace
+            return tag in FEED_ROOT_TAGS
+    except (ET.ParseError, UnicodeDecodeError, LookupError, ValueError):
         return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +181,7 @@ async def check_freshness(
             timeout=aiohttp.ClientTimeout(total=timeout_sec),
             allow_redirects=True,
         ) as resp:
-            body = await resp.content.read(MAX_BODY_BYTES)
+            body = await _read_capped(resp.content, MAX_BODY_BYTES)
     except aiohttp.ClientError:
         return {"newest_post_date": None, "days_since_last_post": None, "freshness_status": ""}
 
@@ -174,7 +196,8 @@ async def check_freshness(
 
     status = "stale" if delta > STALE_THRESHOLD_DAYS else "fresh"
     return {
-        "newest_post_date": newest.isoformat(),
+        # Kept as ``datetime`` — serialisation is the reporter's/CLI's job.
+        "newest_post_date": newest,
         "days_since_last_post": delta,
         "freshness_status": status,
     }
@@ -195,21 +218,30 @@ def _extract_newest_date(text: str) -> datetime | None:
 
 
 def _try_parse_date(s: str) -> datetime | None:
-    """Try a battery of date formats against *s*."""
+    """Try a battery of date formats against *s*.
+
+    Every returned value is timezone-aware (UTC when the source carries a
+    zone abbreviation such as ``GMT`` that ``strptime`` cannot resolve), so
+    dates from mixed RSS/Atom formats remain comparable.
+    """
     # Atom ISO formats
     for fmt in _ISO_FORMATS:
         try:
             dt = datetime.strptime(s, fmt)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+            return dt.astimezone(timezone.utc)
         except ValueError:
             continue
 
     # RSS RFC 2822 formats
     for fmt in _RFC2822_FORMATS:
         try:
-            return datetime.strptime(s, fmt)
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                # ``%Z`` yields a naive datetime for "GMT"/"UTC".
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
         except ValueError:
             continue
 
@@ -218,6 +250,6 @@ def _try_parse_date(s: str) -> datetime | None:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return dt.astimezone(timezone.utc)
     except ValueError:
         return None

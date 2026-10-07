@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from ._schema import CountryProfile, SourceConfig, SourceMetrics
@@ -73,6 +74,16 @@ REGION_MAP: dict[str, str | None] = {
 }
 
 
+def _copy_sources(sources: dict[str, SourceConfig]) -> dict[str, SourceConfig]:
+    """Copy SourceConfig values so no two country profiles share one instance."""
+    return {name: replace(cfg, params=dict(cfg.params)) for name, cfg in sources.items()}
+
+
+def _copy_metrics(metrics: dict[str, SourceMetrics]) -> dict[str, SourceMetrics]:
+    """Copy SourceMetrics values so streaks and counters stay per-country."""
+    return {name: replace(metric) for name, metric in metrics.items()}
+
+
 def merge_profiles(base: CountryProfile, override: CountryProfile) -> CountryProfile:
     """Deep merge two profiles. Override takes precedence.
 
@@ -89,11 +100,11 @@ def merge_profiles(base: CountryProfile, override: CountryProfile) -> CountryPro
         internet_penetration=override.internet_penetration or base.internet_penetration,
         dominant_platforms=override.dominant_platforms or base.dominant_platforms,
         languages=override.languages or base.languages,
-        sources={**base.sources, **override.sources},
+        sources=_copy_sources({**base.sources, **override.sources}),
         local_directories=list(dict.fromkeys(base.local_directories + override.local_directories)),
         media_domains=list(dict.fromkeys(base.media_domains + override.media_domains)),
         disabled_sources=base.disabled_sources | override.disabled_sources,
-        source_performance={**base.source_performance, **override.source_performance},
+        source_performance=_copy_metrics({**base.source_performance, **override.source_performance}),
     )
     return merged
 
@@ -120,11 +131,11 @@ def load_profile(
         internet_penetration=GLOBAL_PROFILE.internet_penetration,
         dominant_platforms=list(GLOBAL_PROFILE.dominant_platforms),
         languages=list(GLOBAL_PROFILE.languages),
-        sources=dict(GLOBAL_PROFILE.sources),
+        sources=_copy_sources(GLOBAL_PROFILE.sources),
         local_directories=list(GLOBAL_PROFILE.local_directories),
         media_domains=list(GLOBAL_PROFILE.media_domains),
         disabled_sources=set(GLOBAL_PROFILE.disabled_sources),
-        source_performance=dict(GLOBAL_PROFILE.source_performance),
+        source_performance=_copy_metrics(GLOBAL_PROFILE.source_performance),
     )
 
     # Apply regional mixin
@@ -181,6 +192,7 @@ def _profile_from_dict(data: dict) -> CountryProfile:
             total_results=m.get("total_results", 0),
             success_count=m.get("success_count", 0),
             failure_count=m.get("failure_count", 0),
+            consecutive_failures=m.get("consecutive_failures", 0),
             total_latency_ms=m.get("total_latency_ms", 0.0),
             last_probe=m.get("last_probe", ""),
         )

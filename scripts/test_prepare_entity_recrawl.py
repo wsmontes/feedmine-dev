@@ -242,6 +242,144 @@ class PrepareEntityRecrawlTests(unittest.TestCase):
         self.assertIsNotNone(result["prepared_at"])
         self.assertIsNotNone(result["input_digest"])
 
+    # ── P1-08: identity collision detection ──
+
+    def _write_two_row_parquet(self, second_source_id: str, second_xml_url: str = "https://other.com/feed"):
+        schema = pa.schema([
+            ("source_id", pa.string()),
+            ("xml_url", pa.string()),
+            ("canonical_xml_url", pa.string()),
+            ("status", pa.string()),
+            ("error_message", pa.string()),
+            ("final_url", pa.string()),
+            ("attempt_count", pa.int32()),
+            ("feed_title", pa.string()),
+            ("articles_fetched", pa.int32()),
+            ("http_status", pa.int32()),
+        ])
+        defaults = {
+            "canonical_xml_url": "", "status": "done", "error_message": None,
+            "final_url": "", "feed_title": "F", "attempt_count": 1,
+            "http_status": 200, "articles_fetched": 1,
+        }
+        data = [
+            {"source_id": "old-0", "xml_url": "https://example.com/feed&#x2F;rss", **defaults},
+            {"source_id": second_source_id, "xml_url": second_xml_url, **defaults},
+        ]
+        pq.write_table(pa.Table.from_pylist(data, schema=schema), self.sources, compression="zstd")
+
+    def test_collision_with_last_row_is_detected(self):
+        """The new identity of row 0 already belongs to the final row."""
+        new_id = compute_source_id(request_url("https://example.com/feed&#x2F;rss"))
+        self._write_two_row_parquet(second_source_id=new_id)
+        self._write_quarantine(
+            '0,old-0,https://example.com/feed&#x2F;rss,url_entities_decoded_requires_refetch'
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            prepare(self.sources, self.quarantine, self.output)
+        self.assertIn("collision", str(ctx.exception))
+        self.assertFalse(self.output.exists())
+        self.assertTrue(self.output.with_suffix(".collisions.csv").exists())
+
+    def test_collision_with_first_row_is_detected(self):
+        """A queued row later in the corpus collides with row 0."""
+        new_id = compute_source_id(request_url("https://example.com/feed&#x2F;rss"))
+        schema = pa.schema([
+            ("source_id", pa.string()),
+            ("xml_url", pa.string()),
+            ("canonical_xml_url", pa.string()),
+            ("status", pa.string()),
+        ])
+        data = [
+            {"source_id": new_id, "xml_url": "https://example.com/feed/rss",
+             "canonical_xml_url": "", "status": "done"},
+            {"source_id": "old-1", "xml_url": "https://example.com/feed&#x2F;rss",
+             "canonical_xml_url": "", "status": "done"},
+        ]
+        pq.write_table(pa.Table.from_pylist(data, schema=schema), self.sources, compression="zstd")
+        self._write_quarantine(
+            '1,old-1,https://example.com/feed&#x2F;rss,url_entities_decoded_requires_refetch'
+        )
+
+        with self.assertRaises(ValueError):
+            prepare(self.sources, self.quarantine, self.output)
+
+    def test_two_queued_rows_collapsing_is_detected(self):
+        schema = pa.schema([
+            ("source_id", pa.string()),
+            ("xml_url", pa.string()),
+            ("canonical_xml_url", pa.string()),
+            ("status", pa.string()),
+        ])
+        data = [
+            {"source_id": "old-0", "xml_url": "https://example.com/feed&#x2F;rss",
+             "canonical_xml_url": "", "status": "done"},
+            {"source_id": "old-1", "xml_url": "https://example.com/feed/rss",
+             "canonical_xml_url": "", "status": "done"},
+        ]
+        pq.write_table(pa.Table.from_pylist(data, schema=schema), self.sources, compression="zstd")
+        self._write_quarantine(
+            '0,old-0,https://example.com/feed&#x2F;rss,url_entities_decoded_requires_refetch',
+            '1,old-1,https://example.com/feed/rss,url_entities_decoded_requires_refetch',
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            prepare(self.sources, self.quarantine, self.output)
+        self.assertIn("collision", str(ctx.exception))
+
+    def test_requeued_row_keeping_its_own_id_is_not_a_collision(self):
+        """A queued row whose identity does not change must not self-conflict."""
+        url = "https://example.com/feed"
+        schema = pa.schema([
+            ("source_id", pa.string()),
+            ("xml_url", pa.string()),
+            ("canonical_xml_url", pa.string()),
+            ("status", pa.string()),
+        ])
+        data = [{
+            "source_id": compute_source_id(url), "xml_url": url,
+            "canonical_xml_url": canonical_url(url), "status": "done",
+        }]
+        pq.write_table(pa.Table.from_pylist(data, schema=schema), self.sources, compression="zstd")
+        self._write_quarantine(
+            f'0,{compute_source_id(url)},{url},url_entities_decoded_requires_refetch'
+        )
+
+        count = prepare(self.sources, self.quarantine, self.output)
+        self.assertEqual(count, 1)
+        self.assertTrue(self.output.exists())
+
+    def test_collision_detection_scales_linearly(self):
+        """Queued rows are indexed once; large corpora do not multiply work."""
+        size = 400
+        new_id = compute_source_id(request_url("https://example.com/feed&#x2F;rss"))
+        schema = pa.schema([
+            ("source_id", pa.string()),
+            ("xml_url", pa.string()),
+            ("canonical_xml_url", pa.string()),
+            ("status", pa.string()),
+        ])
+        data = [
+            {"source_id": "old-0", "xml_url": "https://example.com/feed&#x2F;rss",
+             "canonical_xml_url": "", "status": "done"},
+        ]
+        data += [
+            {"source_id": f"untouched-{i}", "xml_url": f"https://example.com/feed/{i}",
+             "canonical_xml_url": "", "status": "done"}
+            for i in range(size - 2)
+        ]
+        # Final row already owns the proposed identity.
+        data.append({"source_id": new_id, "xml_url": "https://example.com/feed/rss",
+                     "canonical_xml_url": "", "status": "done"})
+        pq.write_table(pa.Table.from_pylist(data, schema=schema), self.sources, compression="zstd")
+        self._write_quarantine(
+            '0,old-0,https://example.com/feed&#x2F;rss,url_entities_decoded_requires_refetch'
+        )
+
+        with self.assertRaises(ValueError):
+            prepare(self.sources, self.quarantine, self.output)
+
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 

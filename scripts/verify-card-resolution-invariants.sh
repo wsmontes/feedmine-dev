@@ -13,7 +13,34 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 pass() { echo -e "  ${GREEN}PASS${NC} $1"; PASS=$((PASS + 1)); }
 fail() { echo -e "  ${RED}FAIL${NC} $1"; FAIL=$((FAIL + 1)); }
 
-SRC=/Users/wagnermontes/Documents/GitHub/feedmine/feedmine
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+SRC="$ROOT/feedmine"
+
+# Preflight: every check below greps a specific file. A negative grep over a
+# missing file proves nothing, so refuse to run against a partial checkout.
+REQUIRED_FILES=(
+  "Views/FeedItemCardView.swift"
+  "Views/PreparedCardImage.swift"
+  "Views/FeedScreen.swift"
+  "Models/FeedCardPresentation.swift"
+  "Services/ImageLoader.swift"
+  "Services/FeedStore.swift"
+  "Services/FeedLoader.swift"
+  "Services/CardPreparationPipeline.swift"
+  "Services/ReadyCardQueue.swift"
+)
+MISSING=0
+for rel in "${REQUIRED_FILES[@]}"; do
+  if [ ! -f "$SRC/$rel" ]; then
+    echo -e "  ${RED}FAIL${NC} missing required file: $SRC/$rel"
+    MISSING=1
+  fi
+done
+if [ "$MISSING" -ne 0 ]; then
+  echo "INVARIANTS UNVERIFIABLE — $SRC is not a complete checkout." >&2
+  exit 1
+fi
+echo "Source root: $SRC"
 
 echo "=== FeedItemCardView: Zero async image loading ==="
 grep -q "CachedAsyncImage" "$SRC/Views/FeedItemCardView.swift" \

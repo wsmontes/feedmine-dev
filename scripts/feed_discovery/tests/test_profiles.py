@@ -169,3 +169,52 @@ def test_global_profile_media_domains_empty():
 
 def test_global_profile_generation_version():
     assert GLOBAL_PROFILE.generation_version == 1
+
+
+# ---- Per-country copies: configs and metrics are never shared (TOOL-20) ----
+
+def test_load_profile_copies_shared_source_configs():
+    from scripts.feed_discovery.profiles._registry import load_profile
+
+    nigeria = load_profile("nigeria")
+    kenya = load_profile("kenya")
+    # Not in REGION_MAP and without a country JSON: built straight from GLOBAL.
+    plain = load_profile("not-a-real-country-slug")
+
+    for name, cfg in nigeria.sources.items():
+        assert cfg is not kenya.sources[name]
+        assert cfg is not plain.sources[name]
+        assert cfg is not GLOBAL_PROFILE.sources[name]
+        assert cfg.params is not GLOBAL_PROFILE.sources[name].params
+
+
+def test_degrading_one_country_does_not_touch_another_country_or_global():
+    from scripts.feed_discovery.country_profiler import CountryProfiler
+    from scripts.feed_discovery.profiles._registry import load_profile
+
+    nigeria = load_profile("nigeria")
+    kenya = load_profile("kenya")
+    kenya_priority = kenya.sources["itunes"].priority
+    global_priority = GLOBAL_PROFILE.sources["itunes"].priority
+
+    profiler = CountryProfiler()
+    for _ in range(3):
+        profiler._record_probe(nigeria, "itunes", success=False, result_count=0)
+
+    assert nigeria.sources["itunes"].priority > kenya_priority
+    assert kenya.sources["itunes"].priority == kenya_priority
+    assert GLOBAL_PROFILE.sources["itunes"].priority == global_priority
+
+
+def test_probe_metrics_are_not_shared_between_countries():
+    from scripts.feed_discovery.country_profiler import CountryProfiler
+    from scripts.feed_discovery.profiles._registry import load_profile
+
+    nigeria = load_profile("nigeria")
+    kenya = load_profile("kenya")
+
+    CountryProfiler()._record_probe(nigeria, "deezer", success=False, result_count=0)
+
+    assert "deezer" in nigeria.source_performance
+    assert "deezer" not in kenya.source_performance
+    assert "deezer" not in GLOBAL_PROFILE.source_performance

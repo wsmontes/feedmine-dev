@@ -18,9 +18,16 @@ RELEASE_APP    := $(DERIVED_DATA)/Build/Products/Release-iphoneos/feedmine.app
 .PHONY: all build install launch audit-images \
         test test-device test-device-only \
         test-ui test-ui-device test-ui-sim \
+        ui-matrix \
         test-sim test-sim-only \
         analyze build-release archive \
         device-info sim-info clean clean-all
+
+# ── Log directory ────────────────────────────────────────
+# Recipes that tee xcodebuild output need this directory to exist first:
+# .build/ is gitignored and absent in a fresh checkout.
+.build:
+	@mkdir -p $@
 
 # ── Device Info ──────────────────────────────────────────
 device-info:
@@ -42,7 +49,7 @@ audit-images:
 all: build install launch
 
 # ── Build (Device) ───────────────────────────────────────
-build:
+build: | .build
 	@echo "🔨 Building Feedmine for device..."
 	xcodebuild build -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS,id=$(DEVICE)" \
@@ -68,7 +75,7 @@ test-ui: test-ui-sim
 	@true
 
 # ── Test: Device ─────────────────────────────────────────
-test-device:
+test-device: | .build
 	@echo "🧪 [Device] Unit tests..."
 	xcodebuild test -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS,id=$(DEVICE)" \
@@ -77,14 +84,14 @@ test-device:
 		-configuration Debug \
 		-only-testing:feedmineTests 2>&1 | tee .build/test-device.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing)"
 
-test-device-only:
+test-device-only: | .build
 	@echo "🧪 [Device] Unit tests (no rebuild)..."
 	xcodebuild test-without-building -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS,id=$(DEVICE)" \
 		-derivedDataPath $(DERIVED_DATA) \
 		-only-testing:feedmineTests 2>&1 | tee .build/test-device.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing)"
 
-test-ui-device:
+test-ui-device: | .build
 	@echo "🧪 [Device] UI tests..."
 	xcodebuild test -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS,id=$(DEVICE)" \
@@ -94,7 +101,7 @@ test-ui-device:
 		-only-testing:feedmineUITests 2>&1 | tee .build/test-ui-device.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing)"
 
 # ── Test: Simulator ──────────────────────────────────────
-test-sim:
+test-sim: | .build
 	@echo "🧪 [Simulator] Unit tests..."
 	xcodebuild test -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS Simulator,name=$(SIM_NAME)" \
@@ -102,14 +109,14 @@ test-sim:
 		-configuration Debug \
 		-only-testing:feedmineTests 2>&1 | tee .build/test-sim.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing|error:)"
 
-test-sim-only:
+test-sim-only: | .build
 	@echo "🧪 [Simulator] Unit tests (no rebuild)..."
 	xcodebuild test-without-building -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS Simulator,name=$(SIM_NAME)" \
 		-derivedDataPath $(SIM_DERIVED) \
 		-only-testing:feedmineTests 2>&1 | tee .build/test-sim.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing)"
 
-test-ui-sim:
+test-ui-sim: | .build
 	@echo "🧪 [Simulator] UI tests..."
 	xcodebuild test -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS Simulator,name=$(SIM_NAME)" \
@@ -117,15 +124,20 @@ test-ui-sim:
 		-configuration Debug \
 		-only-testing:feedmineUITests 2>&1 | tee .build/test-ui-sim.log | grep -E "(Test Suite.*passed|Test Suite.*failed|Executed|Failing)"
 
+# Journeys + every filter axis on the shared simulator, with the app's own log captured beside the results.
+# Serialized through /tmp/feedmine-lane.lock (the device is shared); writes its report under Artifacts/Validation.
+ui-matrix:
+	@bash scripts/validation/run_ui_matrix.sh
+
 # ── Release ──────────────────────────────────────────────
-analyze:
+analyze: | .build
 	@echo "🔍 Running static analysis..."
 	xcodebuild analyze -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS Simulator,name=$(SIM_NAME)" \
 		-derivedDataPath $(SIM_DERIVED) \
 		-configuration Release 2>&1 | tee .build/analyze.log | tail -20
 
-build-release:
+build-release: | .build
 	@echo "📦 Building Release for device..."
 	xcodebuild build -project $(PROJECT) -scheme $(SCHEME) \
 		-destination "platform=iOS,id=$(DEVICE)" \
@@ -133,7 +145,7 @@ build-release:
 		-derivedDataPath $(DERIVED_DATA) \
 		-configuration Release 2>&1 | tee .build/build-release.log | tail -5
 
-archive: test-sim
+archive: test-sim | .build
 	@echo "🏷️  Build metadata..."
 	@bash scripts/generate_build_info.sh
 	@VERSION=$$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" feedmine/Info.plist); \

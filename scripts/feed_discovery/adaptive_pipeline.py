@@ -8,9 +8,11 @@ from pathlib import Path
 
 import aiohttp
 
+from ..catalog_collections import PRODUCTION_COUNTRY_COLLECTION
+from . import verify
 from .models import Candidate, SubRegion
 from .opml import normalize_url
-from .pipeline import Config
+from .pipeline import Config, _bounded_gather
 from .profiles._registry import load_profile, save_profile, REGION_MAP
 from .subregion.opml_writer import read_existing_feeds, write_subregion_opml
 from .subregion.enrich_countries import POPULATION, enrich
@@ -65,13 +67,34 @@ async def discover_with_profile(
             continue
 
         for c in candidates:
+            # Sources may return national/global outlets (Google News headlines,
+            # global lists) for a sub-region query; those are not local feeds.
+            if not c.national:
+                continue
             norm = normalize_url(c.url)
             if norm in seen_urls or norm in existing_urls:
                 continue
             seen_urls.add(norm)
             all_candidates.append(c)
 
-    return all_candidates
+    if not all_candidates:
+        return []
+
+    # Validate before persisting: a source may hand back an HTML page or a dead
+    # endpoint instead of a feed (Deezer show pages, for instance), and the
+    # sub-region OPML must only receive real feeds.
+    verdicts = await _bounded_gather(
+        cfg.concurrency,
+        [verify.verify_feed(session, c.url, cfg.timeout) for c in all_candidates],
+    )
+    verified: list[Candidate] = []
+    for candidate, (is_live, status, title) in zip(all_candidates, verdicts):
+        candidate.is_live, candidate.status_code = is_live, status
+        if title:
+            candidate.title = title
+        if is_live:
+            verified.append(candidate)
+    return verified
 
 
 async def populate_country_adaptive(
@@ -91,7 +114,7 @@ async def populate_country_adaptive(
     # Load enriched country data
     enriched_path = Path(__file__).parent / "data" / "countries_enriched.json"
     if not enriched_path.exists():
-        opml_base = Path(__file__).resolve().parents[1] / "feedmine" / "Resources" / "Feeds" / "countries"
+        opml_base = Path(__file__).resolve().parents[2] / "feedmine" / "Resources" / "Feeds" / PRODUCTION_COUNTRY_COLLECTION
         countries_json = Path(__file__).parent / "data" / "countries.json"
         enrich(opml_base, countries_json, enriched_path)
 
@@ -142,6 +165,10 @@ async def populate_country_adaptive(
 
             if cands:
                 written = write_subregion_opml(Path(sd["opml_path"]), cands)
+                if written:
+                    # Sub-regions run concurrently; registering what was just
+                    # written keeps a later region from repeating the same feed.
+                    all_existing.update(normalize_url(c.url) for c in cands)
                 return (sd["slug"], written)
             return (sd["slug"], 0)
 
@@ -168,7 +195,7 @@ async def populate_all_adaptive(cfg: Config | None = None) -> None:
 
     enriched_path = Path(__file__).parent / "data" / "countries_enriched.json"
     if not enriched_path.exists():
-        opml_base = Path(__file__).resolve().parents[1] / "feedmine" / "Resources" / "Feeds" / "countries"
+        opml_base = Path(__file__).resolve().parents[2] / "feedmine" / "Resources" / "Feeds" / PRODUCTION_COUNTRY_COLLECTION
         countries_json = Path(__file__).parent / "data" / "countries.json"
         enrich(opml_base, countries_json, enriched_path)
 

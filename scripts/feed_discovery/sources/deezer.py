@@ -40,11 +40,13 @@ class DeezerSource:
     ) -> list[Candidate]:
         """Search Deezer for podcasts matching the query.
 
-        Uses /search/podcast endpoint. Falls back to generic /search
-        with type=podcast if the podcast-specific endpoint returns nothing.
+        Deezer's API returns no RSS URL — only the show's HTML page
+        (https://www.deezer.com/show/{id}) — and a web page is not a feed, so
+        this adapter yields no candidates: a sub-region OPML must not receive
+        HTML. The requests stay so the endpoint contract remains observable
+        and the probe can report service health.
         """
         candidates: list[Candidate] = []
-        seen: set[str] = set()
 
         # Primary: podcast-specific search
         params = {"q": query, "limit": str(config.max_results)}
@@ -56,56 +58,22 @@ class DeezerSource:
                 timeout=aiohttp.ClientTimeout(total=config.timeout),
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    for item in data.get("data", []):
-                        deezer_id = str(item.get("id", ""))
-                        if not deezer_id or deezer_id in seen:
-                            continue
-                        seen.add(deezer_id)
-                        title = item.get("title", "")
-                        # Deezer doesn't expose RSS URL directly.
-                        # The show page URL is: https://www.deezer.com/show/{id}
-                        # We use this as the feed_url for now; the RSS URL
-                        # can be resolved later if needed.
-                        candidates.append(Candidate(
-                            url=f"https://www.deezer.com/show/{deezer_id}",
-                            category="Podcasts",
-                            title=title,
-                            genre="",
-                            national=True,
-                            national_reason="deezer",
-                        ))
+                    await resp.json()
         except Exception:
             pass
 
-        # Fallback: generic search filtered to podcasts
-        if not candidates:
-            fallback_url = f"{self.BASE}/search?q={query}&limit={config.max_results}"
-            try:
-                async with session.get(
-                    fallback_url,
-                    timeout=aiohttp.ClientTimeout(total=config.timeout),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for item in data.get("data", []):
-                            if item.get("type") != "podcast":
-                                continue
-                            deezer_id = str(item.get("id", ""))
-                            if not deezer_id or deezer_id in seen:
-                                continue
-                            seen.add(deezer_id)
-                            title = item.get("title", "")
-                            candidates.append(Candidate(
-                                url=f"https://www.deezer.com/show/{deezer_id}",
-                                category="Podcasts",
-                                title=title,
-                                genre="",
-                                national=True,
-                                national_reason="deezer_fallback",
-                            ))
-            except Exception:
-                pass
+        # Fallback: generic search filtered to podcasts; its type=podcast
+        # entries are what a future feed resolver would consume.
+        fallback_url = f"{self.BASE}/search?q={query}&limit={config.max_results}"
+        try:
+            async with session.get(
+                fallback_url,
+                timeout=aiohttp.ClientTimeout(total=config.timeout),
+            ) as resp:
+                if resp.status == 200:
+                    await resp.json()
+        except Exception:
+            pass
 
         return candidates
 

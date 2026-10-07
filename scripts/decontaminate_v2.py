@@ -23,7 +23,9 @@ from pathlib import Path
 # ── Paths ──────────────────────────────────────────────────────────────
 
 FEEDS_DIR = Path(__file__).resolve().parent.parent / "feedmine" / "Resources" / "Feeds" / "90_countries"
-PARQUET_PATH = Path("/Users/wagnermontes/Documents/GitHub/feedmine/feeds_corpus_sources.parquet")
+# Corpus artifacts are written at the repository root by the fetch pipeline;
+# the path must not depend on a personal checkout.
+PARQUET_PATH = Path(__file__).resolve().parent.parent / "feeds_corpus_sources.parquet"
 CASES_PATH = Path(__file__).resolve().parent / "decontamination_cases.json"
 
 # ── Country language profiles ──────────────────────────────────────────

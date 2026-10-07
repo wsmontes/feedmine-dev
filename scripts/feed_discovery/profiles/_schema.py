@@ -21,6 +21,7 @@ class SourceMetrics:
     total_results: int = 0
     success_count: int = 0
     failure_count: int = 0
+    consecutive_failures: int = 0             # zerado a cada probe bem-sucedido
     total_latency_ms: float = 0.0
     last_probe: str = ""                      # ISO timestamp
 

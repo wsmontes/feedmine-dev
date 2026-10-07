@@ -83,6 +83,74 @@ def test_channel_rss_url_format():
     assert url == "https://www.youtube.com/feeds/videos.xml?channel_id=UC1234567890abcdefghij"
 
 
+class _StubResponse:
+    def __init__(self, payload):
+        self.status = 200
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _StubSession:
+    """Minimal session stub: search.list returns one channel and
+    channels.list reports the country that channel declares."""
+
+    def __init__(self, channel_country):
+        self.channel_country = channel_country
+        self.requested: list[str] = []
+
+    def get(self, url, **kwargs):
+        self.requested.append(url)
+        if "/search?" in url:
+            return _StubResponse(
+                {"items": [{"snippet": {"channelId": "UC_foreign_channel"}}]}
+            )
+        return _StubResponse({
+            "items": [{
+                "id": "UC_foreign_channel",
+                "snippet": {"title": "Elsewhere TV"},
+                "brandingSettings": {"channel": {"country": self.channel_country}},
+            }]
+        })
+
+
+@pytest.mark.asyncio
+async def test_channel_from_another_country_is_not_national(monkeypatch):
+    """regionCode is search relevance; a channel declaring another country must
+    not be promoted as a national source (no network: stubbed session)."""
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+    source = YouTubeAPISource()
+    profile = CountryProfile(country="usa", languages=["en"])
+    config = SourceConfig(priority=3, params={"regionCode": "US"})
+
+    candidates = await source.search("usa news", profile, config, _StubSession("GB"))
+
+    assert len(candidates) == 1
+    assert candidates[0].national is False
+    assert candidates[0].national_reason == "youtube_api:GB!=US"
+
+
+@pytest.mark.asyncio
+async def test_channel_from_the_same_country_is_national(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test-key")
+    source = YouTubeAPISource()
+    profile = CountryProfile(country="usa", languages=["en"])
+    config = SourceConfig(priority=3, params={"regionCode": "US"})
+
+    candidates = await source.search("usa news", profile, config, _StubSession("US"))
+
+    assert len(candidates) == 1
+    assert candidates[0].national is True
+    assert candidates[0].national_reason == "youtube_api:US"
+
+
 def test_quota_cost_estimate():
     """search_channels costs ~100 units, list_channels costs ~1 unit per channel."""
     source = YouTubeAPISource()

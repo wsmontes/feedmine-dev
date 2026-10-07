@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from ...catalog_collections import PRODUCTION_COUNTRY_COLLECTION
 from .country_meta import COUNTRY_META, CITIES, display_name, native_name
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-COUNTRIES_DIR = REPO_ROOT / "feedmine" / "Resources" / "Feeds" / "countries"
+COUNTRIES_DIR = REPO_ROOT / "feedmine" / "Resources" / "Feeds" / PRODUCTION_COUNTRY_COLLECTION
 OUT = Path(__file__).parent / "countries.json"
 
 # ccTLD differs from ISO 3166-1 alpha-2 for a handful of countries.

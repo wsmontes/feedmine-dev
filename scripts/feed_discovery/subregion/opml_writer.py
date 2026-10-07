@@ -30,9 +30,11 @@ def read_existing_feeds(opml_path: Path) -> set[str]:
 def write_subregion_opml(opml_path: Path, candidates: list[Candidate]) -> int:
     """Write candidates into the sub-region OPML, preserving existing content.
 
-    Feeds already present in the OPML (by normalized URL) are skipped.
-    New feeds are grouped by candidate.category under <outline text="Category">
-    elements. Existing category groups are preserved; new ones are appended.
+    Feeds already present in the OPML (by normalized URL) and feeds repeated
+    inside this batch are skipped. New feeds are grouped by candidate.category
+    under <outline text="Category"> elements. Existing category groups are
+    preserved; new ones are appended. A malformed existing file is left
+    untouched and raises ValueError instead of being replaced by a skeleton.
 
     Args:
         opml_path: Path to the .opml file (created if missing).
@@ -46,7 +48,7 @@ def write_subregion_opml(opml_path: Path, candidates: list[Candidate]) -> int:
     # Parse existing OPML, or create a new one if missing
     try:
         tree = ET.parse(str(opml_path))
-    except (ET.ParseError, FileNotFoundError):
+    except FileNotFoundError:
         # Create a fresh OPML skeleton
         root = ET.Element("opml")
         root.set("version", "2.0")
@@ -61,6 +63,10 @@ def write_subregion_opml(opml_path: Path, candidates: list[Candidate]) -> int:
             encoding="utf-8",
         )
         tree = ET.parse(str(opml_path))
+    except ET.ParseError as error:
+        raise ValueError(
+            f"refusing to overwrite malformed OPML {opml_path}: {error}"
+        ) from error
     root = tree.getroot()
     body = root.find("body")
     if body is None:
@@ -78,6 +84,9 @@ def write_subregion_opml(opml_path: Path, candidates: list[Candidate]) -> int:
         norm = normalize_url(c.url)
         if norm in existing_urls:
             continue
+        # Register the accepted URL so a second candidate with the same feed in
+        # this same batch is not written twice.
+        existing_urls.add(norm)
         cat = c.category or "Other"
         new_by_cat.setdefault(cat, []).append(c)
 

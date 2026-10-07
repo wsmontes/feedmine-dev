@@ -107,21 +107,19 @@ def prepare(sources: Path, quarantine: Path, output: Path) -> int:
         new_id = compute_source_id(fetch_url)
         proposed_ids.setdefault(new_id, []).append(index)
 
+    queued_indices = {index for index, _fetch_url, _item in queued}
     collision_indices: set[int] = set()
     for new_id, indices in proposed_ids.items():
         # Queued-vs-queued collision
         if len(indices) > 1:
             print(f"  WARNING: {len(indices)} queued rows collapse to source_id {new_id}")
             collision_indices.update(indices[1:])  # keep first, flag rest
-        # Queued-vs-untouched collision
-        for idx in indices:
-            if idx not in collision_indices:
-                for other_idx, row in enumerate(rows):
-                    if other_idx not in {i for _, _, _ in queued}:
-                        if row.get("source_id") == new_id:
-                            print(f"  WARNING: queued row {idx} collides with untouched row {other_idx} (source_id={new_id})")
-                            collision_indices.add(idx)
-                            break
+        # Queued-vs-untouched collision — ``by_source_id`` holds every row
+        # (including the last one), so no line of the corpus is missed.
+        other_idx = by_source_id.get(new_id)
+        if other_idx is not None and other_idx not in queued_indices:
+            print(f"  WARNING: queued row(s) {indices} collide with untouched row {other_idx} (source_id={new_id})")
+            collision_indices.update(indices)
 
     if collision_indices:
         # Write collision quarantine before aborting

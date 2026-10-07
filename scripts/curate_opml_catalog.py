@@ -242,7 +242,18 @@ LANGUAGE_ALIASES = {
     "polish": "pl", "swedish": "sv", "norwegian": "nb", "danish": "da",
     "finnish": "fi", "greek": "el", "hebrew": "he", "indonesian": "id",
     "vietnamese": "vi", "thai": "th", "ukrainian": "uk", "catalan": "ca",
+    # Deprecated ISO 639 codes still seen in feed metadata.
+    "in": "id", "iw": "he",
 }
+
+# BCP 47 subset: language[-script][-region][-variant…].  Script subtags are
+# four letters (Hans, Hant, Latn) and must not be mistaken for a region.
+LANGUAGE_PATTERN = re.compile(
+    r"^([A-Za-z]{2,3})"
+    r"(?:[-_]([A-Za-z]{4}))?"
+    r"(?:[-_]([A-Za-z]{2}|[0-9]{3}))?"
+    r"(?:[-_][A-Za-z0-9]{2,8})*$"
+)
 
 CURRENT_SENSITIVE = (
     "news", "current events", "politics", "government", "election", "geopolitics",
@@ -299,18 +310,31 @@ def parse_tags(raw: str) -> list[str]:
 
 
 def normalize_language(value: str | None) -> str | None:
+    """Return a normalised BCP 47 tag, or ``None`` when *value* is not a tag.
+
+    Script subtags are preserved (``zh-Hans`` stays ``zh-Hans``), the base
+    language is lowercased and the region uppercased.  Text that is not a
+    language tag at all (for example ``"english junk"``) yields ``None``
+    instead of being sliced down to its first letters.
+    """
     value = clean_text(value)
-    if not value:
+    if not value or value.casefold() in {"nan", "none", "null"}:
         return None
     alias = LANGUAGE_ALIASES.get(value.lower())
     if alias:
         return alias
-    match = re.match(r"^([A-Za-z]{2,3})(?:[-_]([A-Za-z]{2}))?", value)
+    match = LANGUAGE_PATTERN.match(value)
     if not match:
         return None
     base = match.group(1).lower()
-    region = match.group(2)
-    return f"{base}-{region.upper()}" if region else base
+    script = match.group(2)
+    region = match.group(3)
+    parts = [base]
+    if script:
+        parts.append(script.title())
+    if region:
+        parts.append(region.upper() if region.isalpha() else region)
+    return "-".join(parts)
 
 
 def phrase_present(haystack: str, needle: str) -> bool:

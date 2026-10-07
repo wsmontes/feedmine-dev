@@ -144,14 +144,13 @@ def detect_language(text: str, opml_path: Path) -> tuple[str | None, float, str]
 
 
 def country_from_path(opml_path: Path) -> str | None:
-    """Extract country slug from an OPML path like .../countries/brazil/brazil.opml."""
+    """Extract country slug from an OPML path like .../90_countries/brazil/brazil.opml."""
     parts = opml_path.parts
-    try:
-        idx = parts.index("countries")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    except ValueError:
-        pass
+    for idx, part in enumerate(parts):
+        if part == "countries" or part.endswith("_countries"):
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+            return None
     return None
 
 
@@ -211,6 +210,7 @@ def main():
         "errors": 0,
         "by_language": defaultdict(int),
         "changes": [],
+        "proposals": [],
     }
 
     for opml_path in opml_files:
@@ -225,6 +225,20 @@ def main():
                 print(f"  SKIP  {rel!s:70s}  no-lang  conf={confidence:.2f}  ({method})")
             else:
                 print(f"  SKIP  {rel!s:70s}  no-lang  {method}")
+            continue
+
+        # Documented contract: only write at or above MIN_CONFIDENCE. Anything below
+        # the floor is reported as a proposal for review and never written.
+        if confidence < MIN_CONFIDENCE:
+            report["skipped_low_confidence"] += 1
+            report["proposals"].append({
+                "path": str(rel),
+                "proposed_language": lang,
+                "confidence": round(confidence, 3),
+                "method": method,
+                "text_len": len(text),
+            })
+            print(f"  PROPOSE {rel!s:70s} → {lang:4s}  conf={confidence:.2f}  ({method}, below {MIN_CONFIDENCE})")
             continue
 
         report["by_language"][lang] += 1
@@ -251,6 +265,7 @@ def main():
     print(f"Total:       {report['total']:5d}")
     print(f"Detected:    {report['detected']:5d}")
     print(f"Skipped:     {report['skipped_low_confidence']:5d} (low confidence)")
+    print(f"Proposals:   {len(report['proposals']):5d} (below conf {MIN_CONFIDENCE}, not written)")
     print(f"No text:     {report['skipped_insufficient_text']:5d} (insufficient text)")
     print(f"Errors:      {report['errors']:5d}")
     print(f"\nBy language:")

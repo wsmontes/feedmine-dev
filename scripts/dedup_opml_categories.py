@@ -69,6 +69,43 @@ def write_opml(opml_path: Path, root: ET.Element) -> None:
     )
 
 
+def _merge_children(dst: ET.Element, src: ET.Element, seen_urls: set[str], stats: dict) -> None:
+    """Move ``src``'s outline children into ``dst`` recursively.
+
+    Containers (folders without xmlUrl) are merged by ``text`` into an existing
+    container, keeping their attributes; feed URLs already seen are dropped and
+    counted. Nothing is discarded except genuine duplicates.
+    """
+    for child in list(src):
+        if child.tag != "outline":
+            src.remove(child)
+            continue
+
+        url = child.get("xmlUrl")
+        if url:
+            src.remove(child)
+            if url in seen_urls:
+                stats["removed_dup_urls"] += 1
+            else:
+                seen_urls.add(url)
+                dst.append(child)
+            continue
+
+        text = child.get("text", "")
+        target = None
+        for cand in dst:
+            if cand.tag == "outline" and cand.get("xmlUrl") is None and cand.get("text", "") == text:
+                target = cand
+                break
+        if target is None:
+            # New container — preserve every attribute of the incoming folder.
+            target = ET.SubElement(dst, "outline")
+            for name, value in child.attrib.items():
+                target.set(name, value)
+        _merge_children(target, child, seen_urls, stats)
+        src.remove(child)
+
+
 def dedup_country_opml(root: ET.Element, head: ET.Element, body: ET.Element) -> dict:
     """
     Deduplicate a single country OPML file (modifies tree in-place).
@@ -96,6 +133,9 @@ def dedup_country_opml(root: ET.Element, head: ET.Element, body: ET.Element) -> 
             if text not in groups:
                 groups[text] = []
             groups[text].append(child)
+        else:
+            # Top-level feeds, folders without text, comments: never discarded.
+            non_category_elements.append(child)
     # Remove the text to rebuilt
     stats["original_groups"] = sum(len(v) for v in groups.values())
 
@@ -111,56 +151,13 @@ def dedup_country_opml(root: ET.Element, head: ET.Element, body: ET.Element) -> 
         # Merge all feed elements from all groups of this category
         seen_urls: set[str] = set()
         merged_parent = ET.SubElement(body, "outline")
+        # Keep the folder's own attributes (title, feedmine*, ...), not just text.
+        for name, value in group_elements[0].attrib.items():
+            merged_parent.set(name, value)
         merged_parent.set("text", cat_text)
 
         for old_group in group_elements:
-            for child in list(old_group):
-                child_text = child.get("text", "")
-                # Copy subcategory outlines (they contain feeds)
-                if child.tag == "outline" and child.get("xmlUrl") is None:
-                    # This is a subcategory group (has text but no xmlUrl)
-                    # Check if already exists in merged
-                    sub_text = child.get("text", "")
-                    existing_sub = None
-                    for s in merged_parent:
-                        if s.get("text") == sub_text and s.get("xmlUrl") is None:
-                            existing_sub = s
-                            break
-                    if existing_sub is not None:
-                        # Merge feeds into existing subcategory
-                        for feed in child:
-                            url = feed.get("xmlUrl", "")
-                            if url and url not in seen_urls:
-                                seen_urls.add(url)
-                                existing_sub.append(feed)
-                            elif url:
-                                stats["removed_dup_urls"] += 1
-                    else:
-                        # Add new subcategory
-                        merged_parent.append(child)
-                        for feed in child.iter("outline"):
-                            url = feed.get("xmlUrl", "")
-                            if url:
-                                if url in seen_urls:
-                                    stats["removed_dup_urls"] += 1
-                                    # Remove this duplicate feed from its parent
-                                    feed_parent = None
-                                    for p in child.iter("outline"):
-                                        if p != feed and any(c is feed for c in p):
-                                            feed_parent = p
-                                            break
-                                    if feed_parent is not None:
-                                        feed_parent.remove(feed)
-                                else:
-                                    seen_urls.add(url)
-                elif child.tag == "outline" and child.get("xmlUrl"):
-                    # Direct feed (no subcategory wrapper)
-                    url = child.get("xmlUrl", "")
-                    if url and url not in seen_urls:
-                        seen_urls.add(url)
-                        merged_parent.append(child)
-                    elif url:
-                        stats["removed_dup_urls"] += 1
+            _merge_children(merged_parent, old_group, seen_urls, stats)
 
         if len(groups[cat_text]) > 1:
             stats["merged_groups"] += len(groups[cat_text]) - 1
@@ -186,6 +183,11 @@ def dedup_country_opml(root: ET.Element, head: ET.Element, body: ET.Element) -> 
                 if parent is not None:
                     parent.remove(feed)
                     stats["removed_dup_urls"] += 1
+
+    # Elements that are not category groups (top-level feeds, folders without
+    # text, comments) are preserved, after the rebuilt groups.
+    for elem in non_category_elements:
+        body.append(elem)
 
     stats["final_groups"] = len(groups)
     stats["final_feeds"] = sum(

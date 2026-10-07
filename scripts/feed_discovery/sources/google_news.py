@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from urllib.parse import urlencode
 
 from ..models import Candidate
 from ..profiles._schema import CountryProfile, SourceConfig
@@ -52,8 +53,11 @@ class GoogleNewsSource:
     ) -> list[Candidate]:
         """Generate Google News RSS feeds for the profile's country.
 
-        Uses https://news.google.com/rss?hl={lang}&gl={iso2}&ceid={iso2}:{lang}
-        which returns localized news RSS feeds for the given country/language.
+        With a query, uses
+        https://news.google.com/rss/search?q={query}&hl={lang}&gl={iso2}&ceid={iso2}:{lang}
+        so a sub-region query does not degrade into the country's general
+        headlines. Without a query (probe), falls back to the localized
+        top-headlines feed https://news.google.com/rss?hl={lang}&gl={iso2}&ceid={iso2}:{lang}.
         """
         country_slug = (profile.country or "").lower()
         iso2 = self._ISO2_MAP.get(country_slug, "")
@@ -66,8 +70,14 @@ class GoogleNewsSource:
 
         for lang in languages:
             iso2u = iso2.upper()
-            # Google News RSS — localized top headlines
-            url = f"{self.BASE}?hl={lang}&gl={iso2u}&ceid={iso2u}:{lang}"
+            if query:
+                params = urlencode(
+                    {"q": query, "hl": lang, "gl": iso2u, "ceid": f"{iso2u}:{lang}"}
+                )
+                url = f"{self.BASE}/search?{params}"
+            else:
+                # Google News RSS — localized top headlines
+                url = f"{self.BASE}?hl={lang}&gl={iso2u}&ceid={iso2u}:{lang}"
             if url not in seen:
                 seen.add(url)
                 candidates.append(Candidate(

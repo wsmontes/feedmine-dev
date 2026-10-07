@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -31,15 +33,104 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def next_revision(destination: Path) -> int:
-    manifest_path = destination / "manifest.json"
+def _revision_of(path: Path) -> int | None:
+    """Revision encoded in a ``<name>.staging-rN``/``<name>.backup-rN`` sibling."""
+    suffix = path.name.rsplit("-r", 1)[-1]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def sibling_revisions(destination: Path) -> list[int]:
+    """Revisions of the staging/backup directories an interrupted run left."""
+    revisions = []
+    for pattern in (".staging-r*", ".backup-r*"):
+        for path in destination.parent.glob(destination.name + pattern):
+            revision = _revision_of(path)
+            if revision is not None:
+                revisions.append(revision)
+    return sorted(revisions)
+
+
+def manifest_revision(manifest_path: Path) -> int | None:
     if not manifest_path.exists():
-        return 1
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
     revision = manifest.get("revision")
-    if not isinstance(revision, int) or revision < 1:
-        raise ValueError(f"invalid existing revision in {manifest_path}")
-    return revision + 1
+    return revision if isinstance(revision, int) and revision >= 1 else None
+
+
+def last_known_revision(destination: Path) -> int | None:
+    """Highest revision the destination tree proves, even when the destination
+    is absent because a swap was interrupted after the first rename."""
+    candidates = [
+        revision
+        for revision in (manifest_revision(destination / "manifest.json"),)
+        if revision is not None
+    ]
+    candidates.extend(sibling_revisions(destination))
+    return max(candidates) if candidates else None
+
+
+def next_revision(destination: Path) -> int:
+    last = last_known_revision(destination)
+    return 1 if last is None else last + 1
+
+
+def recover_destination(destination: Path) -> None:
+    """Undo an interrupted swap.
+
+    A crash between the two renames leaves the destination absent with its
+    content under ``<destination>.backup-rN``. Restoring the newest backup is
+    what the on-disk state says happened; deriving the revision from a missing
+    destination would look for the wrong backup.
+    """
+    backups = sorted(
+        (path for path in destination.parent.glob(destination.name + ".backup-r*") if path.is_dir()),
+        key=lambda path: _revision_of(path) or 0,
+    )
+    if destination.exists():
+        for path in backups:
+            shutil.rmtree(path, ignore_errors=True)
+        return
+    if not backups:
+        return
+    backups[-1].rename(destination)
+    for path in backups[:-1]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def read_signing_key(value: str) -> str:
+    """The signing key is either hex or a path to a file containing it."""
+    candidate = Path(value)
+    if candidate.is_file():
+        return candidate.read_text(encoding="utf-8").strip()
+    return value.strip()
+
+
+def sign_manifest(manifest_path: Path, signing_key: str) -> None:
+    """Sign the staged manifest before it is activated.
+
+    ``scripts/sign_manifest.swift`` signs the canonical unsigned payload and
+    self-checks the signature, so an unusable signature fails publishing
+    instead of exposing an unsigned snapshot.
+    """
+    signer = Path(__file__).resolve().parent / "sign_manifest.swift"
+    if not signer.exists():
+        raise ValueError(f"manifest signer not found: {signer}")
+    result = subprocess.run(
+        ["swift", str(signer), "--sign", str(manifest_path), signing_key],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ValueError(f"manifest signing failed: {detail}")
+    signed = json.loads(result.stdout)
+    signature = signed.get("signature")
+    if not isinstance(signature, str) or len(signature) != 128:
+        raise ValueError("signer returned no usable Ed25519 signature")
+    write_json_atomic(manifest_path, signed)
 
 
 def sync_opml_tree(source_root: Path, destination_root: Path, source_files: list[Path]) -> list[Path]:
@@ -147,15 +238,13 @@ def publish(args: argparse.Namespace) -> dict:
     if revision < 1:
         raise ValueError("revision must be positive")
 
-    # P1-04: enforce strict monotonicity
-    existing_manifest_path = destination / "manifest.json"
-    if existing_manifest_path.exists():
-        existing = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
-        existing_rev = existing.get("revision")
-        if isinstance(existing_rev, int) and revision <= existing_rev:
-            raise ValueError(
-                f"revision {revision} is not greater than existing revision {existing_rev}"
-            )
+    # P1-04: enforce strict monotonicity against the destination and against
+    # any staging/backup directory left behind by an interrupted run.
+    last_revision = last_known_revision(destination)
+    if last_revision is not None and revision <= last_revision:
+        raise ValueError(
+            f"revision {revision} is not greater than the last known revision {last_revision}"
+        )
 
     # P1-09: Stage the complete snapshot in a temporary directory and
     # atomically activate it. If any step fails, the destination is left
@@ -180,25 +269,35 @@ def publish(args: argparse.Namespace) -> dict:
         "revision": revision,
         "schemaVersion": SCHEMA_VERSION,
         "sourceCount": source_count,
-        # P0-02: The Swift manifest decoder expects this field. It is set to
-        # an empty string during publishing; the release process signs the
-        # manifest before the snapshot is activated.
+        # P0-02: the Swift manifest decoder expects this field. It stays empty
+        # only until the signing step below fills it; an unsigned snapshot is
+        # reported (and can be refused with --require-signature).
         "signature": "",
     }
     write_json_atomic(staging / "manifest.json", manifest)
 
+    # The snapshot is signed (and the signature self-checked) while it is still
+    # staging: an unsigned or unsignable snapshot is never activated.
+    signing_key = getattr(args, "signing_key", None)
+    if signing_key:
+        sign_manifest(staging / "manifest.json", read_signing_key(signing_key))
+        manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+    if not manifest.get("signature"):
+        if getattr(args, "require_signature", False):
+            raise ValueError("refusing to activate an unsigned manifest: pass --signing-key")
+        print(
+            "warning: activating an UNSIGNED snapshot (no --signing-key); "
+            "pass --require-signature to make this fatal",
+            file=sys.stderr,
+        )
+
     # P1-09: Atomically activate the complete snapshot.
     # Strategy: move old destination aside → rename staging in → remove old.
-    # If the process dies between steps 1 and 2, the next run recovers by
-    # cleaning up the backup. Readers see either the complete old revision
-    # or the complete new one — never a mixed Feeds/ + manifest.json.
+    # A crash between the two renames leaves <destination>.backup-rN, which the
+    # next run restores before publishing anything else.
+    recover_destination(destination)
     backup = destination.with_name(destination.name + f".backup-r{revision}")
-    # If a backup from a prior crashed run exists, restore it — the crash
-    # happened before staging completed, so the destination may be absent
-    # or incomplete.
-    if backup.exists() and not destination.exists():
-        backup.rename(destination)
-    elif backup.exists():
+    if backup.exists():
         shutil.rmtree(backup)
     if destination.exists():
         destination.rename(backup)
@@ -235,6 +334,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--destination", type=Path, required=True, help="feed-repository checkout")
     parser.add_argument("--revision", type=int, help="explicit monotonically increasing revision")
     parser.add_argument("--generated-at", help="fixed ISO-8601 timestamp (primarily for tests)")
+    parser.add_argument(
+        "--signing-key",
+        help="Ed25519 private key (hex, or path to a file holding it) used to sign the "
+        "manifest before the snapshot is activated",
+    )
+    parser.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="fail instead of activating a snapshot whose manifest carries no signature",
+    )
     parser.add_argument(
         "--bundle-manifest",
         type=Path,

@@ -109,12 +109,24 @@ def _build_country_qid_map(countries: dict, fresh: bool = False) -> dict[str, st
     return qid_map
 
 
+def _load_cached(path: Path) -> list[dict]:
+    """Return the last valid cached payload for a country, or [] when there is none."""
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def _fetch_museums_for_country(
     country_qid: str, country_name: str, country_slug: str
-) -> list[dict]:
+) -> list[dict] | None:
     """Query Wikidata for art + culture museums in a given country.
 
-    Returns list of {name, wikidata_id, website, youtube, instagram, twitter, wikipedia_url}.
+    Returns list of {name, wikidata_id, website, youtube, instagram, twitter, wikipedia_url},
+    or None when the SPARQL request failed — a transient failure must not be cached
+    as "this country has no museums".
     """
     # Build UNION clauses for each museum type
     union_parts = []
@@ -150,7 +162,7 @@ def _fetch_museums_for_country(
             data = json.loads(resp.read())
     except Exception as e:
         print(f"  ✗ SPARQL query failed for {country_name}: {e}", file=sys.stderr)
-        return []
+        return None
 
     bindings = data.get("results", {}).get("bindings", [])
     museums: list[dict] = []
@@ -225,13 +237,14 @@ def build_museum_list(
     for i, (slug, cdata) in enumerate(countries.items()):
         iso2 = cdata["iso2"].upper()
         country_qid = qid_map.get(iso2)
+        cache_path = by_country_dir / f"{slug}.json"
+
         if not country_qid:
             print(f"  [{i+1}/{total_countries}] ⚠ {cdata['name']}: no Q-ID, skipping", file=sys.stderr)
-            all_results[slug] = []
+            all_results[slug] = _load_cached(cache_path)
             continue
 
         # Check cache
-        cache_path = by_country_dir / f"{slug}.json"
         if not fresh and cache_path.exists():
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             print(f"  [{i+1}/{total_countries}] ✓ {cdata['name']}: {len(cached)} museums (cached)", file=sys.stderr)
@@ -240,6 +253,11 @@ def build_museum_list(
 
         print(f"  [{i+1}/{total_countries}] Fetching museums in {cdata['name']}...", file=sys.stderr)
         museums = _fetch_museums_for_country(country_qid, cdata["name"], slug)
+        if museums is None:
+            # Transient failure: keep the last valid answer, never cache [].
+            print(f"    ✗ fetch failed — keeping previous data for {cdata['name']}", file=sys.stderr)
+            all_results[slug] = _load_cached(cache_path)
+            continue
         print(f"    → {len(museums)} museums found", file=sys.stderr)
 
         # Save per-country cache
@@ -249,19 +267,27 @@ def build_museum_list(
         if i < total_countries - 1:
             time.sleep(0.5)  # Rate limit
 
-    # Write combined file
+    # Write combined file — merged over countries this run did not process, so a
+    # single-country run (--country X) never drops the rest of the aggregate.
     combined_path = DATA_DIR / "all_museums.json"
-    combined_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False), encoding="utf-8")
+    combined: dict[str, list[dict]] = {}
+    if combined_path.exists():
+        try:
+            combined = json.loads(combined_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            combined = {}
+    combined.update(all_results)
+    combined_path.write_text(json.dumps(combined, indent=2, ensure_ascii=False), encoding="utf-8")
 
     # Stats
-    total = sum(len(v) for v in all_results.values())
-    with_websites = sum(1 for v in all_results.values() for m in v if m["website"])
-    with_youtube = sum(1 for v in all_results.values() for m in v if m["youtube"])
-    with_social = sum(1 for v in all_results.values() for m in v if m["instagram"] or m["twitter"])
-    countries_with_data = sum(1 for v in all_results.values() if len(v) > 0)
+    total = sum(len(v) for v in combined.values())
+    with_websites = sum(1 for v in combined.values() for m in v if m["website"])
+    with_youtube = sum(1 for v in combined.values() for m in v if m["youtube"])
+    with_social = sum(1 for v in combined.values() for m in v if m["instagram"] or m["twitter"])
+    countries_with_data = sum(1 for v in combined.values() if len(v) > 0)
 
     print(f"\n{'='*60}", file=sys.stderr)
-    print(f"Total: {total} museums across {countries_with_data}/{len(all_results)} countries", file=sys.stderr)
+    print(f"Total: {total} museums across {countries_with_data}/{len(combined)} countries", file=sys.stderr)
     print(f"  With websites: {with_websites} ({with_websites/total*100:.1f}%)" if total else "  With websites: 0", file=sys.stderr)
     print(f"  With YouTube:  {with_youtube} ({with_youtube/total*100:.1f}%)" if total else "  With YouTube: 0", file=sys.stderr)
     print(f"  With social:   {with_social} ({with_social/total*100:.1f}%)" if total else "  With social: 0", file=sys.stderr)

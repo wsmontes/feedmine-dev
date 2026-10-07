@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scripts.catalog_collections import PRODUCTION_COUNTRY_COLLECTION
 from scripts.feed_discovery import registry
 
 DATA = Path(__file__).resolve().parents[1] / "data"
-COUNTRIES_DIR = Path(__file__).resolve().parents[3] / "feedmine" / "Resources" / "Feeds" / "countries"
+COUNTRIES_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "feedmine" / "Resources" / "Feeds" / PRODUCTION_COUNTRY_COLLECTION
+)
 
 
 def test_every_country_folder_has_metadata():

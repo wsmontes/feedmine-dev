@@ -12,7 +12,13 @@ from pathlib import Path
 
 from .checker import run_checks
 from .cleaner import clean_dead_feeds
-from .constants import DEFAULT_CONCURRENCY, DEFAULT_RETRIES, DEFAULT_TIMEOUT, USER_AGENT
+from .constants import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT,
+    PERMANENT_DEAD_STATUSES,
+    USER_AGENT,
+)
 from .models import CheckResult, Report
 from .reporter import print_terminal_report, write_json_report
 from .scanner import scan_directory
@@ -36,6 +42,8 @@ def main(argv: list[str] | None = None) -> None:
         if scan_errors:
             for e in scan_errors:
                 print(f"  Error in {e['file']}: {e['error']}", file=sys.stderr)
+            # Nothing was readable — a gate must not report success.
+            sys.exit(1)
         sys.exit(0)
 
     print(f"   {len(feeds)} feeds across {len({f.source_file for f in feeds})} OPML files.\n",
@@ -119,13 +127,45 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- Clean ---------------------------------------------------------------
     if args.clean:
-        modified = clean_dead_feeds(results, root)
+        # A single-file scan stores ``source_file`` relative to the file's
+        # parent, so the cleaner must resolve against that same base.
+        clean_root = root.parent if root.is_file() else root
+        modified = clean_dead_feeds(results, clean_root)
         print(f"🧹 Cleaned {modified} OPML file(s) — dead feeds removed.")
+        deferred = sum(
+            1 for r in results
+            if r.status == "dead" and r.status_code not in PERMANENT_DEAD_STATUSES
+        )
+        if deferred:
+            print(
+                f"   ⏸️  {deferred} unreachable feed(s) kept (no confirmed 404/410) — review manually.",
+                file=sys.stderr,
+            )
 
-    # Exit code — non-zero if any dead/error
-    failed = counts.get("dead", 0) + counts.get("error", 0)
+    # Exit code — non-zero on any unreadable OPML file or on dead/error/invalid
+    # results.  ``stale``/``redirected`` feeds are still usable.
+    failed = (
+        counts.get("dead", 0)
+        + counts.get("error", 0)
+        + counts.get("invalid", 0)
+        + len(scan_errors)
+    )
     if failed > 0:
         sys.exit(1)
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (got {value})")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be zero or greater (got {value})")
+    return number
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -153,11 +193,11 @@ Examples:
         help="1=reachability  2=+content-validity  3=+freshness (default: 3)",
     )
     p.add_argument(
-        "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+        "--concurrency", type=_positive_int, default=DEFAULT_CONCURRENCY,
         help=f"Max simultaneous requests (default: {DEFAULT_CONCURRENCY})",
     )
     p.add_argument(
-        "--timeout", type=int, default=DEFAULT_TIMEOUT,
+        "--timeout", type=_positive_int, default=DEFAULT_TIMEOUT,
         help=f"Per-request timeout in seconds (default: {DEFAULT_TIMEOUT})",
     )
     p.add_argument(
@@ -177,7 +217,7 @@ Examples:
         help="Custom User-Agent header",
     )
     p.add_argument(
-        "--retries", type=int, default=DEFAULT_RETRIES,
+        "--retries", type=_non_negative_int, default=DEFAULT_RETRIES,
         help=f"Retries per URL on failure (default: {DEFAULT_RETRIES})",
     )
     p.add_argument(
