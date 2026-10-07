@@ -272,13 +272,11 @@ struct V2MediaPreparer: FeedCompositionMediaPreparing {
                   contentDigest: digestText,
                   recipeVersion: recipeValue
               ),
-              let asset,
               let digest = try? LocalAssetStore.digest(hex: digestText),
               let recipe = try? MediaRecipeVersion(recipeValue),
               let bytes = try? assets.storedBytes(
                   for: AssetVersionID(contentDigest: digest, recipeVersion: recipe)
-              ),
-              let bytes
+              )
         else {
             return nil
         }

@@ -31,6 +31,8 @@
 		C0FEED2B00000000000000E2 /* V2Acquisition.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000E2 /* V2Acquisition.swift */; };
 		C0FEED2B00000000000000F1 /* CanonicalContentSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000F1 /* CanonicalContentSearch.swift */; };
 		C0FEED2B00000000000000E3 /* V2FullRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000E3 /* V2FullRuntime.swift */; };
+		C0FEED2B00000000000000F3 /* TestConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000F3 /* TestConfiguration.swift */; };
+		C0FEED2B00000000000000F2 /* V2MediaPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000F2 /* V2MediaPipeline.swift */; };
 		C0FEED2B00000000000000E4 /* LegacyAcquisitionGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000E4 /* LegacyAcquisitionGate.swift */; };
 		C0FEED2B00000000000000E1 /* SyndicationAcquisitionSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A00000000000000E1 /* SyndicationAcquisitionSource.swift */; };
 		C0FEED2B0000000000000023 /* ShadowInputBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FEED2A0000000000000023 /* ShadowInputBridge.swift */; };
@@ -301,6 +303,8 @@
 		C0FEED2A00000000000000E2 /* V2Acquisition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = V2Acquisition.swift; sourceTree = "<group>"; };
 		C0FEED2A00000000000000F1 /* CanonicalContentSearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanonicalContentSearch.swift; sourceTree = "<group>"; };
 		C0FEED2A00000000000000E3 /* V2FullRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = V2FullRuntime.swift; sourceTree = "<group>"; };
+		C0FEED2A00000000000000F3 /* TestConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestConfiguration.swift; sourceTree = "<group>"; };
+		C0FEED2A00000000000000F2 /* V2MediaPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = V2MediaPipeline.swift; sourceTree = "<group>"; };
 		C0FEED2A00000000000000E4 /* LegacyAcquisitionGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyAcquisitionGate.swift; sourceTree = "<group>"; };
 		C0FEED2A00000000000000E1 /* SyndicationAcquisitionSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyndicationAcquisitionSource.swift; sourceTree = "<group>"; };
 		C0FEED2A0000000000000023 /* ShadowInputBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowInputBridge.swift; sourceTree = "<group>"; };
@@ -573,6 +577,7 @@
 				C0FEED2A00000000000000E1 /* SyndicationAcquisitionSource.swift */,
 				C0FEED2A00000000000000E4 /* LegacyAcquisitionGate.swift */,
 				C0FEED2A00000000000000E3 /* V2FullRuntime.swift */,
+				C0FEED2A00000000000000F2 /* V2MediaPipeline.swift */,
 				C0FEED2A00000000000000E2 /* V2Acquisition.swift */,
 				C0FEED2A0000000000000024 /* ShadowComparator.swift */,
 				C0FEED2A00000000000000A1 /* MainFeedCardBridge.swift */,
@@ -766,6 +771,7 @@
 			isa = PBXGroup;
 			children = (
 				2B6F6F47D610412DB5773479 /* AdaptiveScheduler.swift */,
+				C0FEED2A00000000000000F3 /* TestConfiguration.swift */,
 				7211F172980C9D80444C575E /* AppSettings.swift */,
 				01C4ABF16D3BCCA6595D02EA /* AudioPlayerManager.swift */,
 				7C1C800202327D772D477468 /* BookmarkStore.swift */,
@@ -1336,6 +1342,8 @@
 				C0FEED2B00000000000000E1 /* SyndicationAcquisitionSource.swift in Sources */,
 				C0FEED2B00000000000000E4 /* LegacyAcquisitionGate.swift in Sources */,
 				C0FEED2B00000000000000E3 /* V2FullRuntime.swift in Sources */,
+				C0FEED2B00000000000000F3 /* TestConfiguration.swift in Sources */,
+				C0FEED2B00000000000000F2 /* V2MediaPipeline.swift in Sources */,
 				C0FEED2B00000000000000E2 /* V2Acquisition.swift in Sources */,
 				C0FEED2B00000000000000F1 /* CanonicalContentSearch.swift in Sources */,
 				C0FEED2B0000000000000024 /* ShadowComparator.swift in Sources */,

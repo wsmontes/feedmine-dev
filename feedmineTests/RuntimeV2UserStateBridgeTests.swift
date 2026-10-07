@@ -209,8 +209,9 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             at: fixedDate
         )
 
+        let operationsBySubject = await store.bookmarkStore.newestOperationsBySubject()
         let operation = try XCTUnwrap(
-            await store.bookmarkStore.newestOperationsBySubject().first {
+            operationsBySubject.first {
                 $0.operationID == "op-list-roundtrip"
             }
         )
@@ -247,8 +248,9 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             at: fixedDate.addingTimeInterval(2)
         )
 
+        let bookmarkedAnywhere = try await store.bookmarkStore.isBookmarkedAnywhere(itemID: article.id)
         XCTAssertTrue(
-            try await store.bookmarkStore.isBookmarkedAnywhere(itemID: article.id),
+            bookmarkedAnywhere,
             "the durable authority still has the item in the second box"
         )
         let projections = UserStateProjectionStore(database: runtimeDatabase)
@@ -337,8 +339,9 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             )?.lastOperationID,
             "op-launch-reconcile"
         )
+        let secondReport = await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1))
         XCTAssertEqual(
-            await bridge.reconcileForLaunch(at: fixedDate.addingTimeInterval(1)),
+            secondReport,
             ReplayReport(applied: 0, failed: 0),
             "the launch repair is idempotent across both projections"
         )
@@ -408,8 +411,9 @@ final class RuntimeV2UserStateBridgeTests: XCTestCase {
             at: fixedDate
         )
 
+        let newestOperations = await store.bookmarkStore.newestOperationsBySubject()
         let newest = try XCTUnwrap(
-            await store.bookmarkStore.newestOperationsBySubject().first {
+            newestOperations.first {
                 $0.subjectID == article.id
             }
         )
