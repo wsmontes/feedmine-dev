@@ -136,6 +136,10 @@ public struct SyndicationTranslation: Hashable, Sendable {
 
     public var observations: [AcquisitionObservation] { items.map(\.observation) }
 
+    /// The declared items this run passed over: translated or rejected. It is what a checkpoint's
+    /// offset through a sliced document advances by.
+    public var consumedItemCount: Int { items.count + rejections.count }
+
     /// The representation record a confirmed baseline stores: one entry per translated object.
     public var observedRepresentations: [String: SyndicationRepresentationStamp] {
         var map: [String: SyndicationRepresentationStamp] = [:]
@@ -174,6 +178,7 @@ public struct SyndicationTranslator: Sendable {
         scope: ExternalScopeKey,
         observedAt: Date,
         maxItems requestedItems: Int,
+        skipping consumedItems: Int = 0,
         previousRepresentations: [String: SyndicationRepresentationStamp] = [:],
         enrollment: SyndicationSourceEnrollment? = nil
     ) -> Result<SyndicationTranslation, SyndicationTranslationError> {
@@ -192,6 +197,7 @@ public struct SyndicationTranslator: Sendable {
                 scope: scope,
                 observedAt: observedAt,
                 ceiling: ceiling,
+                consumed: max(consumedItems, 0),
                 previous: previousRepresentations,
                 enrollment: enrollment
             ))
@@ -201,6 +207,7 @@ public struct SyndicationTranslator: Sendable {
                 scope: scope,
                 observedAt: observedAt,
                 ceiling: ceiling,
+                consumed: max(consumedItems, 0),
                 previous: previousRepresentations,
                 enrollment: enrollment
             ))
@@ -220,6 +227,7 @@ public struct SyndicationTranslator: Sendable {
         scope: ExternalScopeKey,
         observedAt: Date,
         ceiling: Int,
+        consumed: Int,
         previous: [String: SyndicationRepresentationStamp],
         enrollment: SyndicationSourceEnrollment?
     ) -> SyndicationTranslation {
@@ -232,7 +240,10 @@ public struct SyndicationTranslator: Sendable {
 
         var items: [SyndicationTranslatedItem] = []
         var rejections: [SyndicationItemRejection] = []
-        let slice = declared.prefix(max(ceiling, 0))
+        // A sliced document is consumed in order: the items earlier slices already passed over are
+        // skipped, so the next slice continues the document instead of translating the same prefix
+        // again (ADR-005 D4 — split into batches, never repeat a prefix).
+        let slice = declared.dropFirst(consumed).prefix(max(ceiling, 0))
         for (index, item) in slice.enumerated() {
             let parsed = ParsedItem(
                 declaredIdentifier: item.guid?.value,
@@ -257,7 +268,8 @@ public struct SyndicationTranslator: Sendable {
                 enrollment: enrollment
             ) {
             case .success(let translated): items.append(translated)
-            case .failure(let failure): rejections.append(SyndicationItemRejection(index: index, reason: failure.reason))
+            case .failure(let failure):
+                rejections.append(SyndicationItemRejection(index: index + consumed, reason: failure.reason))
             }
         }
 
@@ -266,7 +278,7 @@ public struct SyndicationTranslator: Sendable {
             items: items,
             rejections: rejections,
             declaredItemCount: declared.count,
-            truncatedByItemCeiling: declared.count > slice.count,
+            truncatedByItemCeiling: declared.count > consumed + slice.count,
             declaresFeedMetadata: declaresFeedMetadata
         )
     }
@@ -290,6 +302,7 @@ public struct SyndicationTranslator: Sendable {
         scope: ExternalScopeKey,
         observedAt: Date,
         ceiling: Int,
+        consumed: Int,
         previous: [String: SyndicationRepresentationStamp],
         enrollment: SyndicationSourceEnrollment?
     ) -> SyndicationTranslation {
@@ -300,7 +313,8 @@ public struct SyndicationTranslator: Sendable {
 
         var items: [SyndicationTranslatedItem] = []
         var rejections: [SyndicationItemRejection] = []
-        let slice = declared.prefix(max(ceiling, 0))
+        // The same slice rule as RSS: a document continues past what earlier slices consumed.
+        let slice = declared.dropFirst(consumed).prefix(max(ceiling, 0))
         for (index, entry) in slice.enumerated() {
             let links = entry.links ?? []
             let alternates = links.filter { Self.relation(of: $0) == "alternate" }
@@ -428,7 +442,15 @@ public struct SyndicationTranslator: Sendable {
         var versionKey: ExternalVersionKey?
         if let declaredVersion {
             do {
-                versionKey = try ExternalVersionKey(scope: scope, text: declaredVersion)
+                // The version key is scoped to the object it is a version *of*. A document regularly
+                // declares one instant for many items — a batch publication does — and a feed-wide key
+                // made those independent articles claim a single alias, which Admission refuses as an
+                // ambiguous alias: the whole batch stopped being admitted for a legitimate collision
+                // (ADR-003 D9, D11).
+                versionKey = try ExternalVersionKey(
+                    scope: scope,
+                    bytes: Self.versionKeyBytes(object: identityRef.key, version: declaredVersion)
+                )
             } catch let error as ExternalIdentityError {
                 return .failure(SyndicationItemFailure(Self.describe(.keyRejected(error))))
             } catch {
@@ -477,6 +499,25 @@ public struct SyndicationTranslator: Sendable {
             representation: representation,
             secondaryLinks: parsed.secondaryLinks
         ))
+    }
+
+    /// The bytes of one representation's version key: the object key, then the declared version, each
+    /// length-prefixed so that no pair of values can encode to the same bytes (ADR-003 D8).
+    ///
+    /// The object key is carried in full rather than as a digest: a digest prunes a lookup and never
+    /// decides identity (ADR-003 D8, `invariant 9`).
+    static func versionKeyBytes(object: ExternalObjectKey, version: String) -> Data {
+        var bytes = Data()
+        bytes.append(lengthPrefixed(object.bytes))
+        bytes.append(lengthPrefixed(Data(version.utf8)))
+        return bytes
+    }
+
+    private static func lengthPrefixed(_ part: Data) -> Data {
+        var length = UInt64(part.count).bigEndian
+        var data = withUnsafeBytes(of: &length) { Data($0) }
+        data.append(part)
+        return data
     }
 
     /// The wire format's declared instant, rendered in one fixed form (ISO 8601, UTC, second

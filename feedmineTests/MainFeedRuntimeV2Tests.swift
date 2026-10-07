@@ -544,17 +544,18 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertEqual(
             legacy,
             .runway(
-                fetched: 1,
-                target: 3,
+                fetched: 0,
+                target: 12,
                 isReady: false,
                 recentlyFetchedSourceNames: ["Legacy Source"],
                 hasPreviouslyLoadedContent: false
-            )
+            ),
+            "the runway lane's fraction is the articles the reader's page is made of, not the sources the runway verified"
         )
-        XCTAssertEqual(legacy.displayedCount, 1)
-        XCTAssertEqual(legacy.detail, "1/3")
-        XCTAssertEqual(legacy.percentage, "33%")
-        XCTAssertEqual(legacy.accessibilityValue, "1/3")
+        XCTAssertEqual(legacy.displayedCount, 0)
+        XCTAssertEqual(legacy.detail, "0 of 12 articles")
+        XCTAssertEqual(legacy.percentage, "0%")
+        XCTAssertEqual(legacy.accessibilityValue, "0 of 12 articles ready")
         XCTAssertEqual(legacy.rotatingSourceTitles, ["Legacy Source"])
         XCTAssertTrue(legacy.hasProgressBar)
 
@@ -611,8 +612,8 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             XCTAssertEqual(
                 FeedLoadingDisplay.forSurface(session: runtime.sessionLoadingStatement, loader: loader),
                 .runway(
-                    fetched: 1,
-                    target: 3,
+                    fetched: 0,
+                    target: 12,
                     isReady: false,
                     recentlyFetchedSourceNames: ["Legacy Source"],
                     hasPreviouslyLoadedContent: false
@@ -651,7 +652,7 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         )
         XCTAssertEqual(
             FeedLoadingDisplay.forSurface(session: runtime.sessionLoadingStatement, loader: loader).detail,
-            "1/3"
+            "0 of 12 articles"
         )
 
         // Back on the selection the session owns, the statement is the session's again.
@@ -959,14 +960,13 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             )
         )
         XCTAssertEqual(legacy.source, "legacy")
-        let legacyArticles = "· 0 of \(loader.startupItemsTarget) articles for your first screen"
         XCTAssertEqual(
             legacy.content(readyPulse: false),
             .figures(
-                counter: "· 1/4",
-                articles: legacyArticles,
+                counter: "· 0/\(loader.startupItemsTarget) articles",
+                articles: nil,
                 isComplete: false,
-                label: "1 of 4 sources verified"
+                label: "0 of \(loader.startupItemsTarget) articles ready for the first screen, 1 of 4 sources verified"
             )
         )
         // The cue is what keeps the figures up for the 1.4 s after the wave is ready, so the same lane
@@ -974,10 +974,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
         XCTAssertEqual(
             legacy.content(readyPulse: true),
             .figures(
-                counter: "· 1/4",
-                articles: legacyArticles,
+                counter: "· 0/\(loader.startupItemsTarget) articles",
+                articles: nil,
                 isComplete: true,
-                label: "1 of 4 sources verified"
+                label: "0 of \(loader.startupItemsTarget) articles ready for the first screen, 1 of 4 sources verified"
             )
         )
         XCTAssertNotEqual(display, legacy, "the statement is not the runway's counters")
@@ -1085,14 +1085,16 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             XCTAssertEqual(display.source, "legacy", name)
             XCTAssertEqual(display.runwayReady, false, name)
             XCTAssertEqual(display.content(readyPulse: false), .catalogueLine("·4/4 sources"), name)
-            // The transient cue still shows the startup figures, as it did: it is the chip's own shape.
+            // The transient cue still shows the startup figures, as it did: one figure, the articles the
+            // reader's first screen is made of (the source counts moved into the accessibility label, where
+            // there is room for them — on the chip they were truncated: `· 2/77… · 0 of 1…`, measured).
             XCTAssertEqual(
                 display.content(readyPulse: true),
                 .figures(
-                    counter: "· 0/4",
-                    articles: "· 0 of \(loader.startupItemsTarget) articles for your first screen",
+                    counter: "· 0/\(loader.startupItemsTarget) articles",
+                    articles: nil,
                     isComplete: true,
-                    label: "0 of 4 sources verified"
+                    label: "0 of \(loader.startupItemsTarget) articles ready for the first screen, 0 of 4 sources verified"
                 ),
                 name
             )
@@ -1104,14 +1106,14 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             XCTAssertEqual(
                 preparing.content(readyPulse: false),
                 .figures(
-                    counter: "· 1/4",
-                    articles: "· 0 of \(loader.startupItemsTarget) articles for your first screen",
+                    counter: "· 0/\(loader.startupItemsTarget) articles",
+                    articles: nil,
                     isComplete: false,
-                    label: "1 of 4 sources verified"
+                    label: "0 of \(loader.startupItemsTarget) articles ready for the first screen, 1 of 4 sources verified"
                 ),
                 name
             )
-            XCTAssertEqual(preparing.diagnosticValue, "· 1/4", name)
+            XCTAssertEqual(preparing.diagnosticValue, "· 0/\(loader.startupItemsTarget) articles", name)
         }
 
         // The acquiring mode, on the selection the session's plan was not built for: that surface's own
@@ -1151,10 +1153,10 @@ final class MainFeedRuntimeV2Tests: XCTestCase {
             CompactFeedDisplay.forSurface(session: runtime.sessionChipStatement, loader: loader)
                 .content(readyPulse: false),
             .figures(
-                counter: "· 1/0",
-                articles: "· 0 of \(loader.startupItemsTarget) articles for your first screen",
+                counter: "· 0/\(loader.startupItemsTarget) articles",
+                articles: nil,
                 isComplete: false,
-                label: "1 of 0 sources verified"
+                label: "0 of \(loader.startupItemsTarget) articles ready for the first screen, 1 of 0 sources verified"
             )
         )
 

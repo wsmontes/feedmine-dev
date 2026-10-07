@@ -1746,12 +1746,16 @@ final class FeedStoreTests: XCTestCase {
         ))
     }
 
-    /// Review P0.3 — the **publish** gate is a complete page of distinct providers, not a screenful.
+    /// The **publish** gate: a full page of items with a diversity *floor* — not a screenful, and not one
+    /// provider per item.
     ///
-    /// The old trigger was `coldStartImmediateItemCount` (12 items), which is the `Loading → partial → better` sequence
-    /// the review forbids: twelve items appeared, the reader started scrolling, and the page grew underneath them. These
-    /// assertions pin the three interesting shapes — a screenful, a full page from too few providers, and a full page
-    /// with the Reservoir's breadth — so the gate cannot quietly relax back to "the reservoir has something".
+    /// The item floor is what stops the `Loading → partial → better` sequence the review forbids (twelve
+    /// items appeared, the reader started scrolling, and the page grew underneath them). The provider
+    /// floor does not mirror the item count: demanding `Reservoir.pageSize` distinct providers made the
+    /// gate unreachable, because the cold-start fetch stops at three successful sources by design — the
+    /// batch that produced 70 real items could never satisfy `count == providers`, and the measured cost
+    /// was that whole batch withheld behind a false "No articles found for…" surface for the last 18 s of
+    /// a 54 s cold start.
     func testColdStartPageGateRequiresAFullPageOfDistinctProviders() {
         func items(sourceCount: Int, itemsPerSource: Int) -> [FeedItem] {
             (0..<sourceCount).flatMap { source in
@@ -1768,10 +1772,13 @@ final class FeedStoreTests: XCTestCase {
         }
 
         XCTAssertFalse(FeedStore.coldStartPageIsReady(items(sourceCount: 6, itemsPerSource: 2)),
-                       "a screenful from six providers is not a page")
-        XCTAssertFalse(FeedStore.coldStartPageIsReady(items(sourceCount: 5, itemsPerSource: 8)),
-                       "forty items from five providers is volume, not breadth")
-        XCTAssertTrue(FeedStore.coldStartPageIsReady(items(sourceCount: Reservoir.pageSize, itemsPerSource: 1)))
+                       "twelve items is a screenful, not a page")
+        XCTAssertFalse(FeedStore.coldStartPageIsReady(items(sourceCount: 1, itemsPerSource: 40)),
+                       "one provider is a single channel, however many items it delivered")
+        XCTAssertTrue(FeedStore.coldStartPageIsReady(items(sourceCount: Reservoir.pageSize, itemsPerSource: 1)),
+                      "a page from a page's worth of providers")
+        XCTAssertTrue(FeedStore.coldStartPageIsReady(items(sourceCount: 3, itemsPerSource: 30)),
+                      "the measured cold-start shape: 70 publishable items from the three sources the fetch stops at")
     }
 
     func testWhatsNewUsesTheSameLanguageFilterAsMainFeed() throws {
@@ -4047,6 +4054,306 @@ final class FeedStoreTests: XCTestCase {
         XCTAssertEqual(
             sourceCountWhenPublished, 0,
             "the cached page must be published before the catalogue loads; nil means it was never published early"
+        )
+    }
+
+    // MARK: - Code review 2026-10-06: Stores slice (S17, S18, S21, S22)
+
+    /// S17: resetAllToggles must republish enablement caches even when the
+    /// counts were already current (the common, settled state).
+    func testResetAllTogglesPublishesFreshEnablementCaches() {
+        let registry = SourceRegistry()
+        registry.sources = [
+            FeedSource(title: "A", url: "https://reset-a.example/feed", category: "News", language: "en"),
+            FeedSource(title: "B", url: "https://reset-b.example/feed", category: "News", language: "en"),
+        ]
+        registry.setCategoryEnabled("News", enabled: false)
+        // Settle the caches: this recomputes synchronously and marks counts current.
+        XCTAssertEqual(registry.enabledSources.count, 0)
+        XCTAssertEqual(registry.activeCount(for: "cat:News"), 0)
+
+        registry.resetAllToggles()
+
+        XCTAssertEqual(registry.enabledSources.count, 2, "reset must refresh the source cache immediately")
+        XCTAssertEqual(registry.activeCount(for: "cat:News"), 2, "reset must refresh the counts immediately")
+        XCTAssertEqual(registry.languageCountSnapshot().enabled["en"], 2)
+    }
+
+    /// S18: a source whose own region *is* the country must not have its country
+    /// delta applied twice.
+    func testActiveCountCountsCountrySourceOnce() {
+        let registry = SourceRegistry()
+        registry.sources = [
+            FeedSource(title: "Brazil base", url: "https://brazil.example/feed",
+                       category: "News", region: "countries/brazil"),
+            FeedSource(title: "Sao Paulo", url: "https://sp.example/feed",
+                       category: "News", region: "countries/brazil/sao-paulo"),
+        ]
+
+        XCTAssertEqual(registry.activeCount(for: "region:countries/brazil"), 2,
+                       "one base source plus one sub-region source is two active sources in the country")
+        XCTAssertEqual(registry.activeCount(for: "region:countries/brazil/sao-paulo"), 1)
+    }
+
+    /// S21: advancing must promote the unseen batch, not hand back the batch
+    /// that is already on screen.
+    func testAdvanceWhatsNewPromotesUnseenBatchWhenPoolHasMore() throws {
+        let store = try FeedStore(inMemory: true)
+        let urls = (0..<20).map { "https://whatsnew\($0).example/feed" }
+        store.registry.sources = urls.map {
+            FeedSource(title: "What's New", url: $0, category: "News", language: "en")
+        }
+        store.activeLanguages = ["en"]
+        let now = Date()
+        let items = (0..<20).map { index in
+            FeedItem(
+                id: "wn-\(index)", sourceTitle: "What's New", sourceURL: urls[index],
+                category: "News", title: "What's New \(index)", excerpt: "x",
+                url: "https://whatsnew.example/\(index)", imageURL: nil,
+                publishedAt: now.addingTimeInterval(TimeInterval(-index)),
+                region: "global", language: "en"
+            )
+        }
+        store.collectWhatsNewCandidates(items)
+        let shown = Set(store.whatsNewItems.map(\.id))
+        XCTAssertEqual(shown.count, 10, "precondition: the carousel fills from the pool")
+
+        store.advanceWhatsNew()
+
+        let next = Set(store.whatsNewItems.map(\.id))
+        XCTAssertEqual(next.count, 10)
+        XCTAssertTrue(next.isDisjoint(with: shown),
+                      "advancing must not re-present the batch already on screen")
+    }
+
+    /// S22: the operation payload decoder must round-trip listID for both wanted
+    /// values (the substring scan returned 0).
+    func testBookmarkOperationPayloadRoundTripsListID() async throws {
+        let store = try FeedStore(inMemory: true)
+        let bookmarks = store.bookmarkStore
+        let listID = try await bookmarks.createBookmarkList(name: "Round Trip")
+        _ = try await bookmarks.setBookmarked(
+            itemID: "payload-item-1", wanted: true, operationID: "payload-op-1", listID: listID
+        )
+        _ = try await bookmarks.setBookmarked(
+            itemID: "payload-item-2", wanted: false, operationID: "payload-op-2", listID: listID
+        )
+
+        let records = await bookmarks.newestOperationsBySubject()
+        let bySubject = Dictionary(uniqueKeysWithValues: records.map { ($0.subjectID, $0) })
+        XCTAssertEqual(bySubject["payload-item-1"]?.listID, listID)
+        XCTAssertEqual(bySubject["payload-item-1"]?.wanted, true)
+        XCTAssertEqual(bySubject["payload-item-2"]?.listID, listID)
+        XCTAssertEqual(bySubject["payload-item-2"]?.wanted, false)
+    }
+
+    // MARK: - Code review 2026-10-06: FeedStore slice (FS-07, FS-08, FS-09, FS-13, FS-15)
+
+    /// FS-07: a revision for an item the *database* holds but this session never loaded — the relaunch
+    /// case — must update the row instead of colliding on the primary key and being skipped, and the
+    /// reader's stamps have to survive the update.
+    func testAtomRevisionUpdatesPersistedItemUnknownToLoadedSet() async throws {
+        let store = try FeedStore(inMemory: true)
+        defer { store.cancelAllWork() }
+        let sourceURL = "https://revision.example/feed"
+        store.registry.sources = [
+            FeedSource(title: "Revision", url: sourceURL, category: "News", region: "global", language: "en"),
+        ]
+        let published = Date()
+
+        let original = FeedItem(
+            id: "rev-1", sourceTitle: "Revision", sourceURL: sourceURL, category: "News",
+            title: "Original title", excerpt: "", url: "https://revision.example/1", imageURL: nil,
+            publishedAt: published, region: "global", language: "en", updatedAt: published
+        )
+        // The DB holds the item and `loadedIDs` (private) does not — exactly the state after a relaunch,
+        // where the id was never loaded into memory this session.
+        try await store.db.write { db in
+            var record = FeedItemRecord(from: original, region: "global", language: "en")
+            record.isRead = true
+            record.openedAt = Int(published.timeIntervalSince1970)
+            try record.insert(db)
+        }
+
+        let revision = FeedItem(
+            id: "rev-1", sourceTitle: "Revision", sourceURL: sourceURL, category: "News",
+            title: "Revised title", excerpt: "", url: "https://revision.example/1", imageURL: nil,
+            publishedAt: published, region: "global", language: "en",
+            updatedAt: published.addingTimeInterval(3600)
+        )
+        _ = await store.persistFetchedItems([revision])
+
+        let stored = try await store.db.read { db in try FeedItemRecord.fetchOne(db, key: "rev-1") }
+        let record = try XCTUnwrap(stored)
+        XCTAssertEqual(record.title, "Revised title",
+                       "a revision of an item the session did not load must still reach the database")
+        XCTAssertTrue(record.isRead, "the revision must not un-read the item")
+        XCTAssertEqual(record.openedAt, Int(published.timeIntervalSince1970),
+                       "the revision must not drop the reader's opened stamp")
+    }
+
+    /// FS-08: the content-filter verdict cache is keyed by item id alone, so a revision that changes the
+    /// text has to invalidate it — in both directions and for both filter passes.
+    func testContentFilterVerdictIsRecomputedWhenItemTextChanges() async throws {
+        let store = try FeedStore(inMemory: true)
+        defer { store.cancelAllWork() }
+        let sourceURL = "https://verdict.example/feed"
+        store.registry.sources = [
+            FeedSource(title: "Blog", url: sourceURL, category: "News", region: "global", language: "en"),
+        ]
+
+        let filters = ContentFilterStore.shared
+        let isEnabledBefore = filters.isEnabled
+        let idsBefore = Set(filters.filters.map(\.id))
+        filters.isEnabled = true
+        filters.addCustom(name: "Spam", keywords: ["spam"])
+        let spamFilter = try XCTUnwrap(filters.filters.first { !idsBefore.contains($0.id) })
+        defer {
+            filters.removeCustom(spamFilter.id)
+            filters.isEnabled = isEnabledBefore
+        }
+
+        // A new item per revision: `searchableText` is computed in `init`, so the text the filter matches
+        // has to come from the initializer, not from a mutated copy.
+        let now = Date()
+        func item(title: String, updatedAt: Date) -> FeedItem {
+            FeedItem(
+                id: "verdict-1", sourceTitle: "Blog", sourceURL: sourceURL, category: "News",
+                title: title, excerpt: "", url: "https://verdict.example/1", imageURL: nil,
+                publishedAt: now, region: "global", language: "en", updatedAt: updatedAt
+            )
+        }
+
+        let clean = item(title: "An ordinary title", updatedAt: now)
+        _ = await store.persistFetchedItems([clean])
+        XCTAssertEqual(store.applyFilters([clean]).map(\.id), ["verdict-1"],
+                       "precondition: the clean item passes, and its verdict is cached")
+
+        // The revision keeps the id and adds the blocked keyword.
+        let spoiled = item(title: "Now with spam in the title", updatedAt: now.addingTimeInterval(3600))
+        _ = await store.persistFetchedItems([spoiled])
+        XCTAssertTrue(store.applyFilters([spoiled]).isEmpty,
+                      "the revision must not be served the verdict cached for the pre-revision text")
+
+        // Reverse direction: the revision drops the keyword, so the item must stop being hidden.
+        let cleansed = item(title: "The blocked word is gone", updatedAt: now.addingTimeInterval(7200))
+        _ = await store.persistFetchedItems([cleansed])
+        XCTAssertEqual(store.applyFilters([cleansed]).map(\.id), ["verdict-1"],
+                       "a revision that dropped the keyword must stop being hidden")
+        let offMain = await store.applyFiltersAsync([cleansed])
+        XCTAssertEqual(offMain.map(\.id), ["verdict-1"],
+                       "the off-main pass caches the same verdicts and must agree")
+    }
+
+    /// FS-13: a content-filter hit is counted at ingestion, not once per persisted revision.
+    func testContentFilterHitCountsIngestionNotRevisions() async throws {
+        let store = try FeedStore(inMemory: true)
+        defer { store.cancelAllWork() }
+        let sourceURL = "https://hits.example/feed"
+        store.registry.sources = [
+            FeedSource(title: "Blog", url: sourceURL, category: "News", region: "global", language: "en"),
+        ]
+
+        let filters = ContentFilterStore.shared
+        let isEnabledBefore = filters.isEnabled
+        let idsBefore = Set(filters.filters.map(\.id))
+        filters.isEnabled = true
+        filters.addCustom(name: "Spam", keywords: ["spam"])
+        let spamFilter = try XCTUnwrap(filters.filters.first { !idsBefore.contains($0.id) })
+        defer {
+            filters.removeCustom(spamFilter.id)
+            filters.isEnabled = isEnabledBefore
+        }
+        func hiddenCount() -> Int {
+            filters.filters.first { $0.id == spamFilter.id }?.hiddenCount ?? -1
+        }
+
+        let now = Date()
+        func item(id: String, title: String, updatedAt: Date) -> FeedItem {
+            FeedItem(
+                id: id, sourceTitle: "Blog", sourceURL: sourceURL, category: "News",
+                title: title, excerpt: "", url: "https://hits.example/\(id)", imageURL: nil,
+                publishedAt: now, region: "global", language: "en", updatedAt: updatedAt
+            )
+        }
+
+        _ = await store.persistFetchedItems([item(id: "hit-1", title: "first spam", updatedAt: now)])
+        XCTAssertEqual(hiddenCount(), 1, "a first ingestion is counted once")
+
+        _ = await store.persistFetchedItems([
+            item(id: "hit-1", title: "first spam, revised", updatedAt: now.addingTimeInterval(3600)),
+        ])
+        XCTAssertEqual(hiddenCount(), 1, "an Atom revision of the same item is not a second ingestion")
+
+        _ = await store.persistFetchedItems([
+            item(id: "hit-2", title: "another spam", updatedAt: now.addingTimeInterval(3600)),
+        ])
+        XCTAssertEqual(hiddenCount(), 2, "a new id is what increments the count")
+    }
+
+    /// FS-09: the bookmark indicator is "saved in any list". Removing the item from one list while another
+    /// still holds it must not clear it, and the store's aggregate has to follow both directions.
+    func testRemovingBookmarkFromOneListKeepsIndicatorWhileAnotherHoldsIt() async throws {
+        let store = try FeedStore(inMemory: true)
+        defer { store.cancelAllWork() }
+        let sourceURL = "https://bookmark-projection.example/feed"
+        store.registry.sources = [
+            FeedSource(title: "Blog", url: sourceURL, category: "News", region: "global", language: "en"),
+        ]
+        let item = contentFilterItem(id: "bm-1", title: "Saved story", sourceURL: sourceURL)
+        _ = await store.persistFetchedItems([item])
+        store.display.publishCards(
+            [FeedCardPresentation(item: item, media: .none, layout: .textOnly,
+                                  isRead: false, isBookmarked: false)],
+            items: [item],
+            readItemIDs: [],
+            bookmarkItemIDs: [],
+            isAppend: false
+        )
+
+        let lists = try await store.allBookmarkLists()
+        let favorites = try XCTUnwrap(lists.first { $0.isDefault })
+        let other = try await store.createBookmarkList(name: "Later")
+
+        try await store.toggleBookmark(itemID: item.id, listID: favorites.id)
+        XCTAssertTrue(store.bookmarkedItemIDs.contains(item.id))
+
+        try await store.toggleBookmark(itemID: item.id, listID: other)
+        XCTAssertTrue(store.bookmarkedItemIDs.contains(item.id))
+
+        // Remove the copy in Favorites; "Later" still holds it.
+        try await store.toggleBookmark(itemID: item.id, listID: favorites.id)
+        XCTAssertTrue(store.bookmarkedItemIDs.contains(item.id),
+                      "another list still holds the item, so it is still bookmarked")
+        XCTAssertEqual(store.visibleItems.first?.isBookmarked, true,
+                       "the visible indicator follows the aggregate, not the list that was toggled")
+
+        // Removing the last copy clears it.
+        try await store.toggleBookmark(itemID: item.id, listID: other)
+        XCTAssertFalse(store.bookmarkedItemIDs.contains(item.id))
+        XCTAssertEqual(store.visibleItems.first?.isBookmarked, false)
+    }
+
+    /// FS-15: the podcast counters must follow ingestion instead of staying at their initial zero.
+    func testPodcastCountersFollowIngestion() async throws {
+        let store = try FeedStore(inMemory: true)
+        defer { store.cancelAllWork() }
+        let sourceURL = "https://podcast-counters.example/feed"
+        store.registry.sources = [
+            FeedSource(title: "Podcast", url: sourceURL, category: "News", region: "global", language: "en"),
+        ]
+        let episode = FeedItem(
+            id: "pod-1", sourceTitle: "Podcast", sourceURL: sourceURL, category: "News",
+            title: "Episode 1", excerpt: "", url: "https://podcast-counters.example/1", imageURL: nil,
+            publishedAt: Date(), audioURL: "https://podcast-counters.example/ep1.mp3",
+            region: "global", language: "en"
+        )
+        _ = await store.persistFetchedItems([episode])
+
+        let counted = await waitUntil { store.podcastItemCount == 1 && store.podcastSourceCount == 1 }
+        XCTAssertTrue(
+            counted,
+            "the podcast counters must follow ingestion (got items=\(store.podcastItemCount) sources=\(store.podcastSourceCount))"
         )
     }
 }

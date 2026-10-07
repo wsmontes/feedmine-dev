@@ -17,7 +17,6 @@ struct FeedComposerScene: View {
     @State private var previewTask: Task<Void, Never>?
     @State private var previewState: PreviewState = .preparing
     @State private var isRecomputing = false
-    @State private var recipeVersion = 0
 
     enum PreviewState: Equatable {
         case preparing
@@ -40,7 +39,11 @@ struct FeedComposerScene: View {
             }
         }
         .onAppear { requestPreview() }
-        .onChange(of: recipeVersion) { _, _ in
+        // Observe the recipe itself, not a version the local bindings bumped: Reset replaces the
+        // recipe from outside this view (`CuratedOnboardingView.resetToNeutral`), and a version counter
+        // only this file incremented never fired for it — the controls showed a neutral recipe while
+        // the cards, and the saved profile, stayed on the previous one.
+        .onChange(of: recipe) { _, _ in
             schedulePreviewUpdate()
         }
         .onDisappear {
@@ -168,7 +171,6 @@ struct FeedComposerScene: View {
                             get: { Set(recipe.languages) },
                             set: { langs in
                                 recipe.languages = Array(langs).sorted()
-                                bumpRecipe()
                             }
                         ),
                         availableLanguages: loader.availableLanguages,
@@ -183,7 +185,6 @@ struct FeedComposerScene: View {
                             get: { recipe.discoveryLevel },
                             set: { val in
                                 recipe.discoveryLevel = val
-                                bumpRecipe()
                             }
                         ),
                         accent: engine.accent
@@ -197,7 +198,6 @@ struct FeedComposerScene: View {
                             get: { recipe.editorialPreferences },
                             set: { prefs in
                                 recipe.editorialPreferences = prefs
-                                bumpRecipe()
                             }
                         ),
                         accent: engine.accent
@@ -221,7 +221,6 @@ struct FeedComposerScene: View {
                                     } else {
                                         recipe.topicPreferences[topic.featureKey] = level
                                     }
-                                    bumpRecipe()
                                 }
                             ),
                             accent: engine.accent
@@ -237,7 +236,6 @@ struct FeedComposerScene: View {
                             get: { recipe.mediaTypes },
                             set: { types in
                                 recipe.mediaTypes = types
-                                bumpRecipe()
                             }
                         ),
                         accent: engine.accent
@@ -306,11 +304,6 @@ struct FeedComposerScene: View {
     }
 
     // MARK: - Preview Scheduling
-
-    /// Increment the recipe version to trigger a coalesced preview update.
-    private func bumpRecipe() {
-        recipeVersion += 1
-    }
 
     /// Coalesce at 100ms — cancel previous task, schedule new one.
     private func schedulePreviewUpdate() {

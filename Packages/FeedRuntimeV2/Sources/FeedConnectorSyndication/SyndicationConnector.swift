@@ -289,12 +289,20 @@ public struct SyndicationConnector: FeedConnector, Sendable {
         now: Date,
         limit: AcquisitionLimit
     ) -> SyndicationAcquisitionOutcome {
+        // A document a sliced batch continues has to be the same document: the offset is an offset into
+        // these bytes, so a body that differs restarts at its first item. The items already admitted keep
+        // their own revisions either way, and an unchanged one is reported as a duplicate.
+        let bodyFingerprint = SyndicationFingerprint.hex(SyndicationFingerprint.fingerprint128(body.body))
+        let continues = checkpoint.partialDocument?.bodyFingerprint == bodyFingerprint
+        let consumed = continues ? (checkpoint.partialDocument?.consumedItemCount ?? 0) : 0
+
         let translation: SyndicationTranslation
         switch translator.translate(
             data: body.body,
             scope: target.scope,
             observedAt: now,
             maxItems: limit.maxItems,
+            skipping: consumed,
             previousRepresentations: checkpoint.observedRepresentations,
             enrollment: enrollment
         ) {
@@ -302,18 +310,45 @@ public struct SyndicationConnector: FeedConnector, Sendable {
         case .failure(let error): return .parseFailure(reason: error.reason, checkpoint: checkpoint)
         }
 
-        // The single rule that governs validator advancement (ADR-005 D12, `invariant 8`): the
-        // validators of a body are proposed for confirmation only when this run consumed the whole
-        // document. Everything else — a rejected item, an item ceiling, a parse failure, a truncated
-        // body, a transport failure — leaves the checkpoint exactly as it arrived.
-        let confirms = translation.consumedWholeDocument
-        let proposed = confirms
-            ? checkpoint.adoptingBaseline(
+        let observed = Self.merge(
+            checkpoint.observedRepresentations,
+            with: translation.observedRepresentations
+        )
+        // A rejection in *any* slice of the document, not only in the one in hand: a document whose
+        // observations could not all be extracted never confirms a validator (ADR-005 D12).
+        let sawRejection = (continues && (checkpoint.partialDocument?.sawItemRejection ?? false))
+            || !translation.rejections.isEmpty
+
+        // The single rule that governs validator advancement (ADR-005 D12, `invariant 8`): the validators
+        // of a body are proposed for confirmation only when this run consumed the whole document and no
+        // part of it was left untranslated. A parse failure, a truncated body, a transport failure and a
+        // document that declares nothing all still leave the previous validators untouched.
+        let confirms = translation.consumedWholeDocument && !sawRejection
+        let proposed: SyndicationCheckpoint
+        if confirms {
+            proposed = checkpoint.adoptingBaseline(
                 validators: body.validators,
                 endpoint: body.endpoint,
-                observedRepresentations: translation.observedRepresentations
+                observedRepresentations: observed
             )
-            : checkpoint
+        } else if translation.truncatedByItemCeiling {
+            // The batch ceiling cut the document short, so this batch is one slice of it: the next pull
+            // resumes past this one instead of translating the same prefix again (ADR-005 D4). The
+            // validators are not confirmed, and the next fetch is unconditional because the body itself
+            // is needed to produce the next slice.
+            proposed = checkpoint.continuing(
+                document: SyndicationCheckpoint.PartialDocument(
+                    bodyFingerprint: bodyFingerprint,
+                    consumedItemCount: consumed + translation.consumedItemCount,
+                    sawItemRejection: sawRejection
+                ),
+                observedRepresentations: observed
+            )
+        } else {
+            // The document is exhausted but may not confirm a validator. Dropping the partial state makes
+            // the next fetch an ordinary conditional one again, and the previous baseline stays as it was.
+            proposed = checkpoint.endingUnconfirmedDocument(observedRepresentations: observed)
+        }
 
         // The batch is bounded by construction: every payload is derived from a body that passed the
         // byte ceilings and from at most `maxItems` items, so no oversized batch can be emitted
@@ -335,6 +370,23 @@ public struct SyndicationConnector: FeedConnector, Sendable {
             redirectChain: body.chain,
             proposesValidatorConfirmation: confirms
         ))
+    }
+
+    /// The representation record of two slices of one document.
+    ///
+    /// The slice in hand wins for a slot both hold: a changed representation is the newer stamp. The
+    /// slots only the checkpoint holds were admitted by an earlier slice and stay, so a replay of that
+    /// item is still recognised as a duplicate.
+    static func merge(
+        _ stored: [String: SyndicationRepresentationStamp],
+        with fresh: [String: SyndicationRepresentationStamp]
+    ) -> [String: SyndicationRepresentationStamp] {
+        guard !stored.isEmpty else { return fresh }
+        var merged = fresh
+        for (slot, stamp) in stored where merged[slot] == nil {
+            merged[slot] = stamp
+        }
+        return merged
     }
 
     /// Opaque audit records. Nothing downstream decodes them, and removing all of them changes no

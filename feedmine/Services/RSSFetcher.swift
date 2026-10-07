@@ -71,8 +71,10 @@ actor RSSFetcher {
         } else {
             let cache = URLCache(memoryCapacity: 4_194_304, diskCapacity: 20_971_520)
             self.transport = transport ?? FeedHTTPSync(session: Self.makeSession(cache: cache, fastLane: false))
+            // The starter lane's session answers in 5 s; the request must say the same, or the request-level
+            // timeout (15 s by default) is what the publisher actually gets.
             self.starterTransport = starterTransport ?? transport
-                ?? FeedHTTPSync(session: Self.makeSession(cache: cache, fastLane: true))
+                ?? FeedHTTPSync(session: Self.makeSession(cache: cache, fastLane: true), requestTimeout: 5)
         }
     }
 
@@ -106,8 +108,9 @@ actor RSSFetcher {
     /// observes and never fetches: nothing below it can start network work.
     func fetch(_ source: FeedSource,
                validators: HTTPValidators = HTTPValidators(),
-               transport: (any FeedHTTPTransport)? = nil) async -> FeedFetchResult {
-        let result = await performFetch(source, validators: validators, transport: transport)
+               transport: (any FeedHTTPTransport)? = nil,
+               skipAudioValidation: Bool = false) async -> FeedFetchResult {
+        let result = await performFetch(source, validators: validators, transport: transport, skipAudioValidation: skipAudioValidation)
         // A fetch the mode's gate refused is not legacy behaviour to mirror: nothing was fetched, so
         // there is nothing to observe, and `ShadowOutcomeKind` maps it to no kind at all.
         if let kind = ShadowOutcomeKind(result.outcome) {
@@ -123,7 +126,8 @@ actor RSSFetcher {
 
     private func performFetch(_ source: FeedSource,
                               validators: HTTPValidators,
-                              transport: (any FeedHTTPTransport)?) async -> FeedFetchResult {
+                              transport: (any FeedHTTPTransport)?,
+                              skipAudioValidation: Bool = false) async -> FeedFetchResult {
         // The one place the mode closes the legacy producers (plan §13). It is checked before the
         // attempt is counted, so `fetchAttemptCount()` stays 0 in a launch whose runtime owns
         // acquisition: a request that was never meant to happen is not an attempt, and the
@@ -142,6 +146,14 @@ actor RSSFetcher {
         let transport = transport ?? self.transport
         let httpResult = await transport.fetch(source, validators: validators)
         let elapsed = ContinuousClock().now - startedAt
+
+        // A fetch whose answer already arrived must stay an *answer*, even when the caller has cancelled in
+        // the meantime: the ledger distinguishes `cancelledAfterCommit` from `cancelledBeforeCommit`, and
+        // reporting a failure here reclassified a served request as one that never happened (caught by
+        // `BackgroundRefreshDemandTests.testCancellationAfterAFetchWasAnsweredIsReportedAsCommittedThenCancelled`).
+        // What cancellation may skip is the expensive, cancellation-unaware post-processing below — the parse
+        // is cheap, and the audio probes are not (up to 12 probes × 6 s, and the group waits for every child).
+        let skipProbes = skipAudioValidation || Task.isCancelled
 
         let ms = Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
         pendingResponseTimes[OPMLParser.normalizeURL(source.url)] = ms
@@ -192,7 +204,16 @@ actor RSSFetcher {
                         elapsedMs: ms
                     )
                 }
-                let validated = await validateAudio(in: items)
+                let validated: [FeedItem]
+                if skipProbes {
+                    // The starter pass is the first paint, and a cancelled pass has no reader waiting for
+                    // playability: probing here (up to 12 probes, 6 concurrent, 6 s each) delays the page for
+                    // information nobody asked for yet, and the progressive pass probes the same items anyway.
+                    // Measured: a 10 s starter deadline returned after 27 s, with this work as the tail.
+                    validated = items
+                } else {
+                    validated = await validateAudio(in: items)
+                }
                 updatedValidators.lastOutcome = .modifiedWithNewItems
                 return FeedFetchResult(
                     source: source, items: validated,
@@ -213,11 +234,19 @@ actor RSSFetcher {
         }
     }
 
+    /// Elapsed milliseconds since `start`, for the starter-fetch timing line. The starter pass is the
+    /// cold-start critical path, and its deadline has to bound the *return*: `group.cancelAll()` only asks
+    /// children to stop, and the group still awaits every one of them.
+    private nonisolated static func msSince(_ start: ContinuousClock.Instant) -> Int {
+        let elapsed = ContinuousClock().now - start
+        return Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
+    }
+
     /// Cold-start fetch that uses the starter HTTP sync with the 5s/7s
     /// timeout session so a slow publisher can't stretch the cold-start
     /// deadline past the ~2.25s per-feed window.
     private func fetchStarterSource(_ source: FeedSource) async -> FeedFetchResult {
-        await fetch(source, validators: HTTPValidators(), transport: starterTransport)
+        await fetch(source, validators: HTTPValidators(), transport: starterTransport, skipAudioValidation: true)
     }
 
     /// Fetch multiple feeds concurrently with a real concurrency cap.
@@ -322,8 +351,22 @@ actor RSSFetcher {
         var notModifiedCount = 0
         var throttledCount = 0
         var gatedSourceCount = 0
+        /// Distinct **providers** among the sources that delivered, in the publication gate's own unit
+        /// (`Reservoir.providerKey`): several generated URLs can be one publisher, and a stop condition
+        /// that counted URLs would hand the gate a batch it still refuses — three Google News queries are
+        /// three successful sources and one provider.
+        var successfulProviderKeys: Set<String> = []
         var sourceOutcomes: [String: FeedFetchOutcome] = [:]
         let cap = max(1, maxConcurrent)
+        let startedAt = ContinuousClock().now
+        let deadlineMs = Int(deadline.components.seconds * 1_000 + deadline.components.attoseconds / 1_000_000_000_000_000)
+        // The slept deadline child is a sibling like any other, and the loop must not depend on being the one
+        // to observe it: measured, `deadlineMs=10000` returned at 27 078 ms with `deadlineFiredMs=-1`. A
+        // wall-clock check in the loop makes the brake unconditional.
+        let deadlineWallClock = Date().addingTimeInterval(
+            Double(deadline.components.seconds) + Double(deadline.components.attoseconds) / 1e18
+        )
+        var deadlineFiredAtMs = -1
 
         await withTaskGroup(of: Event.self) { group in
             var iterator = sources.makeIterator()
@@ -347,10 +390,16 @@ actor RSSFetcher {
                     group.cancelAll()
                     break eventLoop
                 }
+                if Date() >= deadlineWallClock {
+                    deadlineFiredAtMs = Self.msSince(startedAt)
+                    group.cancelAll()
+                    break eventLoop
+                }
                 switch event {
                 case .cancelled:
                     continue
                 case .deadline:
+                    deadlineFiredAtMs = Self.msSince(startedAt)
                     group.cancelAll()
                     break eventLoop
                 case .result(let result):
@@ -363,6 +412,7 @@ actor RSSFetcher {
                     switch result.outcome {
                     case .modifiedWithNewItems:
                         fetchedSourceCount += 1
+                        successfulProviderKeys.insert(Reservoir.providerKey(forSourceURL: result.source.url))
                         allItems.append(contentsOf: result.items)
                     case .modifiedWithoutNewItems:
                         emptySourceCount += 1
@@ -377,7 +427,7 @@ actor RSSFetcher {
                     }
                     await onProgress?(result)
 
-                    let runwayReady = fetchedSourceCount >= minimumSuccessfulSources
+                    let runwayReady = successfulProviderKeys.count >= minimumSuccessfulSources
                         && allItems.count >= minimumItemCount
                     if runwayReady {
                         group.cancelAll()
@@ -395,6 +445,8 @@ actor RSSFetcher {
             }
         }
 
+        let returnMs = Self.msSince(startedAt)
+        Log.network.info("fetchStarter return sources=\(sources.count) items=\(allItems.count) fetched=\(fetchedSourceCount) failed=\(failedSourceCount) deadlineMs=\(deadlineMs) deadlineFiredMs=\(deadlineFiredAtMs) returnMs=\(returnMs) drainMs=\(deadlineFiredAtMs < 0 ? -1 : returnMs - deadlineFiredAtMs)")
         return FeedFetchBatch(
             items: allItems,
             fetchedSourceCount: fetchedSourceCount,
@@ -497,6 +549,10 @@ actor RSSFetcher {
     /// "podcasts" never reach the feed. Bounded, cached, and only touches items
     /// that claim audio — text feeds pay nothing.
     private func validateAudio(in items: [FeedItem]) async -> [FeedItem] {
+        // A cancelled pass probes nothing: this runs *after* the HTTP response, on the same task the fetch's
+        // group is waiting for (6 s per probe, up to 12 probes, 6 concurrent — measured as part of a 27 s
+        // return on a 10 s deadline).
+        guard !Task.isCancelled else { return items }
         // Cap probes per feed so a huge episode list can't stall a fetch; the
         // newest items matter most and appear first.
         let audioIndices = items.indices.filter { items[$0].audioURL != nil }
@@ -585,7 +641,12 @@ actor RSSFetcher {
                 return await probeAudioRanged(url)
             }
             return classify(http)
+        } catch is CancellationError {
+            // A cancelled probe must not launch a second request: the fallback below turned every
+            // cancellation into another 6 s round trip, which is how a cancelled fetch kept its task alive.
+            return .unknown
         } catch {
+            guard !Task.isCancelled else { return .unknown }
             return await probeAudioRanged(url)
         }
     }

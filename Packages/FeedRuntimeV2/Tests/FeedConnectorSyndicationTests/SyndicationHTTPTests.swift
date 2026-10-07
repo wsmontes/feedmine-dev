@@ -168,17 +168,67 @@ final class SyndicationHTTPTests: XCTestCase {
         XCTAssertNil(redirectedETag)
         XCTAssertNil(redirectedSince)
 
-        // A same-host redirect is allowed to keep the validator: the resource is the same origin.
-        let sameHost = try url("https://a.example.com/moved/feed.xml")
-        let (_, transport3) = try await fetch(
+        // A same-host redirect to another *resource* carries nothing: the validator belongs to the resource
+        // that issued it, so a `304` at the new path is refused instead of confirming a baseline this
+        // runtime never read (ADR-005 D12, `invariant 7`; V2-05, V2-06).
+        let otherResource = try url("https://a.example.com/moved/feed.xml")
+        let otherResourceTransport = ScriptedTransport([
+            .status(301, headers: ["Location": otherResource.absoluteString]),
+            .status(304),
+        ])
+        await assertHTTPError(.notModifiedWithoutConditionalRequest) {
+            _ = try await SyndicationHTTPClient(transport: otherResourceTransport).fetch(
+                endpoint: endpoint,
+                generation: 7,
+                checkpoint: self.admittedCheckpoint(endpoint: endpoint),
+                byteCeiling: 1_048_576,
+                now: TestFixtures.observedAt
+            )
+        }
+        let otherResourceETag = await otherResourceTransport.header("If-None-Match", ofRequest: 1)
+        XCTAssertNil(otherResourceETag, "a different resource on the same host never issued this validator")
+
+        // The same resource spelled differently — a canonicalising redirect or a query the audit form
+        // strips — is still the resource the validator belongs to.
+        let sameResource = try url("https://a.example.com/feed.xml?canonical=1")
+        let (sameResourceOutcome, transport3) = try await fetch(
             [
-                .status(301, headers: ["Location": sameHost.absoluteString]),
+                .status(301, headers: ["Location": sameResource.absoluteString]),
                 .status(304),
             ],
             checkpoint: admittedCheckpoint(endpoint: endpoint)
         )
-        let sameHostETag = await transport3.header("If-None-Match", ofRequest: 1)
-        XCTAssertEqual(sameHostETag, "\"a-1\"")
+        let sameResourceETag = await transport3.header("If-None-Match", ofRequest: 1)
+        XCTAssertEqual(sameResourceETag, "\"a-1\"")
+        guard case .notModified = sameResourceOutcome else {
+            return XCTFail("expected notModified, got \(sameResourceOutcome)")
+        }
+    }
+
+    /// A `304` is accepted only as the answer to the request that produced it: a hop requested without a
+    /// validator cannot be confirmed by one it never sent, however conditional an earlier hop was
+    /// (ADR-005 D12; V2-05).
+    func testA304OnAHopRequestedUnconditionallyIsRefused() async throws {
+        let endpoint = try url()
+        let otherHost = try TestFixtures.url(TestFixtures.otherEndpoint)
+        let transport = ScriptedTransport([
+            .status(302, headers: ["Location": otherHost.absoluteString]),
+            .status(304),
+        ])
+
+        await assertHTTPError(.notModifiedWithoutConditionalRequest) {
+            _ = try await SyndicationHTTPClient(transport: transport).fetch(
+                endpoint: endpoint,
+                generation: 7,
+                checkpoint: self.admittedCheckpoint(endpoint: endpoint),
+                byteCeiling: 1_048_576,
+                now: TestFixtures.observedAt
+            )
+        }
+        let originETag = await transport.header("If-None-Match", ofRequest: 0)
+        let redirectedETag = await transport.header("If-None-Match", ofRequest: 1)
+        XCTAssertEqual(originETag, "\"a-1\"", "the origin request was conditional")
+        XCTAssertNil(redirectedETag, "the hop to the other host carried no validator")
     }
 
     // MARK: - 429 / 503
@@ -350,4 +400,119 @@ final class SyndicationHTTPTests: XCTestCase {
         // Once the instant passes, the host is eligible again without any further bookkeeping.
         XCTAssertTrue(gate.isEligible(throttledHost, at: now.addingTimeInterval(60)))
     }
+
+    // MARK: - The production transport's ceilings
+
+    /// A body far larger than the ceiling under test: a transport that only checked after the fact would
+    /// report all of it as received.
+    fileprivate static let streamingBodyBytes = 512 * 1024
+
+    private func streamingTransport() -> PolicyEnforcingHTTPTransport {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StreamingBodyURLProtocol.self]
+        return PolicyEnforcingHTTPTransport(session: URLSession(configuration: configuration))
+    }
+
+    private func streamingRequest() throws -> URLRequest {
+        var request = URLRequest(url: try url())
+        request.httpMethod = "GET"
+        return request
+    }
+
+    /// A declared length above the ceiling is refused from the headers, before the body is read: the
+    /// refusal is the transport's own header check, not the client's after-the-fact one (ADR-005 D4, D14;
+    /// V2-03).
+    func testADeclaredLengthAboveTheCeilingIsRefusedBeforeTheBody() async throws {
+        let transport = streamingTransport()
+        StreamingBodyURLProtocol.declaresLength = true
+
+        do {
+            _ = try await transport.data(
+                for: try streamingRequest(),
+                ceiling: HTTPBodyCeiling(declaredBytes: 32 * 1024)
+            )
+            XCTFail("expected the declared length to be refused")
+        } catch let error as HTTPTransportError {
+            XCTAssertEqual(
+                error,
+                .declaredBodyTooLarge(limit: 32 * 1024, declared: Self.streamingBodyBytes)
+            )
+        }
+    }
+
+    /// A response that declares nothing has its received bytes counted as they arrive, and is stopped at
+    /// the ceiling instead of after the whole body was materialised (ADR-005 D4, D14; V2-03).
+    func testTheCeilingStopsAStreamedBodyWhileItIsRead() async throws {
+        let transport = streamingTransport()
+        StreamingBodyURLProtocol.declaresLength = false
+        let ceiling = 32 * 1024
+
+        do {
+            let (data, _) = try await transport.data(
+                for: try streamingRequest(),
+                ceiling: HTTPBodyCeiling(receivedBytes: ceiling)
+            )
+            XCTFail("expected the body to be refused, got \(data.count) bytes")
+        } catch let error as HTTPTransportError {
+            guard case .receivedBodyTooLarge(let limit, let received) = error else {
+                return XCTFail("expected a received-body refusal, got \(error)")
+            }
+            XCTAssertEqual(limit, ceiling)
+            XCTAssertGreaterThan(received, ceiling)
+            XCTAssertLessThanOrEqual(
+                received,
+                ceiling + StreamingBodyURLProtocol.chunkBytes,
+                "the count stops at the ceiling, not at the end of the body"
+            )
+        }
+    }
+
+    /// The same call under a ceiling the body fits in returns it whole: the bound is a refusal, not a
+    /// truncation.
+    func testABodyUnderTheCeilingIsReturnedWhole() async throws {
+        let transport = streamingTransport()
+        StreamingBodyURLProtocol.declaresLength = false
+
+        let (data, response) = try await transport.data(
+            for: try streamingRequest(),
+            ceiling: HTTPBodyCeiling(declaredBytes: Self.streamingBodyBytes, receivedBytes: Self.streamingBodyBytes)
+        )
+        XCTAssertEqual(response.statusCode, 200)
+        XCTAssertEqual(data.count, Self.streamingBodyBytes)
+    }
+}
+
+/// A `URLProtocol` stub for the transport's own ceilings: it streams a fixed body, optionally declaring
+/// its length up front.
+private final class StreamingBodyURLProtocol: URLProtocol {
+    static let chunkBytes = 8 * 1024
+    /// Whether the response declares its length in the headers. Test-only fixture:
+    /// `URLProtocol` is driven from one thread per test, so the shared flag is safe.
+    nonisolated(unsafe) static var declaresLength = false
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        var headers: [String: String] = [:]
+        if Self.declaresLength {
+            headers["Content-Length"] = "\(SyndicationHTTPTests.streamingBodyBytes)"
+        }
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+              )
+        else { return }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        let chunk = Data(repeating: 0x41, count: Self.chunkBytes)
+        for _ in 0..<(SyndicationHTTPTests.streamingBodyBytes / Self.chunkBytes) {
+            client?.urlProtocol(self, didLoad: chunk)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

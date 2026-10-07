@@ -316,6 +316,45 @@ final class EditorialSequencerTests: SelectionTestCase {
         XCTAssertEqual(one.cards.filter { $0.choice.clusterKey == stableKey("story") }.count, 1)
     }
 
+    /// The quota fallback obeys the cluster rule the main loop enforces: filling a short segment with
+    /// deferred candidates is not a licence to publish two equivalents of one cluster (ADR-007 D13;
+    /// V2-10).
+    func testTheQuotaFallbackStillRespectsTheClusterLimit() throws {
+        let plan = try valuePlan(
+            budget: try makeBudget(cardLimit: 3, poolLimit: 12, providerQuota: 1),
+            // One occurrence per cluster, so the second deferred member can only be admitted by breaking
+            // the cluster rule the main loop enforces.
+            repetition: try RepetitionPolicy(window: 48, limit: 1, allowsDistinctOccurrence: true)
+        )
+        let clustered = [
+            // The editorial order is newest first, so the admitted choice comes first and the two deferred
+            // members of one cluster follow it.
+            try choice("quota-a", provider: "alpha", observedAt: SelectionInstant.offset(2)),
+            try choice("quota-d2", provider: "alpha", observedAt: SelectionInstant.offset(1), clusterKey: "shared"),
+            try choice("quota-d1", provider: "alpha", observedAt: SelectionInstant.offset(0), clusterKey: "shared"),
+        ]
+
+        let sequence = sequencer.sequence(draft: try draft(clustered), plan: plan)
+
+        XCTAssertEqual(sequence.counts.quotaDeferred, 2, "both members of the cluster were deferred by quota")
+        XCTAssertEqual(sequence.counts.quotaAdmitted, 1, "the fallback admits one of them, never both")
+        XCTAssertEqual(sequence.cards.count, 2)
+        XCTAssertEqual(
+            sequence.counts.clustersCollapsed,
+            1,
+            "the second member is what the cluster limit suppresses"
+        )
+        XCTAssertEqual(
+            Set(sequence.cards.map { $0.choice.clusterKey }).count,
+            sequence.cards.count,
+            "no two published cards share a cluster"
+        )
+        XCTAssertEqual(
+            sequence.status,
+            SegmentStatus.partial(.repetitionSuppressed(published: 2, requested: 3))
+        )
+    }
+
     func testTheSequenceExportIsStable() throws {
         let plan = try valuePlan()
         let choices = [try choice("stable-1"), try choice("stable-2")]

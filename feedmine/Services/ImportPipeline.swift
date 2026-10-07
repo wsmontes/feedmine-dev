@@ -285,7 +285,15 @@ actor ImportPipeline {
     /// length responses are stopped the moment the ceiling would be crossed.
     /// Because callers persist only after this returns, cancellation/errors
     /// cannot leave a partial OPML or probe file behind.
-    private func boundedData(from url: URL, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+    ///
+    /// - Parameter allowTruncation: when `true` a body over `maxBytes` is not an
+    ///   error — the transfer stops at the ceiling and the caller gets the prefix
+    ///   read so far. The feed probe uses this: whether a document is a feed is
+    ///   decided by its envelope (first bytes), so a valid feed larger than the
+    ///   probe budget must not be reported as invalid — the same URL worked when
+    ///   the catalogue fetched it and failed when the user imported it (S09). The
+    ///   OPML path keeps the hard ceiling: a truncated OPML is not an OPML.
+    private func boundedData(from url: URL, maxBytes: Int, allowTruncation: Bool = false) async throws -> (Data, HTTPURLResponse) {
         let (bytes, response) = try await session.bytes(from: url)
         guard let http = response as? HTTPURLResponse else {
             throw BoundedDownloadError.nonHTTP
@@ -293,7 +301,7 @@ actor ImportPipeline {
         guard (200...299).contains(http.statusCode) else {
             throw BoundedDownloadError.badStatus(http.statusCode)
         }
-        if response.expectedContentLength > Int64(maxBytes) {
+        if response.expectedContentLength > Int64(maxBytes), !allowTruncation {
             throw BoundedDownloadError.tooLarge(limit: maxBytes)
         }
 
@@ -304,6 +312,7 @@ actor ImportPipeline {
         for try await byte in bytes {
             try Task.checkCancellation()
             guard data.count < maxBytes else {
+                if allowTruncation { break }
                 throw BoundedDownloadError.tooLarge(limit: maxBytes)
             }
             data.append(byte)
@@ -316,7 +325,11 @@ actor ImportPipeline {
         guard let feedURL = URL(string: url) else { return .invalid("Malformed URL") }
 
         do {
-            let (data, http) = try await boundedData(from: feedURL, maxBytes: Self.feedProbeMaxBytes)
+            let (data, http) = try await boundedData(
+                from: feedURL,
+                maxBytes: Self.feedProbeMaxBytes,
+                allowTruncation: true
+            )
             guard data.looksLikeFeedData else {
                 let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
                 if contentType.contains("html") {
@@ -327,8 +340,6 @@ actor ImportPipeline {
             let isJSON = data.first == 0x7B
             let title = Self.extractTitle(from: data, isJSON: isJSON)
             return .success(title: title)
-        } catch BoundedDownloadError.tooLarge(let limit) {
-            return .invalid("Feed response too large (limit \(limit) bytes)")
         } catch {
             return .unreachable
         }

@@ -41,6 +41,7 @@ struct FilterSheetView: View {
                     } label: {
                         Label("Clear All Filters", systemImage: "xmark.circle")
                     }
+                    .accessibilityIdentifier("filter-clear-all")
                     .disabled(!hasDraftFilters && loader.searchQuery.isEmpty)
                 }
 
@@ -48,13 +49,16 @@ struct FilterSheetView: View {
                     Picker(selection: $draftPreset) {
                         Label("Everything", systemImage: "circle.grid.3x3.fill")
                             .tag(PresetSelector.everything)
+                            .accessibilityIdentifier("preset-option-everything")
                         Label("Last clicked", systemImage: "clock.arrow.circlepath")
                             .tag(PresetSelector.lastClicked)
+                            .accessibilityIdentifier("preset-option-last-clicked")
 
                         Section("Editorial") {
                             ForEach(FeedPreset.allCases.filter { $0 != .everything }) { preset in
                                 Label(preset.rawValue, systemImage: preset.icon)
                                     .tag(PresetSelector.editorial(preset))
+                                    .accessibilityIdentifier("preset-option-\(preset.rawValue.identifierSlug)")
                             }
                         }
 
@@ -103,6 +107,12 @@ struct FilterSheetView: View {
                         Label("Preset", systemImage: "sparkles")
                     }
                     .pickerStyle(.menu)
+                    // The option Labels above carry identifiers of their own, but a `.menu` Picker hands its
+                    // content to UIKit, which rebuilds each option as a `UIMenu` item: the option's identifier
+                    // does not survive into the presented menu. The picker row itself is identified here and
+                    // the sweep opens it and taps the option by its label — the same thing a person does — so
+                    // no option is unreachable from a test even though UIKit drops the per-option ids.
+                    .accessibilityIdentifier("preset-picker")
                     .onChange(of: draftPreset) { _, _ in
                         presetIsDirty = true
                     }
@@ -119,6 +129,7 @@ struct FilterSheetView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    .accessibilityIdentifier("countries-link")
                 }
 
                 Section("Content Type") {
@@ -218,6 +229,8 @@ struct FilterSheetView: View {
                                 if draftMood == mood { Image(systemName: "checkmark").foregroundStyle(.blue) }
                             }
                         }
+                        .accessibilityIdentifier("mood-\(mood.rawValue.lowercased())")
+                        .accessibilityValue(draftMood == mood ? "selected" : "not selected")
                     }
                 }
             }
@@ -270,4 +283,15 @@ struct FilterSheetView: View {
         }
     }
 
+}
+
+private extension String {
+    /// Lowercase, hyphen-joined form of a display name, for stable accessibility identifiers
+    /// ("Tech & Science" → "tech-science"). Identifiers only: nothing here changes behaviour or styling.
+    var identifierSlug: String {
+        lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+    }
 }

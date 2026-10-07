@@ -217,8 +217,14 @@ final class AdaptiveScheduler {
         var candidates: [TimeInterval] = []
         if let maxAge = validators.cacheControl?.maxAge { candidates.append(maxAge) }
         if let ttl = validators.ttl { candidates.append(TimeInterval(ttl * 60)) }
-        if let expires = validators.expires {
-            let delta = expires.timeIntervalSinceNow
+        if let expires = validators.expires, let fetchedAt = validators.lastFetchAt {
+            // `Expires` is an absolute date, not a duration: the freshness it declares must be measured from
+            // the moment the headers were received (`lastFetchAt`), never from "now". Reading the remaining
+            // time off the clock made the interval shrink as it was compared against the time already elapsed
+            // since the fetch, so the gate opened at *half* the declared freshness — a feed that said "fresh
+            // for 100 s" was re-fetched at ~50 s (S08). With no fetch anchor the header cannot be interpreted,
+            // so it contributes no candidate and the default below still applies.
+            let delta = expires.timeIntervalSince(fetchedAt)
             if delta > 0 { candidates.append(delta) }
         }
         if estimator.confidence > 0.3 { candidates.append(estimator.minInterval) }

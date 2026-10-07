@@ -172,11 +172,13 @@ actor URLResolver {
             }
 
             // Prime the window
+            var pending = 0
             while started < cap, let candidate = iterator.next() {
                 group.addTask {
                     await self.probeFeedURL(candidate) ? .match(candidate) : .miss
                 }
                 started += 1
+                pending += 1
             }
 
             while let event = await group.next() {
@@ -188,10 +190,19 @@ actor URLResolver {
                     group.cancelAll()
                     return nil
                 case .miss:
+                    pending -= 1
                     if let candidate = iterator.next() {
                         group.addTask {
                             await self.probeFeedURL(candidate) ? .match(candidate) : .miss
                         }
+                        pending += 1
+                    } else if pending == 0 {
+                        // Every candidate has answered and none is a feed. The timeout task would otherwise
+                        // hold the caller for the rest of the budget with nothing left to probe — the common
+                        // case (a site with no feed) paid the full 8 s of discovery latency for no answer
+                        // (S20). Cancelling here ends the group and its deadline child.
+                        group.cancelAll()
+                        return nil
                     }
                 }
             }

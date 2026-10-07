@@ -68,18 +68,26 @@ final class FeedLoader {
     /// the O(n) activeSources filter on every header render.
     @ObservationIgnored private var _cachedActiveSourceCount: Int?
     @ObservationIgnored private var _cachedActiveSourceCountGen: Int64?
+    /// The registry size the cached count was computed from. The filter generation does not move when the
+    /// OPML load finishes, so a count computed while the registry was still empty stayed `0` for the whole
+    /// session — the header read `· 0/77443 sources` in launches that were fetching 240 of them.
+    @ObservationIgnored private var _cachedActiveSourceCountRegistrySize: Int?
 
     var activeSourceCount: Int {
         if let presetCount = store.presetSourceFilter?.count {
             return presetCount
         }
         let gen = store.activeFilterGeneration
-        if let cached = _cachedActiveSourceCount, _cachedActiveSourceCountGen == gen {
+        let registrySize = store.registry.sources.count
+        if let cached = _cachedActiveSourceCount,
+           _cachedActiveSourceCountGen == gen,
+           _cachedActiveSourceCountRegistrySize == registrySize {
             return cached
         }
         let count = activeSources.count
         _cachedActiveSourceCount = count
         _cachedActiveSourceCountGen = gen
+        _cachedActiveSourceCountRegistrySize = registrySize
         return count
     }
 
@@ -578,26 +586,41 @@ final class FeedLoader {
     var selectedBookmarkListID: Int64? {
         get { store.selectedBookmarkListID }
         set {
+            // Each selection loads its box across two awaits. Bump a generation and
+            // cancel the previous load, so a slow box A cannot publish its items
+            // under a later selection B — or after the box was dismissed.
+            bookmarkSelectionTask?.cancel()
+            bookmarkSelectionGeneration &+= 1
+            let generation = bookmarkSelectionGeneration
             store.selectedBookmarkListID = newValue
             if let listID = newValue {
                 // Bookmark mode: load all items from the box
-                Task { @MainActor in
+                bookmarkSelectionTask = Task { @MainActor in
                     do {
                         let lists = try await store.allBookmarkLists()
-                        selectedBookmarkListName = lists.first(where: { $0.id == listID })?.name
+                        guard generation == bookmarkSelectionGeneration else { return }
+                        let name = lists.first(where: { $0.id == listID })?.name
                         let items = try await store.bookmarkedItems(listID: listID)
+                        guard generation == bookmarkSelectionGeneration,
+                              store.selectedBookmarkListID == listID else { return }
+                        selectedBookmarkListName = name
                         store.loadBookmarkFeed(items: items)
                     } catch {
+                        guard generation == bookmarkSelectionGeneration else { return }
                         store.selectedBookmarkListID = nil
                         selectedBookmarkListName = nil
                     }
                 }
             } else {
+                bookmarkSelectionTask = nil
                 selectedBookmarkListName = nil
                 store.clearBookmarkFeed()
             }
         }
     }
+
+    @ObservationIgnored private var bookmarkSelectionTask: Task<Void, Never>?
+    @ObservationIgnored private var bookmarkSelectionGeneration: UInt64 = 0
 
     /// Name of the currently selected bookmark box, if any.
     private(set) var selectedBookmarkListName: String? = nil

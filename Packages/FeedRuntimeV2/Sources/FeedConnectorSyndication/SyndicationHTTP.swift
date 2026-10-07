@@ -281,7 +281,6 @@ public struct SyndicationHTTPClient: Sendable {
         var current = endpoint
         var chain: [URL] = []
         var redirects = 0
-        var conditionalRequestSent = false
 
         while true {
             let target: URL
@@ -308,7 +307,10 @@ public struct SyndicationHTTPClient: Sendable {
             } else {
                 headers = [:]
             }
-            if !headers.isEmpty { conditionalRequestSent = true }
+            // Whether *this* hop asked conditionally. A `304` is only meaningful as the answer to the
+            // request that produced it: a hop requested without a validator cannot be confirmed by one
+            // it never sent, however conditional an earlier hop in the chain was (ADR-005 D12).
+            let sentConditionalRequest = !headers.isEmpty
 
             var request = URLRequest(url: target)
             request.httpMethod = "GET"
@@ -318,7 +320,25 @@ public struct SyndicationHTTPClient: Sendable {
 
             let pair: (Data, HTTPURLResponse)
             do {
-                pair = try await transport.data(for: request)
+                // The ceilings travel with the call so the transport can refuse from the headers and
+                // stop the read at the limit; the checks below stay as the backstop for an injected
+                // transport that only reports the body it already read (ADR-005 D4, D14).
+                pair = try await transport.data(
+                    for: request,
+                    ceiling: HTTPBodyCeiling(
+                        declaredBytes: limits.maxCompressedBytes,
+                        receivedBytes: effectiveCeiling
+                    )
+                )
+            } catch let error as HTTPTransportError {
+                switch error {
+                case .declaredBodyTooLarge(let limit, let declared):
+                    throw SyndicationHTTPError.compressedBodyTooLarge(limit: limit, declared: declared)
+                case .receivedBodyTooLarge(let limit, let received):
+                    throw SyndicationHTTPError.decompressedBodyTooLarge(limit: limit, received: received)
+                case .notHTTP, .status, .transport:
+                    throw SyndicationHTTPError.transport(SyndicationTransportFailureClass.classify(error))
+                }
             } catch {
                 throw SyndicationHTTPError.transport(SyndicationTransportFailureClass.classify(error))
             }
@@ -343,7 +363,7 @@ public struct SyndicationHTTPClient: Sendable {
                 ))
 
             case 304:
-                guard conditionalRequestSent else {
+                guard sentConditionalRequest else {
                     throw SyndicationHTTPError.notModifiedWithoutConditionalRequest
                 }
                 return .notModified(SyndicationNotModified(

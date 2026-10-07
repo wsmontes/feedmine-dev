@@ -242,7 +242,11 @@ public struct CanonicalSearchRepository: Sendable {
             let role: String = row["role"]
             if role == MediaRole.audio.rawValue {
                 if audios[recordID] == nil { audios[recordID] = row["resource_url"] }
-            } else if images[recordID] == nil {
+            } else if Self.imageRoles.contains(role), images[recordID] == nil {
+                // Only a role that *is* an image may fill `imageURL`: a `video` or a `waveform` used to
+                // land here through the `else` branch, so a search result offered an mp4 as the card's
+                // image (plan §10; V2-14). Those roles have no contract in this projection yet, and a
+                // missing image renders its placeholder, which is honest.
                 images[recordID] = row["resource_url"]
             }
         }
@@ -252,4 +256,12 @@ public struct CanonicalSearchRepository: Sendable {
         }
         return result
     }
+
+    /// The roles a search result may render as an image, most specific first (the SQL orders them the
+    /// same way).
+    private static let imageRoles: Set<String> = [
+        MediaRole.image.rawValue,
+        MediaRole.thumbnail.rawValue,
+        MediaRole.poster.rawValue,
+    ]
 }

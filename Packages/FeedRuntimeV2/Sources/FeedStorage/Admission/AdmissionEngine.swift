@@ -202,10 +202,16 @@ public struct AdmissionEngine: Sendable {
                   let revisionID = revisions.revisionIDs[resolution.index]
             else { continue }
             let previousRevisionID = try currentRevisionID(recordID: recordID, in: database)
+            // An instruction without an expectation is not "no revision is current": a connector never
+            // knows a revision row identifier, so `nil` means "resolve the expectation against what is
+            // durable now". Comparing against NULL instead lost the CAS whenever the object already had
+            // a current revision, so an update was admitted as history and the feed kept showing the
+            // older representation (ADR-006 D3).
+            let expectation = expectedRevision?.rawValue ?? previousRevisionID
             try database.execute(sql: """
                 UPDATE origin_record SET current_revision_id = ?
                 WHERE id = ? AND current_revision_id IS ?
-                """, arguments: [revisionID, recordID, expectedRevision.map(\.rawValue)])
+                """, arguments: [revisionID, recordID, expectation])
             // Only a pointer that actually moved changes selectable supply (ADR-006 D6): a CAS that
             // rewrites the revision that is already current is not a supply event.
             if database.changesCount == 1, previousRevisionID != revisionID {

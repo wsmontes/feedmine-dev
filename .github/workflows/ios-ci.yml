@@ -127,3 +127,13 @@ jobs:
             exit 1
           fi
           echo "executed $executed tests"
+          # UI-01: the floor counts tests, not suites. A target that is missing a whole suite still
+          # clears 400 while the gate reports success, which is how Accessibility and Performance
+          # stayed uncompiled. Each suite this gate promises has to be present in the log by name.
+          for suite in ${FEEDMINE_REQUIRED_SUITES:-AccessibilityAuditTests HitchRatioTests}; do
+            if ! grep -q "Test Suite '$suite'" xcodebuild.log; then
+              echo "::error::$suite did not run: the targets do not contain it (UI-01 membership)"
+              exit 1
+            fi
+          done
+          echo "required suites present"

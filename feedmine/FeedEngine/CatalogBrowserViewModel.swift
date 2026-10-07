@@ -61,6 +61,18 @@ final class CatalogBrowserViewModel {
     private var browseNextCursor: CatalogCursor?
     private var searchNextCursor: CatalogCursor?
 
+    /// Bumped whenever browse state is reset, so a browse response that lands after the reader
+    /// moved to another level cannot publish into that new level.
+    private var browseGeneration = 0
+
+    /// Bumped whenever the search state is reset — a new query or ``clearSearch()`` — so a response
+    /// from a previous query cannot publish into the current one.
+    private var searchGeneration = 0
+
+    /// Bumped for every details request, so a slow response cannot replace the details of the
+    /// source the reader tapped last.
+    private var detailsGeneration = 0
+
     /// Cancellable search task. Marked `@ObservationIgnored` to avoid
     /// runtime observation of a non-Sendable `Task` value.
     @ObservationIgnored private var searchTask: Task<Void, Never>?
@@ -112,8 +124,9 @@ final class CatalogBrowserViewModel {
         isLoading = true
         errorMessage = nil
         resetBrowseState()
+        let generation = browseGeneration
 
-        defer { isLoading = false }
+        defer { if generation == browseGeneration { isLoading = false } }
 
         do {
             let query = CatalogBrowseQuery(parentID: nil)
@@ -122,8 +135,10 @@ final class CatalogBrowserViewModel {
                 cursor: nil,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == browseGeneration else { return }
             applyBrowsePage(page)
         } catch {
+            guard generation == browseGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -137,8 +152,9 @@ final class CatalogBrowserViewModel {
         isLoading = true
         errorMessage = nil
         resetBrowseState()
+        let generation = browseGeneration
 
-        defer { isLoading = false }
+        defer { if generation == browseGeneration { isLoading = false } }
 
         do {
             let query = CatalogBrowseQuery(parentID: node.id)
@@ -147,8 +163,10 @@ final class CatalogBrowserViewModel {
                 cursor: nil,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == browseGeneration else { return }
             applyBrowsePage(page)
         } catch {
+            guard generation == browseGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -163,8 +181,9 @@ final class CatalogBrowserViewModel {
         isLoading = true
         errorMessage = nil
         resetBrowseState()
+        let generation = browseGeneration
 
-        defer { isLoading = false }
+        defer { if generation == browseGeneration { isLoading = false } }
 
         do {
             let query = CatalogBrowseQuery(parentID: currentNodeID)
@@ -173,8 +192,10 @@ final class CatalogBrowserViewModel {
                 cursor: nil,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == browseGeneration else { return }
             applyBrowsePage(page)
         } catch {
+            guard generation == browseGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -187,9 +208,12 @@ final class CatalogBrowserViewModel {
 
     /// Load the next browse page, appending results to existing arrays.
     ///
-    /// No-ops while a search is active to avoid polluting browse state.
+    /// No-ops while a search is active, and while a page of this level is already in flight: the
+    /// guard is evaluated before any suspension point, so a second call cannot capture the same
+    /// cursor and append its page twice.
     func loadNextPage() async {
-        guard !isSearching, let cursor = browseNextCursor else { return }
+        guard !isSearching, !isLoadingMore, let cursor = browseNextCursor else { return }
+        let generation = browseGeneration
         isLoadingMore = true
         errorMessage = nil
 
@@ -202,6 +226,7 @@ final class CatalogBrowserViewModel {
                 cursor: cursor,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == browseGeneration else { return }
             nodes.append(contentsOf: page.nodes)
             sources.append(contentsOf: page.sources)
             browseNextCursor = page.nextCursor
@@ -209,6 +234,7 @@ final class CatalogBrowserViewModel {
                 estimatedTotalCount = total
             }
         } catch {
+            guard generation == browseGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -227,24 +253,28 @@ final class CatalogBrowserViewModel {
             return
         }
 
+        let query = CatalogSearchQuery(text: searchText)
+        searchGeneration &+= 1
+        let generation = searchGeneration
         isSearching = true
         isLoading = true
         errorMessage = nil
         searchResults = []
         searchNextCursor = nil
 
-        defer { isLoading = false }
+        defer { if generation == searchGeneration { isLoading = false } }
 
         do {
-            let query = CatalogSearchQuery(text: searchText)
             let page = try await engine.searchCatalog(
                 query: query,
                 cursor: nil,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == searchGeneration else { return }
             searchResults = page.sources
             searchNextCursor = page.nextCursor
         } catch {
+            guard generation == searchGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -253,22 +283,25 @@ final class CatalogBrowserViewModel {
     ///
     /// No-ops when not currently searching.
     func loadNextSearchPage() async {
-        guard isSearching, let cursor = searchNextCursor else { return }
+        guard isSearching, !isLoadingMore, let cursor = searchNextCursor else { return }
+        let query = CatalogSearchQuery(text: searchText)
+        let generation = searchGeneration
         isLoadingMore = true
         errorMessage = nil
 
         defer { isLoadingMore = false }
 
         do {
-            let query = CatalogSearchQuery(text: searchText)
             let page = try await engine.searchCatalog(
                 query: query,
                 cursor: cursor,
                 limit: FeedEnginePageLimit.defaultLimit
             )
+            guard generation == searchGeneration else { return }
             searchResults.append(contentsOf: page.sources)
             searchNextCursor = page.nextCursor
         } catch {
+            guard generation == searchGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -277,6 +310,7 @@ final class CatalogBrowserViewModel {
     func clearSearch() {
         searchTask?.cancel()
         searchTask = nil
+        searchGeneration &+= 1
         searchText = ""
         isSearching = false
         searchResults = []
@@ -302,21 +336,28 @@ final class CatalogBrowserViewModel {
 
     /// Load full details for a given source.
     ///
-    /// Sets ``loadingDetailsSourceID`` before the fetch and clears it in
-    /// `defer` — always, even on cancellation or error.
+    /// Sets ``loadingDetailsSourceID`` before the fetch and clears it in `defer` — while this is
+    /// still the request the view is waiting on, so a slower earlier response cannot publish over
+    /// the source the reader tapped last nor clear the newer request's loading state.
     func loadSourceDetails(for sourceID: SourceID) async {
+        detailsGeneration &+= 1
+        let generation = detailsGeneration
         isLoadingDetails = true
         loadingDetailsSourceID = sourceID
 
         defer {
-            isLoadingDetails = false
-            loadingDetailsSourceID = nil
+            if generation == detailsGeneration {
+                isLoadingDetails = false
+                loadingDetailsSourceID = nil
+            }
         }
 
         do {
             let details = try await engine.loadSourceDetails(sourceID: sourceID)
+            guard generation == detailsGeneration else { return }
             selectedSourceDetails = details
         } catch {
+            guard generation == detailsGeneration else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -334,7 +375,11 @@ final class CatalogBrowserViewModel {
     // MARK: - Helpers
 
     /// Reset all browse-related state (nodes, sources, cursor, count).
+    ///
+    /// Bumps ``browseGeneration`` so any response still in flight for the level being left is
+    /// dropped instead of being applied to the new one.
     private func resetBrowseState() {
+        browseGeneration &+= 1
         nodes = []
         sources = []
         browseNextCursor = nil

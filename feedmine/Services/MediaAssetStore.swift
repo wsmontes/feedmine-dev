@@ -55,20 +55,30 @@ actor MediaAssetStore {
 
     func resolve(request: ImageResolutionRequest) async -> ResolvedImageAsset? {
         let key = request.key
+        let startedAt = ContinuousClock().now
 
-        if let memKey = request.cacheKey, memoryCache.image(for: memKey) != nil {
-            return await loadAssetMetadata(cacheKey: memKey)
+        if let memKey = request.cacheKey, let memoryImage = memoryCache.image(for: memKey) {
+            let asset: ResolvedImageAsset
+            if let stored = await loadAssetMetadata(cacheKey: memKey) {
+                asset = stored
+            } else {
+                asset = await assetFromMemory(memoryImage, cacheKey: memKey, source: request.source)
+            }
+            ImageLog.resolveTiming(url: request.url, outcome: "memory", ms: Self.ms(since: startedAt), bytes: asset.byteCount)
+            return asset
         }
 
         if let entry = inFlight[key] {
-            return try? await awaitSharedTaskRespectingCancellation(entry.task)
+            let shared = try? await awaitSharedTaskRespectingCancellation(entry.task)
+            ImageLog.resolveTiming(url: request.url, outcome: "shared", ms: Self.ms(since: startedAt), bytes: shared?.byteCount ?? 0)
+            return shared
         }
 
         nextInFlightID &+= 1
         let id = nextInFlightID
         let task = Task<ResolvedImageAsset?, Error> { [weak self] in
             try Task.checkCancellation()
-            return await self?.performResolution(request)
+            return await self?.performResolution(request, startedAt: startedAt)
         }
         inFlight[key] = InFlight(id: id, task: task)
 
@@ -79,7 +89,17 @@ actor MediaAssetStore {
             await self?.finishInFlight(key: key, id: id)
         }
 
-        return try? await awaitSharedTaskRespectingCancellation(task)
+        let result = try? await awaitSharedTaskRespectingCancellation(task)
+        if result == nil {
+            ImageLog.resolveTiming(url: request.url, outcome: "miss", ms: Self.ms(since: startedAt), bytes: 0)
+        }
+        return result
+    }
+
+    /// Elapsed milliseconds, for the media-path timing logs.
+    private nonisolated static func ms(since start: ContinuousClock.Instant) -> Int {
+        let elapsed = ContinuousClock().now - start
+        return Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
     }
 
     private func finishInFlight(key: ImageAssetKey, id: UInt64) {
@@ -99,8 +119,7 @@ actor MediaAssetStore {
               let image = ImageCache.downsample(data: data, to: ImageCache.downsampleMaxDimension) else {
             return nil
         }
-        let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
-        memoryCache.setImage(image, for: cacheKey, cost: cost)
+        memoryCache.setImage(image, for: cacheKey, cost: Self.memoryCost(of: image))
         return image
     }
 
@@ -114,12 +133,16 @@ actor MediaAssetStore {
 
     // MARK: - Private
 
-    private func performResolution(_ request: ImageResolutionRequest) async -> ResolvedImageAsset? {
+    private func performResolution(_ request: ImageResolutionRequest, startedAt: ContinuousClock.Instant) async -> ResolvedImageAsset? {
         if let cacheKey = request.cacheKey,
            let data = await diskCache.data(for: cacheKey),
            Self.hasSafeImageDimensions(data),
            let image = ImageCache.downsample(data: data, to: ImageCache.downsampleMaxDimension) {
-            memoryCache.setImage(image, for: cacheKey)
+            // Same cost accounting as the download branch below: an insert
+            // without cost counts as zero bytes against `totalCostLimit`, so
+            // restored bitmaps made the limit mean nothing.
+            memoryCache.setImage(image, for: cacheKey, cost: Self.memoryCost(of: image))
+            ImageLog.resolveTiming(url: request.url, outcome: "disk", ms: Self.ms(since: startedAt), bytes: data.count)
             return assetMetadata(from: image, cacheKey: cacheKey, data: data, source: request.source)
         }
 
@@ -141,7 +164,7 @@ actor MediaAssetStore {
             try await diskCache.store(data, key: cacheKey)
             await diskCache.evictIfNeeded()
 
-            let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+            let cost = Self.memoryCost(of: image)
             memoryCache.setImage(image, for: cacheKey, cost: cost)
 
             await persistResolution(
@@ -149,10 +172,15 @@ actor MediaAssetStore {
                 cacheKey: cacheKey,
                 data: data,
                 url: url,
-                source: request.source
+                source: request.source,
+                image: image
             )
+            ImageLog.resolveTiming(url: url, outcome: "download", ms: Self.ms(since: startedAt), bytes: data.count)
+            ImageLog.downloadSuccess(url, size: data.count)
             return assetMetadata(from: image, cacheKey: cacheKey, data: data, source: request.source)
         } catch {
+            ImageLog.resolveTiming(url: url, outcome: "error", ms: Self.ms(since: startedAt), bytes: 0)
+            ImageLog.downloadFailed(url, error: error)
             await persistFailure(itemID: request.itemID, error: error, url: url)
             return nil
         }
@@ -203,13 +231,45 @@ actor MediaAssetStore {
     private func assetMetadata(
         from image: UIImage, cacheKey: String, data: Data, source: ImageResolutionSource
     ) -> ResolvedImageAsset {
-        ResolvedImageAsset(
+        let size = Self.pixelSize(of: image)
+        return ResolvedImageAsset(
             cacheKey: cacheKey,
-            pixelWidth: Int(image.size.width * image.scale),
-            pixelHeight: Int(image.size.height * image.scale),
+            pixelWidth: size.width,
+            pixelHeight: size.height,
             byteCount: data.count,
             source: source
         )
+    }
+
+    /// Builds the asset from caches for a bitmap that is already decoded. The
+    /// metadata row is an optimization — a missing row (failed persist, evicted
+    /// item, schema that has never been written) must not turn a present bitmap
+    /// into a miss.
+    private func assetFromMemory(
+        _ image: UIImage, cacheKey: String, source: ImageResolutionSource
+    ) async -> ResolvedImageAsset {
+        let size = Self.pixelSize(of: image)
+        let bytes = await diskCache.data(for: cacheKey)?.count ?? 0
+        return ResolvedImageAsset(
+            cacheKey: cacheKey,
+            pixelWidth: size.width,
+            pixelHeight: size.height,
+            byteCount: bytes,
+            source: source
+        )
+    }
+
+    /// Pixel size of a decoded bitmap (`UIImage.size` is in points).
+    private nonisolated static func pixelSize(of image: UIImage) -> (width: Int, height: Int) {
+        (Int(image.size.width * image.scale), Int(image.size.height * image.scale))
+    }
+
+    /// Cost charged to `MemoryImageCache` for a decoded bitmap, in bytes
+    /// (4 bytes per pixel at the image's own scale). Single place on purpose:
+    /// an insertion that skips it is counted as zero and the cache's
+    /// `totalCostLimit` stops being a byte budget.
+    private nonisolated static func memoryCost(of image: UIImage) -> Int {
+        Int(image.size.width * image.scale * image.size.height * image.scale * 4)
     }
 
     private func loadAssetMetadata(cacheKey: String) async -> ResolvedImageAsset? {
@@ -235,7 +295,7 @@ actor MediaAssetStore {
     }
 
     private func persistResolution(
-        itemID: String, cacheKey: String, data: Data, url: URL, source: ImageResolutionSource
+        itemID: String, cacheKey: String, data: Data, url: URL, source: ImageResolutionSource, image: UIImage
     ) async {
         let fingerprint = ImageCandidateFingerprint.compute(
             feedImageURL: url.absoluteString,
@@ -243,22 +303,35 @@ actor MediaAssetStore {
             youTubeThumbnailURL: nil
         )
         let now = Int64(Date().timeIntervalSince1970)
+        let size = Self.pixelSize(of: image)
         let record = ImageResolutionRecord(
             itemID: itemID, candidateFingerprint: fingerprint,
             state: ImageResolutionOutcome.resolved.rawValue,
             cacheKey: cacheKey, resolvedURL: url.absoluteString,
-            pixelWidth: 0, pixelHeight: 0, byteCount: data.count,
+            pixelWidth: size.width, pixelHeight: size.height, byteCount: data.count,
             attemptCount: 1, lastAttemptAt: now, nextRetryAt: nil,
             failureClass: source.rawValue, failureCode: nil,
             updatedAt: now
         )
+        await persist(record, itemID: itemID)
+    }
+
+    /// `save` inserts and fails when the row already exists; `upsert` covers that
+    /// case. Both failures are logged: a silent `try?` here is what kept
+    /// `image_resolution` empty while the mapping never matched the schema.
+    private func persist(_ record: ImageResolutionRecord, itemID: String) async {
         do {
             try await db.write { db in
                 try record.save(db)
             }
         } catch {
-            _ = try? await db.write { db in
-                try record.upsert(db)
+            Log.db.error("image_resolution save failed item=\(itemID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            do {
+                try await db.write { db in
+                    try record.upsert(db)
+                }
+            } catch {
+                Log.db.error("image_resolution upsert failed item=\(itemID, privacy: .public) error=\(String(describing: error), privacy: .public)")
             }
         }
     }
@@ -288,15 +361,7 @@ actor MediaAssetStore {
             failureClass: nsError.domain, failureCode: nsError.code,
             updatedAt: now
         )
-        do {
-            try await db.write { db in
-                try record.save(db)
-            }
-        } catch {
-            _ = try? await db.write { db in
-                try record.upsert(db)
-            }
-        }
+        await persist(record, itemID: itemID)
     }
 
     private nonisolated func isValidImageData(_ data: Data) -> Bool {

@@ -91,6 +91,78 @@ final class CanonicalSearchRepositoryTests: RuntimeV2TestCase {
         XCTAssertNil(hit.audioURL)
     }
 
+    /// Only a role that *is* an image may fill `imageURL`: a revision that declares `poster`, `audio`
+    /// and `video` offers the poster as the image and the audio as the audio, and one that declares
+    /// only `video`/`waveform` offers no image at all. Before the whitelist any non-audio role became
+    /// `imageURL`, so a search result could render an mp4 as the card's image (plan §10; V2-14).
+    func testSearchRendersOnlyImageRolesAsTheImageURL() async throws {
+        try registerTarget()
+        let source = try insertSource(editorialKey: "catalog:media", displayTitle: "Media Notes")
+        let membership = try MembershipClaim(sourceID: source, membershipKind: "editorial")
+        let poster = try MediaCandidateClaim(
+            role: .poster,
+            resourceURL: "https://cdn.example.test/poster.jpg",
+            position: 0
+        )
+        let audio = try MediaCandidateClaim(
+            role: .audio,
+            resourceURL: "https://cdn.example.test/audio.mp3",
+            position: 1
+        )
+        let video = try MediaCandidateClaim(
+            role: .video,
+            resourceURL: "https://cdn.example.test/clip.mp4",
+            position: 2
+        )
+        let videoOnly = try MediaCandidateClaim(
+            role: .video,
+            resourceURL: "https://cdn.example.test/only.mp4",
+            position: 0
+        )
+        let waveform = try MediaCandidateClaim(
+            role: .waveform,
+            resourceURL: "https://cdn.example.test/wave.png",
+            position: 1
+        )
+        try admitRequiringSuccess(
+            try batch(
+                id: "batch-media",
+                expectedCheckpoint: 0,
+                observations: [
+                    try observation(
+                        object: "media-rich",
+                        version: "v1",
+                        headline: "Poster and audio",
+                        body: "sharedterm",
+                        memberships: [membership],
+                        media: [poster, audio, video],
+                        observedAt: TestInstant.seconds(2)
+                    ),
+                    try observation(
+                        object: "media-video-only",
+                        version: "v1",
+                        headline: "Video only",
+                        body: "sharedterm",
+                        memberships: [membership],
+                        media: [videoOnly, waveform],
+                        observedAt: TestInstant.seconds(1)
+                    ),
+                ]
+            )
+        )
+
+        let hits = try await repository.search("sharedterm", in: database)
+        XCTAssertEqual(hits.count, 2)
+
+        let rich = try XCTUnwrap(hits.first { $0.headline == "Poster and audio" })
+        XCTAssertEqual(rich.imageURL, "https://cdn.example.test/poster.jpg", "the poster is the image")
+        XCTAssertEqual(rich.audioURL, "https://cdn.example.test/audio.mp3", "audio stays audio, never the image")
+
+        let videoOnlyHit = try XCTUnwrap(hits.first { $0.headline == "Video only" })
+        XCTAssertNil(videoOnlyHit.imageURL, "a video is never the card's image (V2-14)")
+        XCTAssertNil(videoOnlyHit.audioURL)
+    }
+
     /// The hit is the record's *current* revision: after a newer revision becomes current the index
     /// answers with the new text and the superseded term matches nothing.
     func testSearchFollowsTheCurrentRevisionAndForgetsTheSupersededOne() async throws {

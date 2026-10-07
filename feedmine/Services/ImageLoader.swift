@@ -44,9 +44,23 @@ enum ImageLoader {
             }
         }
 
-        // Register this download for deduplication
-        await ImageCache.registerDownload(for: cacheURL)
-        defer { Task { await ImageCache.unregisterDownload(for: cacheURL) } }
+        // Register this download for deduplication. The returned token is
+        // ownership, not a hint: `registerDownload` answers `false` when another
+        // path (the prefetcher, another card) already holds the URL. This caller
+        // then must not fetch a second copy of the same bytes — and must not
+        // unregister a mark it does not own, because that would let a third
+        // caller start the duplicate the mark exists to prevent.
+        let ownsDownload = await ImageCache.registerDownload(for: cacheURL)
+        defer { if ownsDownload { Task { await ImageCache.unregisterDownload(for: cacheURL) } } }
+        guard ownsDownload else {
+            // Someone else is fetching this URL right now (the in-flight check
+            // above can win a look at a download that had not registered yet):
+            // wait for their result under the same budget instead of issuing a
+            // duplicate request. A timeout here is a placeholder for this card,
+            // never a second download; the retry queue owns LATER attempts.
+            let deadline = Date().addingTimeInterval(3.0)
+            return await ImageCache.shared.waitForInFlightDownload(of: cacheURL, until: deadline)
+        }
 
         // Tier 3: network download with URL candidate fallbacks
         if let url {

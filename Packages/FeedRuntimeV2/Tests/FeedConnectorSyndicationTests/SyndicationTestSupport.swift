@@ -143,6 +143,61 @@ enum TestFixtures {
     </rss>
     """
 
+    /// Two articles a publisher released in one batch: distinct GUIDs, one declared instant.
+    static let rssTwoItemsOneInstant = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <title>Batch Release</title>
+        <link>https://example.com/</link>
+        <description>Two articles published at the same moment</description>
+        <item>
+          <title>Batch one</title>
+          <link>https://example.com/batch-one</link>
+          <guid isPermaLink="false">batch-one</guid>
+          <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate>
+          <description>First of the batch</description>
+        </item>
+        <item>
+          <title>Batch two</title>
+          <link>https://example.com/batch-two</link>
+          <guid isPermaLink="false">batch-two</guid>
+          <pubDate>Mon, 14 Sep 2026 10:00:00 GMT</pubDate>
+          <description>Second of the batch</description>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    /// A document longer than one batch carries, generated rather than written out.
+    ///
+    /// Each item has its own GUID, link, instant and excerpt. The minutes are derived from the index, so
+    /// the generator is only usable for fewer than sixty items.
+    static func rssDocument(itemCount: Int) -> String {
+        let items = (0..<itemCount).map { index in
+            """
+            <item>
+              <title>Item \(index)</title>
+              <link>https://example.com/item-\(index)</link>
+              <guid isPermaLink="false">item-\(index)</guid>
+              <pubDate>Mon, 14 Sep 2026 10:\(String(format: "%02d", index)):00 GMT</pubDate>
+              <description>Excerpt \(index)</description>
+            </item>
+            """
+        }.joined(separator: "\n")
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+          <channel>
+            <title>Paged Feed</title>
+            <link>https://example.com/</link>
+            <description>A document with more items than one batch carries</description>
+        \(items)
+          </channel>
+        </rss>
+        """
+    }
+
     /// The GUID spelled like a URL, verbatim, including its query.
     static let urlSpelledGUID = "https://example.com/second?utm_source=feed&id=2"
 

@@ -91,6 +91,15 @@ public struct EditorialSequencer: Sendable {
         if cards.count < budget.cardLimit {
             for choice in deferredByQuota {
                 if cards.count == budget.cardLimit { break }
+                // A quota is not a licence to publish two equivalents: the cluster rule that deferred
+                // nothing above applies here too, and admitting a deferred choice consumes its cluster's
+                // allowance like any other admission (ADR-007 D13).
+                if clusterUsed[choice.clusterKey, default: 0] >= clusterOccurrenceAllowance {
+                    clustersCollapsed += 1
+                    continue
+                }
+                quotaUsed[choice.candidate.quotaKey, default: 0] += 1
+                clusterUsed[choice.clusterKey, default: 0] += 1
                 cards.append(
                     card(
                         ordinal: cards.count,

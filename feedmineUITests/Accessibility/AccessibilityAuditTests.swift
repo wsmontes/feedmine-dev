@@ -1,13 +1,18 @@
+import Foundation
 import XCTest
 
 /// Accessibility audit tests for FeedMine's main screens and states.
 ///
-/// Uses XCUIApplication.performAccessibilityAudit (available in Xcode 15+)
-/// to automatically detect accessibility issues on each screen.
+/// Uses XCUIApplication.performAccessibilityAudit (available in Xcode 15+) to automatically detect
+/// accessibility issues on each screen.
 ///
-/// Coverage per plan Section 14.1:
-/// - Onboarding, timeline, card, catalog, search, source detail,
-///   player, preferences, loading, empty, offline, error, modal.
+/// `performAccessibilityAudit()` audits whatever is frontmost, so every test here navigates to the surface
+/// it declares and asserts that surface by an identifier production actually sets before auditing it.
+/// The version this replaces audited the wrong screen four times over: `Catalog` probed a tab bar this app
+/// has never had (and audited the feed), `Settings` opened the more-menu and audited the menu, `Loading`
+/// and `FreshInstall` audited onboarding, and `FilterSheet` audited the feed twice when no sheet appeared.
+/// A surface that cannot be reached now fails — or skips with its precondition named — and never passes by
+/// auditing something else. Every audit attaches a screenshot of the surface it audited.
 @MainActor
 final class AccessibilityAuditTests: XCTestCase {
 
@@ -22,6 +27,7 @@ final class AccessibilityAuditTests: XCTestCase {
             let screenshot = app.screenshot()
             let attachment = XCTAttachment(screenshot: screenshot)
             attachment.lifetime = .keepAlways
+            attachment.name = "failure-\(name)"
             add(attachment)
         }
     }
@@ -32,117 +38,187 @@ final class AccessibilityAuditTests: XCTestCase {
     func testAccessibilityAudit_MainTimeline() throws {
         AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false)
 
-        // Wait for feed to load
-        _ = app.collectionViews.firstMatch.waitForExistence(timeout: UIWaits.extendedTimeout)
-
-        try app.performAccessibilityAudit()
+        try audit(surface: "timeline", requiring: element(ScreenID.filterButton))
     }
 
     /// Audit the onboarding welcome screen.
     func testAccessibilityAudit_Onboarding() throws {
         AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: true)
 
-        _ = app.buttons[ScreenID.welcomeShape].waitForExistence(timeout: UIWaits.launchTimeout)
-
-        try app.performAccessibilityAudit()
+        try audit(surface: "onboarding", requiring: element(ScreenID.welcomeShape))
     }
 
-    // MARK: - Catalog & search
+    // MARK: - Catalog
 
-    /// Audit the catalog/search interface.
+    /// Audit the catalog browser.
+    ///
+    /// There is no tab bar and no `catalog` screen id: the catalog is `CatalogExploreView`, titled
+    /// "Catalog" at its root (`CatalogBrowserViewModel.swift:95`, `CatalogExploreView.swift:23`), presented
+    /// from the debug bar, which the compact header draws only under `showDebugBar` (FeedScreen.swift).
+    /// That bar is reached, with no production change, by its own toggle: a triple tap on the feed status
+    /// chip — the "secret gesture" the chip carries (`FeedScreen.swift`).
     func testAccessibilityAudit_Catalog() throws {
         AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false)
-        XCTAssertTrue(app.buttons["filter-button"].waitForExistence(timeout: UIWaits.extendedTimeout),
-                      "Feed must be ready before auditing catalog")
+        XCTAssertTrue(
+            element(ScreenID.filterButton).waitForExistence(timeout: UIWaits.extendedTimeout),
+            "The feed must be ready before the catalog can be opened (feed chrome: filter-button, FeedScreen.swift)"
+        )
 
-        // Open catalog tab — fail loudly if unreachable
-        let tabBar = app.tabBars.firstMatch
-        if tabBar.exists {
-            let catalogTab = tabBar.buttons.element(boundBy: 1)
-            XCTAssertTrue(catalogTab.waitForExistence(timeout: 5),
-                          "Catalog tab must exist in tab bar")
-            catalogTab.tap()
+        // Toggle the developer debug bar only if it is not already up — the flag persists in UserDefaults
+        // across launches, so a previous run can have left it on — then take its catalog entry. Without the
+        // entry the catalog screen cannot be presented at all, and auditing the feed instead is the defect
+        // being fixed here.
+        let exploreCatalog = app.buttons[ScreenID.catalogExploreLabel]
+        if !exploreCatalog.exists {
+            let statusChip = app.staticTexts[ScreenID.feedStatusChipLabel]
+            XCTAssertTrue(
+                statusChip.waitForExistence(timeout: UIWaits.defaultTimeout),
+                "The feed status chip ('\(ScreenID.feedStatusChipLabel)') must be on screen to toggle the debug bar — it is the toggle's only handle — and the catalog entry is not already present"
+            )
+            statusChip.tap(withNumberOfTaps: 3, numberOfTouches: 1)
         }
-        _ = app.collectionViews.firstMatch.waitForExistence(timeout: 5)
+        XCTAssertTrue(
+            exploreCatalog.waitForExistence(timeout: UIWaits.defaultTimeout),
+            "The debug bar's '\(ScreenID.catalogExploreLabel)' entry (FeedScreen.swift, `showDebugBar` branch) must appear after the status chip's triple-tap toggle; the catalog has no other entry point, so without it this audit cannot be run against the catalog."
+        )
+        exploreCatalog.tap()
 
-        try app.performAccessibilityAudit()
+        try audit(surface: "catalog", requiring: app.navigationBars[ScreenID.catalogTitle])
     }
 
     // MARK: - Filter sheet
 
-    /// Audit the content filter interface.
+    /// Audit the content filter sheet.
     func testAccessibilityAudit_FilterSheet() throws {
         AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false)
 
-        XCTAssertTrue(app.buttons["filter-button"].waitForExistence(timeout: UIWaits.extendedTimeout),
-                      "Filter button must be reachable — cannot audit filter sheet")
-        app.buttons["filter-button"].tap()
+        let filterButton = element(ScreenID.filterButton)
+        XCTAssertTrue(
+            filterButton.waitForExistence(timeout: UIWaits.extendedTimeout),
+            "filter-button must be reachable before the filter sheet can be presented (FeedScreen.swift)"
+        )
+        filterButton.tap()
 
-        // Filter may present as sheet, navigation push, or popover.
-        // Wait for any indication that filter UI appeared (sheet, button, or new nav title)
-        let filterUIDetected = app.buttons["filter-done"].waitForExistence(timeout: 15)
-                            || app.sheets.firstMatch.waitForExistence(timeout: 15)
-                            || app.staticTexts["Clear All Filters"].waitForExistence(timeout: 15)
-        // If filter UI not detected yet, wait a bit more and audit current screen
-        if !filterUIDetected {
-            Thread.sleep(forTimeInterval: 5.0)
-        }
-        try app.performAccessibilityAudit()
-
-        try app.performAccessibilityAudit()
+        // The sheet is proved by its own control, not by "a sheet/button/nav title appeared somewhere":
+        // `filter-done` is the sheet's Done button (FilterSheetView.swift:242).
+        try audit(surface: "filter-sheet", requiring: element(ScreenID.filterDone))
     }
 
     // MARK: - Settings
 
-    /// Audit the settings interface.
+    /// Audit the settings sheet.
     func testAccessibilityAudit_Settings() throws {
         AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false)
-        XCTAssertTrue(app.buttons["filter-button"].waitForExistence(timeout: UIWaits.extendedTimeout),
-                      "Feed must be ready before auditing settings")
+        XCTAssertTrue(
+            element(ScreenID.filterButton).waitForExistence(timeout: UIWaits.extendedTimeout),
+            "The feed must be ready before settings can be opened (feed chrome: filter-button, FeedScreen.swift)"
+        )
 
-        // Open settings via more menu — fail loudly if unreachable
-        XCTAssertTrue(app.buttons["more-menu"].waitForExistence(timeout: 5),
-                      "More menu button must exist on feed screen")
-        app.buttons["more-menu"].tap()
-        // The more menu opens a popover/menu — audit whatever appears
-        _ = app.sheets.firstMatch.waitForExistence(timeout: 3)
-               || app.popovers.firstMatch.waitForExistence(timeout: 3)
-               || app.menus.firstMatch.waitForExistence(timeout: 3)
+        let moreMenu = element(ScreenID.moreMenu)
+        XCTAssertTrue(
+            moreMenu.waitForExistence(timeout: UIWaits.defaultTimeout),
+            "more-menu must exist on the feed screen (FeedScreen.swift, the compact header's `Menu`)"
+        )
+        moreMenu.tap()
 
-        try app.performAccessibilityAudit()
+        // The menu is only the way in: Settings itself is the sheet whose navigation bar is titled
+        // "Settings" (SettingsSheetView.swift:272), entered by the menu's own "Settings" item
+        // (FeedScreen.swift).
+        let settingsEntry = app.buttons["Settings"]
+        XCTAssertTrue(
+            settingsEntry.waitForExistence(timeout: UIWaits.defaultTimeout),
+            "The more-menu must offer its 'Settings' item (FeedScreen.swift) — auditing the open menu is not auditing Settings"
+        )
+        settingsEntry.tap()
+
+        try audit(surface: "settings", requiring: app.navigationBars[ScreenID.settingsTitle])
     }
 
     // MARK: - RTL locale (Arabic)
 
     /// Verify app remains operable in right-to-left locale.
     func testAccessibilityAudit_ArabicLocale() throws {
-        AppLauncher.launchAccessibility(app: app, locale: "ar", showOnboarding: true)
+        AppLauncher.launchAccessibility(app: app, locale: "ar", showOnboarding: false)
 
-        _ = app.buttons.firstMatch.waitForExistence(timeout: UIWaits.launchTimeout)
-
-        try app.performAccessibilityAudit()
+        // The locale is the variable here, so the surface is held constant: the feed, proved by the one
+        // identifier every feed state carries, rather than by "some button exists".
+        try audit(surface: "timeline-rtl", requiring: element(ScreenID.filterButton))
     }
 
     // MARK: - Loading state
 
-    /// Audit the loading/initial state.
+    /// Audit the startup loading chrome.
+    ///
+    /// The surface is `initial-feed-loading` (`InitialFeedLoadingView`, FeedScreen.swift). It exists
+    /// only while the feed is preparing, so this launch refuses every request at the process boundary
+    /// (`-network-profile offline` installs `OfflineNetworkGuard`), leaving nothing that could bring the
+    /// phase to an end while the audit runs.
     func testAccessibilityAudit_LoadingState() throws {
-        AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: true)
+        AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false, networkProfile: "offline")
 
-        // Audit immediately while loading indicators may be visible
-        _ = app.buttons.firstMatch.waitForExistence(timeout: 5)
+        let loading = element(ScreenID.initialLoading)
+        guard loading.waitForExistence(timeout: UIWaits.defaultTimeout) else {
+            throw XCTSkip("""
+            initial-feed-loading is not on screen and cannot be induced from here: `XCUIApplication.launch()` returns only once \
+            the app is idle, and with every request refused the run reaches the empty/offline surface before the harness can look. \
+            The loader exposes no delay hook and no launch argument holds the preparing phase, so the loading chrome is not \
+            reachable at audit time. Auditing whatever replaced it would report on a different screen.
+            """)
+        }
 
-        try app.performAccessibilityAudit()
+        try audit(surface: "loading", requiring: loading)
     }
 
     // MARK: - Empty state
 
-    /// Audit app after fresh install (should show onboarding or empty state).
+    /// Audit the empty feed a fresh install opens on.
+    ///
+    /// The surface is `feed-empty-state` (`FeedEmptyStateView`, FeedEmptyStateView.swift:358) — what a feed
+    /// with nothing to show draws, and what onboarding leaves behind on a first run.
     func testAccessibilityAudit_FreshInstall() throws {
-        AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: true)
+        AppLauncher.launchAccessibility(app: app, locale: "en", showOnboarding: false, networkProfile: "offline")
 
-        _ = app.buttons.firstMatch.waitForExistence(timeout: UIWaits.launchTimeout)
+        let empty = element(ScreenID.emptyState)
+        guard empty.waitForExistence(timeout: UIWaits.extendedTimeout) else {
+            throw XCTSkip("""
+            feed-empty-state is not on screen and cannot be induced from here: the harness cannot empty the store. \
+            `-fixture-profile empty` is parsed by TestConfiguration (TestConfiguration.swift:139) and consumed by nothing, so a \
+            previous run's cached page survives the launch and the feed draws content. Auditing that page would report on the \
+            timeline, not on a fresh install.
+            """)
+        }
+
+        try audit(surface: "empty-state", requiring: empty)
+    }
+
+    // MARK: - Audit plumbing
+
+    /// The one place an audit happens.
+    ///
+    /// The declared surface must be on screen — proved by an identifier production sets for it — before the
+    /// audit runs; the surface's screenshot is attached under its own name. If the surface is not there the
+    /// audit is **not** run: `continueAfterFailure` is on, so an `XCTAssert` alone would fall through into
+    /// auditing the wrong screen, which is precisely the failure this file was rewritten to remove.
+    private func audit(surface: String, requiring element: XCUIElement) throws {
+        guard element.waitForExistence(timeout: UIWaits.extendedTimeout) else {
+            XCTFail("Refusing to audit '\(surface)': its surface ('\(element.identifier)') is not on screen, so the audit would land on whatever replaced it.")
+            return
+        }
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "audit-\(surface)"
+        attachment.lifetime = .keepAlways
+        add(attachment)
 
         try app.performAccessibilityAudit()
+    }
+
+    /// Match on identifier across every descendant, in whichever element type the view produced it:
+    /// `feed-empty-state` is a plain `VStack` and `initial-feed-loading` a combined `GeometryReader`, so
+    /// guessing `otherElements`/`staticTexts` here would trade a wrong screen for a wrong query.
+    private func element(_ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@", identifier))
+            .firstMatch
     }
 }

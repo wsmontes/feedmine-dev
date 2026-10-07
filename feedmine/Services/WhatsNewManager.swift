@@ -60,15 +60,35 @@ final class WhatsNewManager {
     }
 
     /// Advance the carousel: return shown (unclicked) items to the pool so
-    /// they remain available for future selections, then promote next batch.
+    /// they remain available for future selections, then promote the next batch.
+    ///
+    /// The pool is ordered newest-first, and the previewed items are re-sorted to its
+    /// front, so a plain promote would hand back the very batch that is on screen.
+    /// Promote from the candidates that were *not* just previewed instead, so advancing
+    /// makes progress while an unseen alternative exists. Without a full unseen batch
+    /// the previewed items are the newest available, and the carousel keeps them rather
+    /// than pretending the selection changed.
     func advanceWhatsNew(markSurfaced: ([FeedItem]) -> Void) {
+        let shownIDs = Set(whatsNewItems.map(\.id))
         // Return unclicked items to the pool — they were only previewed, not consumed
         if !whatsNewItems.isEmpty {
             whatsNewPool = (whatsNewItems + whatsNewPool)
                 .sorted { $0.publishedAt > $1.publishedAt }
         }
         whatsNewItems = []
-        promoteWhatsNewIfReady(markSurfaced: markSurfaced)
+        let unseen = shownIDs.isEmpty
+            ? whatsNewPool
+            : whatsNewPool.filter { !shownIDs.contains($0.id) }
+        guard unseen.count >= whatsNewThreshold else {
+            promoteWhatsNewIfReady(markSurfaced: markSurfaced)
+            return
+        }
+        let batch = Array(unseen.prefix(whatsNewThreshold))
+        let batchIDs = Set(batch.map(\.id))
+        whatsNewPool.removeAll { batchIDs.contains($0.id) }
+        whatsNewItems = batch
+        // Carousel items are visible on screen — mark as surfaced
+        markSurfaced(batch)
     }
 
     /// Kick off an aggressive fetch to fill the What's New pool quickly at

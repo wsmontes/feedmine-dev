@@ -115,6 +115,19 @@ struct CatalogUpdateManifest: Codable, Equatable, Sendable {
         try verifySignature()
     }
 
+    /// The canonical payload the signature covers.
+    ///
+    /// It must reproduce, byte for byte, `canonicalEncoder` in `scripts/sign_manifest.swift`: compact JSON,
+    /// lexicographically sorted keys, unescaped slashes. Key order is not a Codable contract and the signer's
+    /// `UnsignedManifest` is a distinct type from `UnsignedFields`, so a default `JSONEncoder()` produced bytes
+    /// nobody could reproduce — a signature valid in one process could be rejected in another (TOOL-24 / S16).
+    /// Sorting the keys is what lets two independently declared shapes yield the same payload.
+    private static let canonicalEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }()
+
     private func verifySignature() throws {
         let pkHex = Self.publicKeyHex
         guard !pkHex.isEmpty else {
@@ -141,7 +154,7 @@ struct CatalogUpdateManifest: Codable, Equatable, Sendable {
             fileCount: fileCount,
             files: files
         )
-        guard let payload = try? JSONEncoder().encode(unsigned) else {
+        guard let payload = try? Self.canonicalEncoder.encode(unsigned) else {
             throw CatalogUpdateError.invalidManifest("failed to re-encode manifest for verification")
         }
 

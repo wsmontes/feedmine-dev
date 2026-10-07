@@ -462,9 +462,17 @@ enum ExportEngine {
     /// Returns: either a URL (single) or a temp file URL (batch via OPML).
     static func shareLink(sources: [FeedSource]) -> ShareLinkResult {
         if sources.count == 1, let source = sources.first {
-            // Single feed: deep link
-            let encoded = source.url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? source.url
-            let link = "feedmine://import?url=\(encoded)"
+            // Single feed: deep link. Built with URLComponents/URLQueryItem rather than by concatenating a
+            // percent-encoded string: `.urlQueryAllowed` keeps `&` and `=` intact, so a feed URL carrying its
+            // own query split the deep link into extra parameters and the consumer's `queryItems` read back
+            // only the part before the first `&`
+            // (feed.example/rss?a=1&token=… → "…?a=1", round-trip false). URLQueryItem encodes each value as
+            // a *value*, which is what the consumer reads back.
+            var components = URLComponents()
+            components.scheme = "feedmine"
+            components.host = "import"
+            components.queryItems = [URLQueryItem(name: "url", value: source.url)]
+            let link = components.url?.absoluteString ?? "feedmine://import"
             return .text("\(source.title)\n\(link)")
         }
         // Batch: generate temp OPML file for attachment

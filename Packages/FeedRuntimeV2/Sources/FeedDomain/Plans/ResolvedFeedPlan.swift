@@ -67,9 +67,101 @@ public struct ContextKey: Hashable, Sendable, CustomStringConvertible {
         self.planIdentity = planIdentity
     }
 
+    /// Reads back what `canonicalSerialization` wrote, or `nil` when the text is not a canonical key.
+    ///
+    /// The three fields are assigned directly rather than through the throwing initializer so the
+    /// answer to "is this text a key" stays a question about the text.
+    public init?(canonicalText text: String) {
+        guard let fields = Self.split(fields: text), fields.count == 3,
+              let surface = Surface(rawValue: fields[0]),
+              !fields[1].isEmpty,
+              !fields[2].isEmpty
+        else { return nil }
+        self.surface = surface
+        self.scopeKey = fields[1]
+        self.planIdentity = fields[2]
+    }
+
     /// Canonical text form. This is also the `context_key` an edition carries.
+    ///
+    /// Every field is escaped, so a field that itself contains the separator cannot be read back as two
+    /// fields: the main feed's `scopeKey` is `preset=…|box=…`, and joining the fields raw made the key
+    /// ambiguous — a decoder bounded to three fields reassigned part of the scope to the plan, and two
+    /// different contexts could serialize to one key (ADR-002 D1).
     public var canonicalSerialization: String {
+        [surface.rawValue, scopeKey, planIdentity]
+            .map(Self.escaped)
+            .joined(separator: String(Self.fieldSeparator))
+    }
+
+    /// The form written before fields were escaped.
+    ///
+    /// It is only ever *read*: a row that carries it is still this context's row, and the next save
+    /// rewrites it in the escaped form. For a context whose three fields contain no separator — every
+    /// context but the main feed's — the two forms are the same text.
+    public var legacySerialization: String {
         "\(surface.rawValue)|\(scopeKey)|\(planIdentity)"
+    }
+
+    private static let fieldSeparator: Character = "|"
+    private static let escapeCharacter: Character = "\\"
+
+    /// The text a canonical key was written under before fields were escaped.
+    ///
+    /// Removing the escapes recovers the older spelling exactly, which is what a row written by an earlier
+    /// build carries. It is *not* a parse: the older spelling cannot be split back unambiguously, and this
+    /// exists so such a row can be recognized, read and retired (ADR-002 D1; V2-12).
+    public static func preEscapeText(ofCanonicalText text: String) -> String {
+        var plain = ""
+        plain.reserveCapacity(text.count)
+        var escaping = false
+        for character in text {
+            if escaping {
+                plain.append(character)
+                escaping = false
+            } else if character == escapeCharacter {
+                escaping = true
+            } else {
+                plain.append(character)
+            }
+        }
+        return plain
+    }
+
+    private static func escaped(_ field: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(field.count)
+        for character in field {
+            if character == escapeCharacter || character == fieldSeparator {
+                escaped.append(escapeCharacter)
+            }
+            escaped.append(character)
+        }
+        return escaped
+    }
+
+    /// The fields of the escaped form, in order. `nil` when the text ends inside an escape, which makes
+    /// it unreadable as a key.
+    private static func split(fields text: String) -> [String]? {
+        var fields: [String] = []
+        var current = ""
+        var escaping = false
+        for character in text {
+            if escaping {
+                current.append(character)
+                escaping = false
+            } else if character == escapeCharacter {
+                escaping = true
+            } else if character == fieldSeparator {
+                fields.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        guard !escaping else { return nil }
+        fields.append(current)
+        return fields
     }
 
     public var description: String { canonicalSerialization }

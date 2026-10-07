@@ -19,13 +19,55 @@ public struct SystemEditorialClock: EditorialClock {
 /// Outbound HTTP, injected so editorial and rendering paths can be proven free of network
 /// (plan §3, I-02).
 public protocol HTTPTransport: Sendable {
+    /// The whole body, with no ceiling on how much of it is read.
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse)
+
+    /// The same call under the ceilings of the caller that knows how much it is willing to read.
+    ///
+    /// A ceiling enforced by the caller *after* the body arrived is not a ceiling: the bytes were
+    /// already received, decompressed and held in memory. An implementation therefore refuses from the
+    /// response headers when they already exceed `ceiling`, counts the bytes it reads, and stops the
+    /// transfer at the ceiling (ADR-005 D4, D14). The default implementation below is the unbounded
+    /// call, which is what an injected transport under test provides.
+    func data(for request: URLRequest, ceiling: HTTPBodyCeiling) async throws -> (Data, HTTPURLResponse)
+}
+
+public extension HTTPTransport {
+    func data(for request: URLRequest, ceiling: HTTPBodyCeiling) async throws -> (Data, HTTPURLResponse) {
+        try await data(for: request)
+    }
+}
+
+/// The two byte ceilings one transport call must not cross.
+///
+/// They measure different things: `declaredBytes` is checked against the `Content-Length` a response
+/// declares, before the body is read (what the wire promised to send), and `receivedBytes` against the
+/// bytes actually read after the transport decompressed them.
+public struct HTTPBodyCeiling: Hashable, Sendable {
+    /// Ceiling on the length the response declares. `nil` means the caller did not declare one.
+    public let declaredBytes: Int?
+    /// Ceiling on the bytes read. Checked as they arrive, never after the fact.
+    public let receivedBytes: Int
+
+    public init(declaredBytes: Int? = nil, receivedBytes: Int = Int.max) {
+        self.declaredBytes = declaredBytes
+        self.receivedBytes = receivedBytes
+    }
+
+    /// No ceiling of either kind.
+    public static let unbounded = HTTPBodyCeiling()
 }
 
 public enum HTTPTransportError: Error, Equatable, Sendable {
     case notHTTP
     case status(Int)
     case transport(String)
+    /// The response declared more bytes than the caller's ceiling allows: refused from the headers,
+    /// before the body is read.
+    case declaredBodyTooLarge(limit: Int, declared: Int)
+    /// The body crossed the caller's ceiling while it was being read: the transfer was stopped and the
+    /// body was never materialised.
+    case receivedBodyTooLarge(limit: Int, received: Int)
 }
 
 /// A connector: an external effect that turns a target into canonical observations.

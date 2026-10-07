@@ -81,14 +81,20 @@ struct ArticleWebView: UIViewRepresentable {
         }
 
         if let url {
+            context.coordinator.requestedURL = url
             webView.load(URLRequest(url: url))
         }
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Reload if URL changed (e.g. reused for different article) (#46)
-        if let url, webView.url?.absoluteString != url.absoluteString {
+        // Reload only when the *input* changed (e.g. reused for different article, #46). Comparing
+        // `webView.url` against it restarted the article after a redirect or an in-page navigation:
+        // the browser's current URL is the result of a load, never the input the representable was
+        // given, so any environment-driven `updateUIView` sent the reader back to the original URL.
+        guard context.coordinator.requestedURL != url else { return }
+        context.coordinator.requestedURL = url
+        if let url {
             webView.load(URLRequest(url: url))
         }
     }
@@ -96,6 +102,9 @@ struct ArticleWebView: UIViewRepresentable {
     class Coordinator: NSObject, WKNavigationDelegate {
         var progressView: UIProgressView?
         var progressObservation: NSKeyValueObservation?
+        /// The URL this representable was last asked to load. It is the only input allowed to restart a
+        /// load; the web view's own current URL is not an input.
+        var requestedURL: URL?
 
         deinit {
             progressObservation?.invalidate()

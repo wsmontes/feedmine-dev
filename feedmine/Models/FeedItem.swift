@@ -227,7 +227,10 @@ struct FeedItem: Identifiable, Sendable, Codable, Equatable {
         // `d >= 60` is false for NaN but TRUE for +inf, and Int(_:) traps on infinity —
         // episode durations arrive from feed metadata, so check finiteness explicitly.
         guard let d = duration, d.isFinite, d >= 60 else { return nil }
-        let mins = Int(d / 60)
+        // Finite is not enough: 1e30 / 60 and greatestFiniteMagnitude are outside Int's range and
+        // `Int(_:)` traps on them. Truncate first, then convert exactly — a value that cannot be
+        // represented as an Int is not a readable duration, so it returns nil instead of crashing.
+        guard let mins = Int(exactly: (d / 60).rounded(.towardZero)) else { return nil }
         if mins < 60 { return "\(mins) min" }
         let hrs = mins / 60
         let rem = mins % 60

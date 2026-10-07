@@ -60,14 +60,41 @@ public struct SessionCheckpointStore: Sendable {
                     checkpoint.updatedAtMs,
                 ]
             )
+            // The text this context used before fields were escaped is retired with the write: one
+            // context keeping two rows would leave the cursor depending on which row a read finds first.
+            let legacy = checkpoint.context.legacySerialization
+            if legacy != checkpoint.context.canonicalSerialization {
+                try db.execute(
+                    sql: "DELETE FROM session_checkpoint WHERE context_key = ?",
+                    arguments: [legacy]
+                )
+            }
             return true
         }
     }
 
     /// Reads the cursor of one context, or `nil` when the surface has never been visited.
+    ///
+    /// A row written before context fields were escaped under a different text is still this context's
+    /// row: this lookup asked for the context, so the requested context — not the ambiguous split of the
+    /// stored text — is what the checkpoint belongs to (ADR-002 D1; V2-12).
     public func load(context: ContextKey) throws -> SessionCheckpoint? {
         try database.read { db in
-            try Self.load(db, contextKey: context.canonicalSerialization)
+            if let current = try Self.load(db, contextKey: context.canonicalSerialization) {
+                return current
+            }
+            let legacy = context.legacySerialization
+            guard legacy != context.canonicalSerialization,
+                  let stored = try Self.load(db, contextKey: legacy)
+            else { return nil }
+            return SessionCheckpoint(
+                context: context,
+                editionID: stored.editionID,
+                anchor: stored.anchor,
+                renderEnvironmentRevision: stored.renderEnvironmentRevision,
+                policyVersion: stored.policyVersion,
+                updatedAtMs: stored.updatedAtMs
+            )
         }
     }
 
@@ -78,7 +105,17 @@ public struct SessionCheckpointStore: Sendable {
                 sql: "DELETE FROM session_checkpoint WHERE context_key = ?",
                 arguments: [context.canonicalSerialization]
             )
-            return db.changesCount > 0
+            var cleared = db.changesCount > 0
+            // A row left under the pre-escape text is this context's row too (V2-12).
+            let legacy = context.legacySerialization
+            if legacy != context.canonicalSerialization {
+                try db.execute(
+                    sql: "DELETE FROM session_checkpoint WHERE context_key = ?",
+                    arguments: [legacy]
+                )
+                cleared = cleared || db.changesCount > 0
+            }
+            return cleared
         }
     }
 
@@ -133,9 +170,14 @@ public struct SessionCheckpointStore: Sendable {
         )
     }
 
-    /// `ContextKey.canonicalSerialization` is `surface|scopeKey|planIdentity`; the plan identity may
-    /// itself contain the separator, so the split is bounded to the declared field count.
+    /// A stored `context_key`, read back.
+    ///
+    /// The escaped form is tried first: every field is escaped there, so the split is exact. A row
+    /// written before that is read with the bounded split the previous build used — the best reading
+    /// available for text that was itself ambiguous, and one a lookup by context replaces with the
+    /// context it was asked for (V2-12).
     private static func decodeContext(_ text: String) -> ContextKey? {
+        if let context = ContextKey(canonicalText: text) { return context }
         let parts = text.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
         guard parts.count == 3 else { return nil }
         guard let surface = ContextKey.Surface(rawValue: String(parts[0])) else { return nil }

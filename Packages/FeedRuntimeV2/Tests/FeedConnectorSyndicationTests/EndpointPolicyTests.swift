@@ -32,11 +32,19 @@ final class EndpointPolicyTests: XCTestCase {
         XCTAssertEqual(EndpointPolicy.validate(url), .failure(.embeddedCredentials))
     }
 
-    func testValidatorMayNotFollowARedirectToAnotherHost() {
+    func testValidatorMayNotFollowARedirectToAnotherHostOrResource() {
         let source = URL(string: "https://a.example.com/feed")!
-        XCTAssertTrue(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://a.example.com/other")!))
+        // The same resource, spelled the same way: the validator belongs to it.
+        XCTAssertTrue(EndpointPolicy.allowsValidatorTransfer(from: source, to: source))
+        // A query string is not part of an endpoint's identity, so two spellings of one endpoint are one
+        // endpoint (ADR-005 D14).
+        XCTAssertTrue(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://a.example.com/feed?page=2")!))
         XCTAssertFalse(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://b.example.com/feed")!))
         XCTAssertFalse(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://sub.a.example.com/feed")!))
         XCTAssertFalse(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "http://a.example.com/feed")!))
+        XCTAssertFalse(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://a.example.com:8443/feed")!))
+        // Another resource on the same host never issued this validator, so a `304` there would confirm a
+        // baseline this runtime never read (ADR-005 D12, `invariant 7`).
+        XCTAssertFalse(EndpointPolicy.allowsValidatorTransfer(from: source, to: URL(string: "https://a.example.com/other")!))
     }
 }

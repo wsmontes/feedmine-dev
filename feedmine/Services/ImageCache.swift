@@ -154,6 +154,26 @@ enum ImageLog {
     static func allFailed(_ urls: [URL]) {
         logger.error("All image candidates failed: \(urls.map { $0.lastPathComponent }.joined(separator: ", "), privacy: .public)")
     }
+
+    // MARK: - Timing (the media path used to have none)
+
+    /// One resolution, with where it came from and what it cost. Without this the media path could not
+    /// answer "late" vs "never": a card that missed its deadline and a card never asked for looked alike.
+    static func resolveTiming(url: URL?, outcome: String, ms: Int, bytes: Int) {
+        logger.info("resolve outcome=\(outcome, privacy: .public) ms=\(ms) bytes=\(bytes) host=\(url?.host ?? "?", privacy: .public)")
+    }
+
+    /// A published card whose image missed the deadline and was retried later. `ms` is measured from the
+    /// deferred retry's start; the card only shows the image at the next composition (see
+    /// `FeedDisplayState`), which is the delay the reader reports.
+    static func deferredRetry(itemID: String, ms: Int, gotImage: Bool) {
+        logger.info("deferred-retry item=\(itemID, privacy: .private(mask: .hash)) ms=\(ms) image=\(gotImage ? 1 : 0)")
+    }
+
+    /// What a card was published with, and how long that decision took.
+    static func prepareOutcome(itemID: String, outcome: String, ms: Int, index: Int) {
+        logger.info("prepare item=\(itemID, privacy: .private(mask: .hash)) index=\(index) outcome=\(outcome, privacy: .public) ms=\(ms)")
+    }
 }
 
 /// Finds article artwork only when a visible card has already proven that its

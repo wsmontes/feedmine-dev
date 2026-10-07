@@ -248,6 +248,16 @@
 		0F1E2D3C4B5A60718293A4B65 /* FeedComposerScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E2D3C4B5A60718293A4B65 /* FeedComposerScene.swift */; };
 		2F1E2D3C4B5A60718293A4B5C /* FeedRecipeDefinitionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F1E2D3C4B5A60718293A4B5C /* FeedRecipeDefinitionTests.swift */; };
 		2F1E2D3C4B5A60718293A4B5D /* FeedRecipeResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F1E2D3C4B5A60718293A4B5D /* FeedRecipeResolverTests.swift */; };
+		FEEDC0DE0000000000000201 /* AccessibilityAuditTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000101 /* AccessibilityAuditTests.swift */; };
+		FEEDC0DE0000000000000202 /* ConcurrentRefreshTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000102 /* ConcurrentRefreshTests.swift */; };
+		FEEDC0DE0000000000000203 /* DumpStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000103 /* DumpStateTests.swift */; };
+		FEEDC0DE0000000000000204 /* HitchRatioTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000104 /* HitchRatioTests.swift */; };
+		FEEDC0DE0000000000000205 /* LaunchPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000105 /* LaunchPerformanceTests.swift */; };
+		FEEDC0DE0000000000000206 /* ScrollPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000106 /* ScrollPerformanceTests.swift */; };
+		FEEDC0DE0000000000000207 /* AppLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000107 /* AppLauncher.swift */; };
+		FEEDC0DE0000000000000208 /* ScreenObjects.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000108 /* ScreenObjects.swift */; };
+		FEEDC0DE0000000000000209 /* CardIdentityStabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE0000000000000109 /* CardIdentityStabilityTests.swift */; };
+		FEEDC0DE000000000000020A /* UsabilityJourneyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEEDC0DE000000000000010A /* UsabilityJourneyTests.swift */; };
 		/* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -507,6 +517,16 @@
 		F1E2D3C4B5A60718293A4B65 /* FeedComposerScene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedComposerScene.swift; sourceTree = "<group>"; };
 		1F1E2D3C4B5A60718293A4B5C /* FeedRecipeDefinitionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedRecipeDefinitionTests.swift; sourceTree = "<group>"; };
 		1F1E2D3C4B5A60718293A4B5D /* FeedRecipeResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedRecipeResolverTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000101 /* AccessibilityAuditTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityAuditTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000102 /* ConcurrentRefreshTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConcurrentRefreshTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000103 /* DumpStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DumpStateTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000104 /* HitchRatioTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HitchRatioTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000105 /* LaunchPerformanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchPerformanceTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000106 /* ScrollPerformanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollPerformanceTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000107 /* AppLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLauncher.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000108 /* ScreenObjects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenObjects.swift; sourceTree = "<group>"; };
+		FEEDC0DE0000000000000109 /* CardIdentityStabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardIdentityStabilityTests.swift; sourceTree = "<group>"; };
+		FEEDC0DE000000000000010A /* UsabilityJourneyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsabilityJourneyTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -622,9 +642,51 @@
 				AA11BB22CC33DD44EE55F601 /* PersonaExplorationUITests.swift */,
 				923881CC88CDBCB473B3CC10 /* FeedmineUITests.swift */,
 				D97F29521510460FB178EE66 /* RuntimeV2BookmarkWindowTests.swift */,
+				FEEDC0DE0000000000000301 /* Accessibility */,
+				FEEDC0DE0000000000000302 /* Performance */,
+				FEEDC0DE0000000000000303 /* Support */,
+				FEEDC0DE0000000000000304 /* Usability */,
 				6ECC04725B33F93DE0F9E647 /* Info.plist */,
 			);
 			path = feedmineUITests;
+			sourceTree = "<group>";
+		};
+		FEEDC0DE0000000000000301 /* Accessibility */ = {
+			isa = PBXGroup;
+			children = (
+				FEEDC0DE0000000000000101 /* AccessibilityAuditTests.swift */,
+			);
+			path = Accessibility;
+			sourceTree = "<group>";
+		};
+		FEEDC0DE0000000000000302 /* Performance */ = {
+			isa = PBXGroup;
+			children = (
+				FEEDC0DE0000000000000102 /* ConcurrentRefreshTests.swift */,
+				FEEDC0DE0000000000000103 /* DumpStateTests.swift */,
+				FEEDC0DE0000000000000104 /* HitchRatioTests.swift */,
+				FEEDC0DE0000000000000105 /* LaunchPerformanceTests.swift */,
+				FEEDC0DE0000000000000106 /* ScrollPerformanceTests.swift */,
+			);
+			path = Performance;
+			sourceTree = "<group>";
+		};
+		FEEDC0DE0000000000000303 /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				FEEDC0DE0000000000000107 /* AppLauncher.swift */,
+				FEEDC0DE0000000000000108 /* ScreenObjects.swift */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+		FEEDC0DE0000000000000304 /* Usability */ = {
+			isa = PBXGroup;
+			children = (
+				FEEDC0DE0000000000000109 /* CardIdentityStabilityTests.swift */,
+				FEEDC0DE000000000000010A /* UsabilityJourneyTests.swift */,
+			);
+			path = Usability;
 			sourceTree = "<group>";
 		};
 		62C912E6A13BBEE525E730CE = {
@@ -1163,6 +1225,16 @@
 				AA11BB22CC33DD44EE55F602 /* PersonaExplorationUITests.swift in Sources */,
 				73A647D7BC363A39AB99FD59 /* FeedmineUITests.swift in Sources */,
 				8306FB7E7FF14E80A0610D9D /* RuntimeV2BookmarkWindowTests.swift in Sources */,
+				FEEDC0DE0000000000000201 /* AccessibilityAuditTests.swift in Sources */,
+				FEEDC0DE0000000000000202 /* ConcurrentRefreshTests.swift in Sources */,
+				FEEDC0DE0000000000000203 /* DumpStateTests.swift in Sources */,
+				FEEDC0DE0000000000000204 /* HitchRatioTests.swift in Sources */,
+				FEEDC0DE0000000000000205 /* LaunchPerformanceTests.swift in Sources */,
+				FEEDC0DE0000000000000206 /* ScrollPerformanceTests.swift in Sources */,
+				FEEDC0DE0000000000000207 /* AppLauncher.swift in Sources */,
+				FEEDC0DE0000000000000208 /* ScreenObjects.swift in Sources */,
+				FEEDC0DE0000000000000209 /* CardIdentityStabilityTests.swift in Sources */,
+				FEEDC0DE000000000000020A /* UsabilityJourneyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

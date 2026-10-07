@@ -19,10 +19,16 @@ enum EditorialSequencer {
     /// How many times one provider may appear in a row while another provider still has candidates later in the list.
     static let maxConsecutivePerProvider = 1
 
-    /// The provider identity used for the rule. Normalized, because the same source reaches the store under several
-    /// spellings (`http`/`https`, trailing slash) and two spellings of one provider are still one provider to a reader.
+    /// The provider identity used for the rule: the *same* one the Reservoir interleaves and front-loads by
+    /// (`Reservoir.providerKey`), which resolves the publisher behind a URL — generated aggregator feeds
+    /// included.
+    ///
+    /// It used to be a normalized URL here and an aggregator-aware key there. Two identities for one concept
+    /// means a candidate set can satisfy the limit in one layer and violate it in the other, because the
+    /// layers disagree about who the provider is (S15). There is one definition, in `Reservoir`, and every
+    /// policy that ranks by provider resolves through it.
     static func providerKey(_ item: FeedItem) -> String {
-        OPMLParser.normalizeURL(item.sourceURL)
+        Reservoir.providerKey(item)
     }
 
     /// The sequence to publish: `items`, spread across providers so that no provider appears twice in a row while another

@@ -66,7 +66,12 @@ final class AudioPlayerManager {
         let cc = MPRemoteCommandCenter.shared()
 
         cc.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in self?.togglePlayPause() }
+            // A play order is not a toggle: one received while the episode is already playing must not
+            // pause it. The lock screen can carry both, and the two used to fight over the same state (S11).
+            Task { @MainActor [weak self] in
+                guard let self, !self.isPlaying else { return }
+                self.togglePlayPause()
+            }
             return .success
         }
         cc.pauseCommand.addTarget { [weak self] _ in
@@ -188,10 +193,27 @@ final class AudioPlayerManager {
             info[MPMediaItemPropertyComments] = item.excerpt
         }
 
-        // Pre-load artwork data on MainActor, then dispatch the
-        // MPMediaItemArtwork creation off MainActor so the requestHandler
-        // closure doesn't inherit @MainActor isolation.
-        if let urlString = item.bestImageURL ?? item.imageURL,
+        // Publish the basic metadata *now*, synchronously. The artwork branch below used to be the only
+        // writer whenever an image was cached, and it publishes only while the lock screen already shows this
+        // item — exactly the state a new episode is not in (after `stop` the dictionary is nil; after a
+        // switch it still carries the previous id). The guard then discarded the new episode's metadata on
+        // every tick, so the lock screen showed nothing or the previous episode until something else wrote it
+        // (S11).
+        let center = MPNowPlayingInfoCenter.default()
+        // Reuse the artwork already published for this same item instead of re-reading its image data from
+        // disk on every position tick: the artwork of an episode does not change while it plays.
+        if let published = center.nowPlayingInfo,
+           published["feedmineItemID"] as? String == item.id,
+           let artwork = published[MPMediaItemPropertyArtwork] {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
+        center.nowPlayingInfo = info
+
+        // Enrich with artwork while the lock screen has none for this item. The MPMediaItemArtwork is created
+        // off MainActor so the requestHandler closure doesn't inherit @MainActor isolation, and it is
+        // published only if the now-playing item is still the one it captured.
+        if info[MPMediaItemPropertyArtwork] == nil,
+           let urlString = item.bestImageURL ?? item.imageURL,
            let url = URL(string: urlString),
            let data = ImageCache.shared.cachedImageData(for: url) {
             let capturedID = item.id  // guard against rapid episode switches
@@ -209,8 +231,6 @@ final class AudioPlayerManager {
                     MPNowPlayingInfoCenter.default().nowPlayingInfo = updated
                 }
             }
-        } else {
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
     }
 

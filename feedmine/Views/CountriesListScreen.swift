@@ -21,6 +21,7 @@ struct CountriesListScreen: View {
                     ))
                     .labelsHidden()
                     .tint(.green)
+                    .accessibilityIdentifier("country-toggle-all")
                 }
             }
 
@@ -48,8 +49,11 @@ struct CountriesListScreen: View {
                             ))
                             .labelsHidden()
                             .tint(.green)
+                            .accessibilityIdentifier("country-toggle-\(country.slug)")
                         }
                     }
+                    .accessibilityIdentifier("country-\(country.slug)")
+                    .accessibilityValue(loader.isRegionEnabled(country.region) ? "selected" : "not selected")
                 }
             } footer: {
                 let total = countries.map(\.feedCount).reduce(0, +)

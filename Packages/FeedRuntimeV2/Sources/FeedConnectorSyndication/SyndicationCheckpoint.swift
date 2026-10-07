@@ -40,6 +40,28 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
     /// refused rather than guessed at (ADR-005 D11).
     public static let currentSchemaVersion = 1
 
+    /// A document this connector is partway through, because its items did not all fit in one batch
+    /// (ADR-005 D4: a connector that would exceed the batch ceiling splits into batches, it does not
+    /// re-emit the same prefix). Absent — `nil` — when no document is in flight, which is also what a
+    /// checkpoint written before this field existed decodes to.
+    public struct PartialDocument: Hashable, Sendable, Codable {
+        /// Fingerprint of the exact body bytes the offset counts items of. A slice may only continue a
+        /// document whose bytes are unchanged: a body that differs restarts at its first item.
+        public let bodyFingerprint: String
+        /// The declared items of that document this connector already passed over, translated or
+        /// rejected.
+        public let consumedItemCount: Int
+        /// Whether any slice of this document could not be translated. A document with a rejected item
+        /// never confirms a validator, however far the slices got (ADR-005 D12).
+        public let sawItemRejection: Bool
+
+        public init(bodyFingerprint: String, consumedItemCount: Int, sawItemRejection: Bool) {
+            self.bodyFingerprint = bodyFingerprint
+            self.consumedItemCount = consumedItemCount
+            self.sawItemRejection = sawItemRejection
+        }
+    }
+
     public let schemaVersion: Int
     /// The connector namespace this checkpoint belongs to, so a row handed to the wrong connector is
     /// refused instead of reused (ADR-005 D11).
@@ -59,6 +81,8 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
     /// What the connector last saw per object, so an unchanged representation is reported as a
     /// duplicate instead of a spurious current. Bounded by the per-batch item ceiling.
     public let observedRepresentations: [String: SyndicationRepresentationStamp]
+    /// The document this checkpoint is partway through, or `nil` when it is at a document boundary.
+    public let partialDocument: PartialDocument?
 
     public init(
         schemaVersion: Int = SyndicationCheckpoint.currentSchemaVersion,
@@ -67,7 +91,8 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
         endpoint: String,
         validators: SyndicationValidators = SyndicationValidators(),
         hasAdmittedBaseline: Bool = false,
-        observedRepresentations: [String: SyndicationRepresentationStamp] = [:]
+        observedRepresentations: [String: SyndicationRepresentationStamp] = [:],
+        partialDocument: PartialDocument? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.connectorNamespace = connectorNamespace
@@ -76,6 +101,7 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
         self.validators = validators
         self.hasAdmittedBaseline = hasAdmittedBaseline
         self.observedRepresentations = observedRepresentations
+        self.partialDocument = partialDocument
     }
 
     /// The form an endpoint is stored and compared in. A query string is personal data and is never
@@ -125,6 +151,10 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
         guard isUsable(for: endpoint, generation: generation, connectorNamespace: connectorNamespace),
               hasAdmittedBaseline
         else { return [:] }
+        // Half a document needs its body again to produce the next slice, and a validator that was
+        // issued with a partially admitted body is not a confirmed baseline: the fetch that resumes a
+        // document is unconditional by construction (ADR-005 D12).
+        guard partialDocument == nil else { return [:] }
         var headers: [String: String] = [:]
         if let etag = validators.etag { headers["If-None-Match"] = etag }
         if let lastModified = validators.lastModified { headers["If-Modified-Since"] = lastModified }
@@ -159,6 +189,45 @@ public struct SyndicationCheckpoint: Hashable, Sendable, Codable {
     public func confirmedByNotModified() throws -> SyndicationCheckpoint {
         guard hasAdmittedBaseline else { throw SyndicationCheckpointError.notModifiedWithoutAdmittedBaseline }
         return self
+    }
+
+    /// The same document, one slice further: the next pull translates from `consumedItemCount` of the
+    /// same body bytes.
+    ///
+    /// Nothing about the baseline moves. The body was only partly admitted, so its validators are not
+    /// confirmed and the fetch that produces the next slice must be unconditional — a conditional one
+    /// would answer `304` and there would be no body left to translate (ADR-005 D12).
+    public func continuing(
+        document: PartialDocument,
+        observedRepresentations: [String: SyndicationRepresentationStamp]
+    ) -> SyndicationCheckpoint {
+        SyndicationCheckpoint(
+            connectorNamespace: connectorNamespace,
+            generation: generation,
+            endpoint: endpoint,
+            validators: validators,
+            hasAdmittedBaseline: hasAdmittedBaseline,
+            observedRepresentations: observedRepresentations,
+            partialDocument: document
+        )
+    }
+
+    /// A document read to its end that may not confirm a validator: an item the connector could not
+    /// translate, or a document that declares nothing recognizable (ADR-005 D12).
+    ///
+    /// The partial state is dropped — the next slice would be empty, and the next fetch is an ordinary
+    /// conditional one again — while the previous baseline and validators stay exactly as they were.
+    public func endingUnconfirmedDocument(
+        observedRepresentations: [String: SyndicationRepresentationStamp]
+    ) -> SyndicationCheckpoint {
+        SyndicationCheckpoint(
+            connectorNamespace: connectorNamespace,
+            generation: generation,
+            endpoint: endpoint,
+            validators: validators,
+            hasAdmittedBaseline: hasAdmittedBaseline,
+            observedRepresentations: observedRepresentations
+        )
     }
 
     /// The payload a repository stores as `connector_checkpoint.payload`.

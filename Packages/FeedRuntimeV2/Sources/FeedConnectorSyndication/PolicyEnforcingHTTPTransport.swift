@@ -58,6 +58,71 @@ public struct PolicyEnforcingHTTPTransport: HTTPTransport {
     }
 
     public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let validated = try Self.validated(request)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: validated)
+        } catch {
+            throw error
+        }
+        guard let http = response as? HTTPURLResponse else { throw HTTPTransportError.notHTTP }
+        // The status is reported, not interpreted: 304, 429 and a redirect are facts the connector's own
+        // contract is written against.
+        return (data, http)
+    }
+
+    /// The bounded call: the ceilings are checked as the response arrives, never after the fact.
+    ///
+    /// A `Content-Length` above the declared ceiling is refused from the headers, before a single body
+    /// byte is read, and the received count is counted on every byte: the sequence is abandoned at the
+    /// ceiling, which stops the transfer, so a response that declares nothing and streams hundreds of
+    /// megabytes is never materialised (ADR-005 D4, D14).
+    ///
+    /// The read is deliberately the byte sequence and not the delegate-based `data(for:delegate:)`: a
+    /// task delegate is not consulted for the body of a data task (measured — `didReceive` fires
+    /// neither for the response nor for the data), so a ceiling built on one would be a ceiling that
+    /// never triggers. Counting per byte costs about 45 ns (measured: 0.37 s for 8 MiB), which is the
+    /// price of a refusal that a compressed body cannot walk around; a declared length is still refused
+    /// from the headers, before any of it is paid.
+    public func data(for request: URLRequest, ceiling: HTTPBodyCeiling) async throws -> (Data, HTTPURLResponse) {
+        let validated = try Self.validated(request)
+
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: validated)
+        } catch {
+            throw error
+        }
+        guard let http = response as? HTTPURLResponse else { throw HTTPTransportError.notHTTP }
+        if let declaredCeiling = ceiling.declaredBytes,
+           let declared = http.value(forHTTPHeaderField: "Content-Length").flatMap(Int.init),
+           declared > declaredCeiling {
+            throw HTTPTransportError.declaredBodyTooLarge(limit: declaredCeiling, declared: declared)
+        }
+
+        var data = Data()
+        data.reserveCapacity(min(ceiling.receivedBytes, 256 * 1024))
+        do {
+            for try await byte in bytes {
+                guard data.count < ceiling.receivedBytes else {
+                    throw HTTPTransportError.receivedBodyTooLarge(
+                        limit: ceiling.receivedBytes,
+                        received: data.count + 1
+                    )
+                }
+                data.append(byte)
+            }
+        } catch let error as HTTPTransportError {
+            throw error
+        }
+        return (data, http)
+    }
+
+    /// The endpoint policy, applied to every request before the bytes leave the process.
+    private static func validated(_ request: URLRequest) throws -> URLRequest {
         guard let url = request.url else { throw HTTPTransportError.notHTTP }
 
         let target: URL
@@ -72,26 +137,10 @@ public struct PolicyEnforcingHTTPTransport: HTTPTransport {
 
         var validated = request
         if target != url { validated.url = target }
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: validated)
-        } catch {
-            throw error
-        }
-        guard let http = response as? HTTPURLResponse else { throw HTTPTransportError.notHTTP }
-        // The status is reported, not interpreted: 304, 429 and a redirect are facts the connector's own
-        // contract is written against.
-        return (data, http)
+        return validated
     }
 }
 
-/// The session's redirect policy: none are followed (ADR-005 D12, D14).
-///
-/// A `URLSession` that followed a redirect would report the final response as if the requested
-/// endpoint had produced it, so the connector could bind a checkpoint to an endpoint that never
-/// answered, and `If-None-Match` could reach a host that never issued the validator.
 private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(
         _ session: URLSession,

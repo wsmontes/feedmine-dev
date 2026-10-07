@@ -54,6 +54,14 @@ public enum AcquisitionSourceEvent: Hashable, Sendable {
     case disconnected
     /// The finite stream has no more work.
     case finished
+    /// The source confirmed that the checkpoint it resumed from is still current: nothing changed and
+    /// there is nothing to admit in this episode.
+    ///
+    /// It is not `finished`: it says nothing about the stream having ended, so the target stays eligible
+    /// and a later demand may ask it again. A conditional fetch that the endpoint answers `304` is this
+    /// case, which is why a renewable feed can never be reported as a finite stream that ended
+    /// (ADR-005 D8, D12).
+    case upToDate
     /// The stream ended because the caller cancelled.
     case cancelled
 }
@@ -252,6 +260,7 @@ public actor AcquisitionCoordinator {
         case duplicate(batchID: String, bytes: Int)
         case refused(AdmissionResult)
         case sourceFinished
+        case sourceUpToDate
         case sourceDisconnected
         case sourceCancelled
         case sourceFailed(String)
@@ -425,6 +434,12 @@ public actor AcquisitionCoordinator {
                 frontier.markFinished(item.target.id, bindingRevision: snapshot.bindingRevision)
                 return (nil, tally)
 
+            case .sourceUpToDate:
+                // Current, not exhausted: the item ends here and the frontier is left untouched, so the
+                // next demand may consult the same target again. Marking it finished is what froze a
+                // renewable feed for the rest of the session after one 304 (ADR-005 D8).
+                return (nil, tally)
+
             case .sourceDisconnected:
                 frontier.markDegraded(.streamDisconnected(item.target.id))
                 return (.degraded(.streamDisconnected(item.target.id)), tally)
@@ -486,6 +501,8 @@ public actor AcquisitionCoordinator {
         switch event {
         case .finished:
             return (.sourceFinished, true)
+        case .upToDate:
+            return (.sourceUpToDate, true)
         case .disconnected:
             return (.sourceDisconnected, true)
         case .cancelled:

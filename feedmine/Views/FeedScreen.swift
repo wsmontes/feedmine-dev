@@ -317,15 +317,18 @@ struct FeedScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .openSourceView)) { notification in
             guard let feedURL = notification.userInfo?["feedURL"] as? String,
                   !feedURL.isEmpty else { return }
-            let normalized = OPMLParser.normalizeURL(feedURL)
-            let ref = SourceReference(
+            // Pass the endpoint exactly as the deep link carried it. `SourceReference` keeps it as the
+            // fetch URL (signed/authorization query parameters included) and derives the deduplicated
+            // identity in `id`; normalising *before* building the reference removed the signature, so an
+            // imported source opened from `feedmine://source?url=…` refreshed an endpoint without its
+            // credentials.
+            selectedSource = SourceReference(
                 title: "Source",
-                feedURL: normalized,
+                feedURL: feedURL,
                 category: "",
                 region: "global",
                 mediaKind: .text
             )
-            selectedSource = ref
         }
         .onChange(of: player.lastPlaybackError) { _, error in
             if let error {
@@ -470,14 +473,12 @@ struct FeedScreen: View {
             + (isSearching ? searchControlsHeight : (isFilterLensVisible ? 20 : 0))
     }
 
-    @State private var _cachedFilterLensKey: String = ""
-    @State private var _cachedFilterLensSig: String = ""
-
     private var filterLensSignature: String {
         guard hasFilterLensContent else { return "" }
-        // Cache against filter state to avoid string join on every scroll frame
-        let key = "\(loader.selectedRegion ?? ".")|\(loader.selectedContentType.rawValue)|\(loader.selectedMood.rawValue)|\(loader.searchQuery)"
-        if key == _cachedFilterLensKey { return _cachedFilterLensSig }
+        // Every input the lens draws from belongs in this signature: `onChange(of: filterLensSignature)`
+        // compares it to decide whether the lens must be re-presented, so a signature that omits an
+        // input keeps the bar hidden for a selection the reader has not dismissed. Computing it inline
+        // also keeps the render getter free of `@State` mutations.
         var parts: [String] = []
         parts.append(loader.activePreset.displayName)
         parts.append(loader.selectedRegion ?? "")
@@ -486,10 +487,7 @@ struct FeedScreen: View {
         parts.append(loader.selectedNodeIDs.sorted().joined(separator: ","))
         parts.append(loader.selectedLanguages.sorted().joined(separator: ","))
         parts.append(loader.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines))
-        let sig = parts.joined(separator: "|")
-        _cachedFilterLensKey = key
-        _cachedFilterLensSig = sig
-        return sig
+        return parts.joined(separator: "|")
     }
 
     // MARK: - Compact Header
@@ -1022,6 +1020,15 @@ struct FeedScreen: View {
                             EmptyFilterView(category: loader.selectedNodeNames.joined(separator: ", "))
                         }
                     }
+                    // Cards that arrive after the first page — the cold start's starter slice, the runway
+                    // that lands behind it, a load-more — *enter* instead of appearing. Without a transaction
+                    // the list jumped from N to N+20 in a single frame, which reads as a flicker rather than
+                    // as a feed filling up. The value is the published page itself, so the animation is
+                    // exactly "how much is on screen changed".
+                    .animation(
+                        reduceMotion ? nil : .easeOut(duration: 0.28),
+                        value: runtime.presentation.sections.reduce(0) { $0 + $1.rows.count }
+                    )
                     .padding(.top, feedTopPadding)
                     .scrollTargetLayout()
                 }
@@ -1746,10 +1753,14 @@ enum CompactFeedDisplay: Equatable {
         case .legacy(let facts):
             if facts.isPreparingRunway || readyPulse {
                 return .figures(
-                    counter: "· \(facts.fetchedSourceCount)/\(facts.totalSourceCount)",
-                    articles: "· \(facts.itemsReady) of \(facts.itemsTarget) articles for your first screen",
+                    // One figure while the feed is being prepared. The source counts that used to sit beside
+                    // it are catalogue bookkeeping: they were truncated on the chip anyway (measured:
+                    // `· 2/77… · 0 of 1…`) and they say nothing about when the reader's screen fills. The
+                    // sentence they carried is kept in the accessibility label, where there is room for it.
+                    counter: "· \(facts.itemsReady)/\(facts.itemsTarget) articles",
+                    articles: nil,
                     isComplete: readyPulse,
-                    label: "\(facts.fetchedSourceCount) of \(facts.totalSourceCount) sources verified"
+                    label: "\(facts.itemsReady) of \(facts.itemsTarget) articles ready for the first screen, \(facts.fetchedSourceCount) of \(facts.totalSourceCount) sources verified"
                 )
             }
             // The local first page is published before the catalogue is loaded, so the runway flag
@@ -2063,8 +2074,13 @@ enum FeedLoadingDisplay: Equatable {
     ) -> FeedLoadingDisplay {
         guard let session else {
             return .runway(
-                fetched: loader.startupFetchedSourceCount,
-                target: loader.startupTargetSourceCount,
+                // The fraction the reader watches is the one that ends when their screen fills: articles
+                // ready for the first page, out of the page's own target. It used to be sources verified
+                // against the runway's 100 — a number that sat at 2/100 and 2% for the whole wait and
+                // completed long after the feed was on screen (measured: 3/100 with the page already
+                // published). Sources still have their own line, the rotating ticker below.
+                fetched: loader.startupItemsReady,
+                target: max(loader.startupItemsTarget, 1),
                 isReady: loader.startupRunwayReady,
                 recentlyFetchedSourceNames: loader.startupRecentSourceNames,
                 hasPreviouslyLoadedContent: loader.hasPreviouslyLoadedContent
@@ -2118,8 +2134,10 @@ enum FeedLoadingDisplay: Equatable {
     var title: String {
         switch self {
         case .runway(let fetched, _, _, _, let hasPreviouslyLoadedContent):
-            if fetched > 0 { return String(localized: "Loading \(fetched) sources...") }
-            if hasPreviouslyLoadedContent { return String(localized: "Loading your feed...") }
+            // No count in the title: the number the reader watches sits beside the bar, and it counts the
+            // articles their screen is made of. "Loading 2 sources..." named the app's bookkeeping instead
+            // of the reader's wait.
+            if fetched > 0 || hasPreviouslyLoadedContent { return String(localized: "Loading your feed...") }
             return String(localized: "Preparing your feed...")
         case .session(.readingCatalogue):
             return String(localized: "Preparing your feed...")
@@ -2138,7 +2156,9 @@ enum FeedLoadingDisplay: Equatable {
     var detail: String {
         switch self {
         case .runway(let fetched, let target, _, _, _):
-            return "\(fetched)/\(target)"
+            // Articles, and named: "2/100" asked the reader to know what was being counted, and the answer
+            // used to be sources the app was verifying. This line completes when the page lands.
+            return String(localized: "\(fetched) of \(target) articles")
         case .session(.readingCatalogue):
             return String(localized: "Waiting for the source catalogue")
         case .session(.acquiring(let sources, let watched)):
@@ -2163,7 +2183,7 @@ enum FeedLoadingDisplay: Equatable {
     var accessibilityValue: String {
         switch self {
         case .runway(let fetched, let target, _, _, _):
-            return "\(fetched)/\(target)"
+            return String(localized: "\(fetched) of \(target) articles ready")
         case .session:
             return detail
         }
@@ -2319,7 +2339,9 @@ struct InitialFeedLoadingView: View {
                     }
                     nextSourceNameIndex = index + 1
                 }
-                try? await Task.sleep(for: .milliseconds(250))
+                // One name at a time, readable: the rotation ran at 250 ms and the still showed three
+                // names overlaid — a crossfade per 250 ms reads as a flicker, not as a ticker.
+                try? await Task.sleep(for: .milliseconds(900))
             }
         }
     }

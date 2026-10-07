@@ -87,14 +87,20 @@ final class FeedDisplayState {
 
     /// What this session has already written for each composition signature.
     ///
-    /// Two facts, both about *not* regressing the page on disk: the fingerprint of the page last written (an
+    /// Two facts, both about *not* regressing the page on disk: the payload of the page last written (an
     /// unchanged page is not rewritten) and its depth (a thinner publication cannot replace a deeper page — see
     /// ``cacheVisiblePageIfNeeded(filterSignature:)``). Keyed by signature because one session writes several:
     /// a single slot made two compositions invalidate each other's guard.
     private var cachedPages: [String: WrittenPage] = [:]
 
+    /// The page last written for a signature, kept as the payload itself instead of a derived fingerprint:
+    /// every field the cache persists is compared, so a change behind an unchanged id (title, excerpt,
+    /// read/bookmark flag, layout, media decision, cache key) counts as a new page — the old
+    /// `id|layout|hasMedia` string did not, and a warm start restored the older content (S03). Holding the
+    /// values costs no copy: the arrays share the published `FeedItem`/card values.
     private struct WrittenPage {
-        let fingerprint: String
+        let items: [FeedItem]
+        let cards: [CachedCardMedia]?
         let depth: Int
     }
 
@@ -253,6 +259,12 @@ final class FeedDisplayState {
         // Same auto-heal on the card path.
         if !stampedItems.isEmpty { setFilteredCompositionInFlight(false) }
 
+        // One decision per publication: whether anything the reader can observe changed. Consumers read
+        // the two generations as cache-invalidation keys, so a publication that changes nothing must not
+        // bump them (and a publication that changes must bump exactly once — the merge branch used to
+        // bump and then fall through into the unconditional bump below, incrementing twice).
+        var didChange = false
+
         // Background merge over a displayed page: keep the displayed *order*, keep the better card
         // per id, append the ids this batch adds at the end. Reordering is what the user reports as
         // "cards moving up and down", so the displayed order wins over the batch's order; removal is
@@ -284,16 +296,14 @@ final class FeedDisplayState {
                 mergedCards.append(card)
                 mergedItems.append(item)
             }
-            // A merge that changes nothing must not churn the visible page. Assigning and bumping
-            // both generations re-renders every card, and a re-render landing between a test's
-            // stability check and its tap is what loses the tap — recorded as
-            // `miss_cause=feed_unchanged_verified` in the release journey. The settle and the
-            // page-cache write below still run either way.
+            // A merge that changes nothing must not churn the visible page. Assigning and bumping both
+            // generations re-renders every card, and a re-render landing between a test's stability check
+            // and its tap is what loses the tap — recorded as `miss_cause=feed_unchanged_verified` in the
+            // release journey. The settle and the page-cache write below still run either way.
             if mergedCards != visibleCards || mergedItems != visibleItems {
                 visibleCards = mergedCards
                 visibleItems = mergedItems
-                visibleItemsGeneration &+= 1
-                visibleCardsGeneration &+= 1
+                didChange = true
             }
             for card in mergedCards where mediaCacheKeys[card.id] != nil {
                 visibleCardCacheKeys[card.id] = mediaCacheKeys[card.id]
@@ -313,15 +323,23 @@ final class FeedDisplayState {
             let newItems = stampedItems.filter { newIDs.contains($0.id) }
             visibleCards.append(contentsOf: newCards)
             visibleItems.append(contentsOf: newItems)
+            didChange = true
             for (id, key) in mediaCacheKeys { visibleCardCacheKeys[id] = key }
         } else {
+            // The cache keys are part of what the page publishes — the restore path rebuilds cards from
+            // them — so a key change is a change even when the id list is identical.
+            didChange = visibleCards != cards
+                || visibleItems != stampedItems
+                || visibleCardCacheKeys != mediaCacheKeys
             visibleCards = cards
             visibleItems = stampedItems
             visibleCardCacheKeys = mediaCacheKeys
         }
 
-        visibleItemsGeneration &+= 1
-        visibleCardsGeneration &+= 1
+        if didChange {
+            visibleItemsGeneration &+= 1
+            visibleCardsGeneration &+= 1
+        }
 
         // First-paint transition: settle .preparing → .ready/.empty.
         // Skips when loadingState == .refreshing to avoid flashing the
@@ -349,6 +367,41 @@ final class FeedDisplayState {
         if shouldCache {
             cacheVisiblePageIfNeeded(filterSignature: filterSignature)
         }
+    }
+
+    /// Give an already-published card its artwork, in place.
+    ///
+    /// A late image used to be kept only for the next composition, and that is the delay the reader
+    /// reports on podcast cards: the card is on screen with its placeholder and the art arrives seconds
+    /// later — or never, if the session never composes again. Measured on a Podcasts+EN page, every
+    /// card on screen held the stand-in while the deferred retry had already fetched the image.
+    ///
+    /// Refused unless the card's frame was already reserved. The reason a published presentation was
+    /// frozen is that activating a hero slot where there was none changes the card's height and shifts
+    /// everything below it. Two cases reserve the frame with no media in it, and only those are healed:
+    ///
+    /// * a **podcast** — `MainFeedCardBridge.mediaSlot` reserves the hero for `item.isPodcast` in the card
+    ///   band and a thumbnail for it in the row band, and both keep that layout once the image lands;
+    /// * a card whose **stored layout already matches** — the row band reserves a thumbnail for an item
+    ///   with a potential image.
+    ///
+    /// A non-podcast card with no image has no slot at all (`.none` → text-only), so an image arriving
+    /// late would grow a hero under the reader: that one keeps waiting for a composition.
+    ///
+    /// Returns whether the published page changed.
+    @discardableResult
+    func healPublishedMedia(_ card: FeedCardPresentation, cacheKey: String?) -> Bool {
+        guard let index = visibleCards.firstIndex(where: { $0.id == card.id }) else { return false }
+        let shown = visibleCards[index]
+        guard !Self.cardHasMedia(shown.media), Self.cardHasMedia(card.media) else { return false }
+        guard card.item.isPodcast || shown.layout == card.layout else { return false }
+        // Same index in both arrays: the heal never inserts, removes or reorders — it is one card's
+        // media changing under an id the page already holds.
+        guard index < visibleItems.count, visibleItems[index].id == card.id else { return false }
+        visibleCards[index] = card
+        if let cacheKey { visibleCardCacheKeys[card.id] = cacheKey }
+        visibleCardsGeneration &+= 1
+        return true
     }
 
     /// Mutate a single visible item in-place.
@@ -425,6 +478,13 @@ final class FeedDisplayState {
             .first
     }()
 
+    /// Serializes the page-cache writes (FIFO) so a slow write cannot land after a newer one of the same
+    /// destination, and keeps the JSON encoding off the main actor.
+    private static let pageWriteQueue = DispatchQueue(
+        label: "com.feedmine.feeddisplay.page-cache",
+        qos: .utility
+    )
+
     /// How much of the page the cache keeps: one page, the same depth the pipeline publishes as its first page
     /// (`RunwayPolicy.initialPublishedCount`). More than this is the reader scrolling, not the reader reopening.
     nonisolated static let cachedPageDepth = Reservoir.pageSize
@@ -456,7 +516,7 @@ final class FeedDisplayState {
         var cards: [CachedCardMedia]?
     }
 
-    struct CachedCardMedia: Codable {
+    struct CachedCardMedia: Codable, Equatable {
         let itemID: String
         /// Terminal layout the pipeline decided for this card (`hero` / `thumb` / `text`).
         ///
@@ -522,13 +582,6 @@ final class FeedDisplayState {
             logger.info("page[cache] skip sig=\(key) items=\(depth) reason=media-without-keys")
             return
         }
-        // Skip the rewrite only when nothing about the page changed — keyed on the *full* fingerprint
-        // (`id|layout|hasMedia`), never on the id list alone. The warm path's upgrade-only merge keeps
-        // the ids and improves the media, so an id-keyed guard would decide "unchanged", keep a
-        // media-less page cached, and hand the next launch the image pop-in it just fixed.
-        let fingerprint = Self.pageFingerprint(cards: cards, items: items)
-        guard fingerprint != written?.fingerprint else { return }
-        cachedPages[filterSignature] = WrittenPage(fingerprint: fingerprint, depth: depth)
         let cardsByID = Dictionary(cards.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let projection: [CachedCardMedia]? = visibleCardCacheKeys.isEmpty ? nil : items.map { item in
             let card = cardsByID[item.id]
@@ -539,16 +592,24 @@ final class FeedDisplayState {
                 cacheKey: visibleCardCacheKeys[item.id]
             )
         }
+        // Skip the rewrite only when nothing the cache persists changed — compared field by field, never on
+        // the id list alone. The warm path's upgrade-only merge keeps the ids and improves the media, so an
+        // id-keyed guard would decide "unchanged", keep a media-less page cached, and hand the next launch
+        // the image pop-in it just fixed.
+        if let written, written.items == items, written.cards == projection { return }
         let page = CachedPage(
             items: items,
             visibleItemsGeneration: visibleItemsGeneration,
             cards: projection
         )
         logger.info("page[cache] write sig=\(key) items=\(items.count) cards=\(cards.count) mediaKeys=\(self.visibleCardCacheKeys.count)")
-        Task.detached(priority: .background) {
+        Self.pageWriteQueue.async {
             do {
                 let data = try JSONEncoder().encode(page)
                 try data.write(to: url, options: .atomic)
+                Task { @MainActor [weak self] in
+                    self?.cachedPages[filterSignature] = WrittenPage(items: items, cards: projection, depth: depth)
+                }
             } catch {
                 logger.warning("Failed to cache visible page: \(error)")
             }
@@ -570,16 +631,8 @@ final class FeedDisplayState {
     }
 
 
-    /// `id|layout|hasMedia` per card, in order — the key that decides whether the page cache is stale.
-    static func pageFingerprint(cards: [FeedCardPresentation], items: [FeedItem]) -> String {
-        cards.map { card in
-            "\(card.item.id)|\(layoutKey(card.layout))|\(mediaKindKey(card.media) == "image" ? "img" : "no")"
-        }
-        .joined(separator: ",")
-    }
-
-    /// The persisted spelling of a layout. Shared by the fingerprint and the persisted decision so the two can never
-    /// disagree about what "unchanged" means.
+    /// The persisted spelling of a layout. Shared by the persisted decision so a reader of the cache and a
+    /// writer of it can never disagree about what "unchanged" means.
     static func layoutKey(_ layout: FeedCardLayout) -> String {
         switch layout {
         case .hero: return "hero"

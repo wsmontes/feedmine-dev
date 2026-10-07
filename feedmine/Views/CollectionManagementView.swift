@@ -339,10 +339,11 @@ struct SourceFeedView: View {
     @Environment(\.dismiss) private var dismiss
     let source: SourceReference
     @State private var items: [FeedItem] = []
-    /// Pre-resolved card presentations for source items. Built during load()
-    /// so FeedItemCardView can render proper layouts and images instead of
-    /// falling back to text-only when presentation is nil.
-    @State private var cards: [FeedCardPresentation] = []
+    /// Pre-resolved card presentations for source items, keyed by item id. Built during load()
+    /// so FeedItemCardView can render proper layouts and images instead of falling back to text-only
+    /// when presentation is nil. Keyed rather than an array: the row list looked each row up with
+    /// `cards.first { $0.id == item.id }`, so a full render of a large history was O(items²).
+    @State private var cardsByID: [String: FeedCardPresentation] = [:]
     @State private var isLoading = true
     @State private var result: SourceContentResult?
     @State private var articleItem: FeedItem?
@@ -372,7 +373,7 @@ struct SourceFeedView: View {
                     ForEach(items) { item in
                         let render = MainFeedCardBridge.card(
                             item: item,
-                            presentation: cards.first { $0.id == item.id },
+                            presentation: cardsByID[item.id],
                             band: loader.layout
                         )
                         FeedItemView(
@@ -510,7 +511,7 @@ struct SourceFeedView: View {
         let cachedPresentations = await buildPresentations(for: cached)
         if !cached.isEmpty {
             items = cached
-            cards = cachedPresentations
+            cardsByID = cachedPresentations
         }
 
         let loaded = await loader.loadSourceContent(source)
@@ -521,21 +522,20 @@ struct SourceFeedView: View {
         // instant; misses download and are cached for subsequent views.
         let loadedPresentations = await buildPresentations(for: loaded.items)
         items = loaded.items
-        cards = loadedPresentations
+        cardsByID = loadedPresentations
         isLoading = false
     }
 
-    /// Resolves images and builds FeedCardPresentation objects for the given items.
+    /// Resolves images and builds FeedCardPresentation objects for the given items, keyed by item id.
     /// Uses ImageLoader.resolveImage which checks memory cache → disk cache →
     /// in-flight download → network download (with OG fallback for articles).
     /// nonisolated — runs image resolution off the main actor so the UI stays
     /// responsive during concurrent downloads.
-    private nonisolated func buildPresentations(for items: [FeedItem]) async -> [FeedCardPresentation] {
-        guard !items.isEmpty else { return [] }
+    private nonisolated func buildPresentations(for items: [FeedItem]) async -> [String: FeedCardPresentation] {
+        guard !items.isEmpty else { return [:] }
 
-        // Resolve images concurrently for the first page (20 items), then
-        // continue resolving the rest in the background. This matches the
-        // main feed's behavior: show the first page as soon as it's ready.
+        // Resolve images concurrently for the first page (20 items); the rest of the history renders
+        // the placeholder presentation built below, so the first paint is not held by a long tail.
         let pageSize = 20
         let initialBatch = Array(items.prefix(pageSize))
         let rest = Array(items.dropFirst(pageSize))
@@ -556,26 +556,20 @@ struct SourceFeedView: View {
             presentations = batchResults.map(\.1)
         }
 
-        // Resolve remaining items in background (don't block first paint)
+        // Items past the first page render placeholders.
         if !rest.isEmpty {
-            Task.detached(priority: .background) {
-                var restPresentations: [FeedCardPresentation] = []
-                for item in rest {
-                    guard !Task.isCancelled else { break }
-                    restPresentations.append(await Self.resolvePresentation(for: item))
-                }
-                // Merge back into the main cards array on the next load
-                // or refresh — for now, items beyond page 1 use placeholder.
-            }
-            // Fill remaining slots with placeholder presentations so the
-            // cards array is complete (items beyond page 1 show placeholders
-            // until the background task completes on next refresh).
+            // No work is published for `rest`: this used to start a `Task.detached` that resolved every
+            // image and dropped the array, so a source of any size kept downloading after the sheet was
+            // dismissed and every refresh repeated it. Untracked work with no consumer is deleted rather
+            // than kept as a cache warmer — nothing on this surface could read what it warmed (the first
+            // page is re-resolved from the same order every load). Items beyond page 1 render the
+            // placeholder below, which is what the code already showed while that task ran.
             for item in rest {
                 presentations.append(Self.placeholderPresentation(for: item))
             }
         }
 
-        return presentations
+        return Dictionary(presentations.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Resolves the best available image for an item and returns a terminal

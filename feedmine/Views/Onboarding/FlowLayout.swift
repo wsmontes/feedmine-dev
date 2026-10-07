@@ -27,16 +27,22 @@ struct FlowLayout: Layout {
         var height: CGFloat = 0
         var lineWidth: CGFloat = 0
         var lineHeight: CGFloat = 0
+        let maxWidth = proposal.width ?? .infinity
 
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
-            if lineWidth + size.width > (proposal.width ?? .infinity) && lineWidth > 0 {
+            // The gap counts towards the fit test: `placeSubviews` breaks when the next chip would
+            // cross the row edge *after* the spacing the previous chip already advanced, so measuring
+            // without it returned one line where placement used two (width 100, chips 60 + 35,
+            // spacing 10 → measured a single 105-wide line, placed as two rows).
+            let spacing = lineWidth > 0 ? horizontalSpacing : 0
+            if lineWidth + spacing + size.width > maxWidth && lineWidth > 0 {
                 width = max(width, lineWidth)
                 height += lineHeight + verticalSpacing
                 lineWidth = 0
                 lineHeight = 0
             }
-            lineWidth += size.width + (lineWidth > 0 ? horizontalSpacing : 0)
+            lineWidth += (lineWidth > 0 ? horizontalSpacing : 0) + size.width
             lineHeight = max(lineHeight, size.height)
         }
         width = max(width, lineWidth)

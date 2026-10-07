@@ -107,7 +107,9 @@ public struct SyndicationRepresentationStamp: Hashable, Sendable, Codable {
     ///
     /// `historicalOnly` is never emitted: RSS and Atom declare no ordering, so "older than what is
     /// current" is not expressible at this boundary (ADR-003 D9; ADR-006 D7). `expectedRevision` is
-    /// always nil because a revision row identifier belongs to the core, not to a connector.
+    /// always nil because a revision row identifier belongs to the core, not to a connector: Admission
+    /// resolves the expectation against the revision that is current when the batch commits, so a
+    /// changed representation of an object that already has one becomes current (ADR-006 D3).
     public func precedence(from previous: SyndicationRepresentationStamp?) -> PrecedenceInstruction {
         isUnchanged(from: previous) ? .duplicate : .makeCurrent(expectedRevision: nil)
     }

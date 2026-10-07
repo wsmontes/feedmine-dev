@@ -353,12 +353,18 @@ actor SQLiteCatalogRepository: FeedEngineProtocol, CatalogRepository, CatalogSea
         return try await dbQueue.read { db in
             let parentID = query.parentID ?? .root
             let catalogVersion = try Self.catalogVersion(db: db)
+            try Self.validateCursor(cursor, catalogVersion: catalogVersion)
             let rows = try CatalogBrowseRow.fetchAll(
                 db,
-                sql: Self.browseSQL(includeSources: query.includeSources, hasCursor: cursor != nil),
+                sql: Self.browseSQL(
+                    includeSources: query.includeSources,
+                    hasCursor: cursor != nil,
+                    language: query.language
+                ),
                 arguments: Self.browseArguments(
                     parentID: parentID,
                     includeSources: query.includeSources,
+                    language: query.language,
                     cursor: cursor,
                     limit: pageLimit + 1
                 )
@@ -377,6 +383,7 @@ actor SQLiteCatalogRepository: FeedEngineProtocol, CatalogRepository, CatalogSea
         let match = Self.ftsQuery(for: text)
         return try await dbQueue.read { db in
             let catalogVersion = try Self.catalogVersion(db: db)
+            try Self.validateCursor(cursor, catalogVersion: catalogVersion)
             let rows = try CatalogBrowseRow.fetchAll(
                 db,
                 sql: Self.searchSQL(filters: query.filters, hasCursor: cursor != nil),
@@ -503,8 +510,25 @@ actor SQLiteCatalogRepository: FeedEngineProtocol, CatalogRepository, CatalogSea
         return CatalogPage(nodes: nodes, sources: sources, nextCursor: nextCursor, estimatedTotalCount: nil)
     }
 
-    private static func browseSQL(includeSources: Bool, hasCursor: Bool) -> String {
+    /// A keyset cursor is only meaningful against the catalog version that produced it.
+    ///
+    /// A rebuilt catalog can reuse a sort key for a different entity, so a cursor from another
+    /// version would make the page silently skip or repeat rows and return a next cursor that hides
+    /// the mismatch (``Pagination.swift``): reject it before the query runs.
+    private static func validateCursor(_ cursor: CatalogCursor?, catalogVersion: Int64) throws {
+        guard let cursor, cursor.catalogVersion != catalogVersion else { return }
+        throw FeedEngineError.invalidCatalog(
+            "Stale catalog cursor: cursor version \(cursor.catalogVersion), catalog version \(catalogVersion)"
+        )
+    }
+
+    private static func browseSQL(includeSources: Bool, hasCursor: Bool, language: String?) -> String {
         let cursorClause = hasCursor ? "AND (sort_key > ? OR (sort_key = ? AND entity_id > ?))" : ""
+        // Same rule the search path already applies (`searchSQL`): the filter is the source's own
+        // language. Nodes are deliberately left unfiltered — they are this level's navigation, and a
+        // node whose own language is unknown must stay reachable so its matching children can be
+        // opened at all.
+        let languageClause = language == nil ? "" : "AND s.language = ?"
         let sourceUnion = includeSources ? """
             UNION ALL
             SELECT DISTINCT
@@ -514,6 +538,7 @@ actor SQLiteCatalogRepository: FeedEngineProtocol, CatalogRepository, CatalogSea
             FROM catalog_placement p
             JOIN catalog_source s ON s.id = p.source_id
             WHERE p.node_id = ?
+            \(languageClause)
             GROUP BY s.id
             """ : ""
 
@@ -538,12 +563,16 @@ actor SQLiteCatalogRepository: FeedEngineProtocol, CatalogRepository, CatalogSea
     private static func browseArguments(
         parentID: CatalogNodeID,
         includeSources: Bool,
+        language: String?,
         cursor: CatalogCursor?,
         limit: Int
     ) -> StatementArguments {
         var args: [any DatabaseValueConvertible] = [Int64(parentID.rawValue)]
         if includeSources {
             args.append(Int64(parentID.rawValue))
+            if let language {
+                args.append(language)
+            }
         }
         if let cursor {
             args.append(cursor.sortKey)

@@ -14,6 +14,7 @@ final class SyndicationTranslatorTests: XCTestCase {
     private func translate(
         _ document: String,
         maxItems: Int = 200,
+        skipping: Int = 0,
         previous: [String: SyndicationRepresentationStamp] = [:]
     ) throws -> SyndicationTranslation {
         let result = SyndicationTranslator().translate(
@@ -21,13 +22,27 @@ final class SyndicationTranslatorTests: XCTestCase {
             scope: scope,
             observedAt: TestFixtures.observedAt,
             maxItems: maxItems,
+            skipping: skipping,
             previousRepresentations: previous
         )
         return try result.get()
     }
 
+    /// The declared version inside an object-scoped version key.
+    ///
+    /// The key is `length(object key) || object key || length(version) || version`, so the version is
+    /// read past the object it is scoped to (V2-16). Decoding the whole key as text used to work only
+    /// while the key was the bare instant, and a bare instant is exactly what two articles of one batch
+    /// could not share.
     private func versionText(of item: SyndicationTranslatedItem) -> String? {
-        item.observation.versionKey.map { String(decoding: $0.bytes, as: UTF8.self) }
+        guard let key = item.observation.versionKey else { return nil }
+        let bytes = [UInt8](key.bytes)
+        guard bytes.count > 16 else { return nil }
+        var objectLength: UInt64 = 0
+        for byte in bytes[0..<8] { objectLength = (objectLength << 8) | UInt64(byte) }
+        let versionStart = 16 + Int(objectLength)
+        guard bytes.count > versionStart else { return nil }
+        return String(decoding: bytes[versionStart...], as: UTF8.self)
     }
 
     // MARK: - RSS
@@ -209,6 +224,71 @@ final class SyndicationTranslatorTests: XCTestCase {
             previous: newer.observedRepresentations
         )
         XCTAssertEqual(backwards.items[0].observation.precedence, .makeCurrent(expectedRevision: nil))
+    }
+
+    /// Two articles a publisher released together declare one instant. Each version key is scoped to the
+    /// object it is a version of, so neither claims the other's alias and the batch is admissible
+    /// (ADR-003 D9, D11; V2-16).
+    func testTwoArticlesThatDeclareOneInstantDoNotShareAVersionKey() throws {
+        let translation = try translate(TestFixtures.rssTwoItemsOneInstant)
+
+        XCTAssertEqual(translation.items.count, 2)
+        XCTAssertEqual(versionText(of: translation.items[0]), "2026-09-14T10:00:00Z")
+        XCTAssertEqual(versionText(of: translation.items[1]), "2026-09-14T10:00:00Z")
+
+        let first = try XCTUnwrap(translation.items[0].observation.versionKey)
+        let second = try XCTUnwrap(translation.items[1].observation.versionKey)
+        XCTAssertNotEqual(
+            first,
+            second,
+            "one declared instant under two objects is one version of each, not one alias for both"
+        )
+        XCTAssertEqual(first.scope, second.scope)
+
+        // The same object and the same instant still produce the same key, so re-observing an unchanged
+        // representation stays a duplicate rather than becoming a new version of the same object.
+        let replay = try translate(TestFixtures.rssTwoItemsOneInstant)
+        XCTAssertEqual(replay.items[0].observation.versionKey, first)
+        XCTAssertEqual(replay.items[1].observation.versionKey, second)
+    }
+
+    /// A document longer than one batch is consumed in slices: the next slice starts where the previous
+    /// one stopped, and only the slice that reaches the end consumed the whole document (ADR-005 D4;
+    /// V2-11).
+    func testASlicedDocumentContinuesPastWhatThePreviousSliceConsumed() throws {
+        let document = TestFixtures.rssDocument(itemCount: 5)
+
+        let first = try translate(document, maxItems: 2)
+        XCTAssertEqual(first.items.count, 2)
+        XCTAssertEqual(first.declaredItemCount, 5)
+        XCTAssertTrue(first.truncatedByItemCeiling)
+        XCTAssertFalse(first.consumedWholeDocument)
+        XCTAssertEqual(first.consumedItemCount, 2)
+
+        let second = try translate(document, maxItems: 2, skipping: 2)
+        XCTAssertEqual(second.items.count, 2)
+        XCTAssertTrue(second.truncatedByItemCeiling)
+        XCTAssertEqual(second.consumedItemCount, 2)
+        XCTAssertEqual(
+            String(decoding: second.items[0].observation.externalKey.bytes, as: UTF8.self),
+            "item-2",
+            "the slice starts past what the previous one consumed, not at the document's first item"
+        )
+
+        let last = try translate(document, maxItems: 2, skipping: 4)
+        XCTAssertEqual(last.items.count, 1)
+        XCTAssertEqual(
+            String(decoding: last.items[0].observation.externalKey.bytes, as: UTF8.self),
+            "item-4"
+        )
+        XCTAssertFalse(last.truncatedByItemCeiling)
+        XCTAssertTrue(last.consumedWholeDocument)
+
+        // Every declared item is translated exactly once across the three slices.
+        let keys = (first.items + second.items + last.items).map {
+            String(decoding: $0.observation.externalKey.bytes, as: UTF8.self)
+        }
+        XCTAssertEqual(keys, ["item-0", "item-1", "item-2", "item-3", "item-4"])
     }
 
     // MARK: - Atom

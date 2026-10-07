@@ -2,8 +2,20 @@ import Foundation
 import UIKit
 import XCTest
 
+/// Thrown when the app never reached its own chrome. That is a failure, not a precondition, and XCTest reports it as
+/// the case's error — which also stops the run instead of spending ~2.5 minutes on an app that is not there.
+private struct AppNeverReady: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+}
+
 /// Captures screenshots of every major screen/state in Feedmine for persona agents to analyze.
-/// This test does NOT assert — it navigates broadly and saves evidence.
+///
+/// The tour navigates broadly and saves evidence, but it is not evidence-free: the surfaces it *promises* are
+/// asserted (the reader pair; a warm reopen that shows cards with no loading screen), and the contract it announces
+/// is checked at the end — real `feed-item-` cards carrying their language identity, from the unfiltered context the
+/// launch arguments promise, with no loading surface left up. A step whose control is absent is still skipped, as
+/// this surface tour always did; what it may no longer do is report green while holding none of them.
 @MainActor
 final class PersonaExplorationUITests: XCTestCase {
 
@@ -27,8 +39,17 @@ final class PersonaExplorationUITests: XCTestCase {
 
     // MARK: - Main Screenshot Harness
 
-    func testCaptureAllScreens() {
-        waitForAppReady()
+    func testCaptureAllScreens() throws {
+        let pageReady = try waitForAppReady()
+        guard pageReady else {
+            // The chrome answered but no page ever arrived. On a fresh install the first page is all network (measured
+            // 81.4 s, see `waitForAppReady`), so this is a genuinely environmental precondition — the journey promises
+            // the surfaces of a *prepared* feed and there is none to walk. Skipped, never green: the surfaces it
+            // promises (the reader pair, the sheets) cannot be exercised at all, and the release validator counts the
+            // captures that exist. A page that was prepared and then fails to render is not this case — the reopen
+            // measurement below fails on it.
+            throw XCTSkip("journey precondition: app ready but no feed card within 150 s (fresh or offline install — the first page comes off the network) — no prepared page to exercise")
+        }
 
         // 1. Main Feed (default view)
         capture("01-main-feed")
@@ -355,12 +376,52 @@ final class PersonaExplorationUITests: XCTestCase {
         }
         print("REOPEN persisted_before \(persistedBefore.evidence)")
         print("REOPEN persisted_after \(persistedAfter.evidence)")
+
+        // Guard 5 — the two signals the journey *announces*, decided here instead of only printed. The headline
+        // criterion is "close and reopen the app and the feed is already there, from the page the previous interaction
+        // persisted, **with no loading screen in between**": nothing before `launch()` returned is observable, so a
+        // loading surface sampled after it is the user sitting through the very screen the criterion rules out. Gated
+        // on `warmVerified` because an unlabelled start (guard 2) is the case the run already refuses to read as a
+        // warm start — there the verdict stays inconclusive, and no warm claim is made either way.
+        if loadingSeen, warmVerified {
+            XCTFail("warm reopen: a loading surface was still on screen after the app reported idle — surface=\(loadingSurfaceID) title=\(loadingTitle) first_ms=\(loadingFirstMS) last_ms=\(loadingLastMS) window_ms=\(loadingMS) ttff_card_ms=\(firstCardMS < 0 ? "timeout" : String(firstCardMS)) cards=\(settledCards.count) — the criterion is a warm start with no loading screen in between")
+        }
         if firstCardMS < 0 {
             // Guard 4 — name the layer, or say plainly that it cannot be named: an absent persisted row is a
             // save-path miss, a signature mismatch a restore-ordering one — and the signature itself
             // (`FeedStore.pageCacheSignature`) is not reachable from the UI-test target, so the stored keys
             // are reported and the signature is declared unavailable rather than guessed.
             print("REOPEN miss=no-card-within-30s layer=indeterminate stored_keys=\(persistedBefore.pageKeys.joined(separator: ",")) computed_signature=unavailable-in-test-target (pageCacheSignature lives in the app target)")
+            // And the run must not end green on it: the journey reached this point only after a page was on screen
+            // (the readiness gate), so a relaunch that renders no card for 30 s is the warm start failing, not a slow
+            // network. The two preconditions travel in the message so the verdict can be checked without the log.
+            XCTFail("reopen: no `feed-item-` card within 30 s of relaunch (warm_precondition=\(warmVerified ? "verified" : "unverified") persisted_usable=\(persistedBefore.usable ? 1 : 0) page_visible_before_terminate=\(pageVisibleBeforeTerminate ? 1 : 0) container_found=\(persistedBefore.containerFound ? 1 : 0) app_state=\(app.state.rawValue)) — the last surface this journey promises is the restored feed; \(persistedBefore.evidence)")
+        }
+
+        // Guard 6 — the contract the journey announces, asserted once at the end instead of only printed along the
+        // way: a real feed page, its cards carrying the language/type identity their identifier advertises
+        // (`feed-item-<lang>-<id>`, `FeedItemView.swift:82`), from the unfiltered context the launch arguments promise
+        // (`-UITestResetFilters`; `filter-button`'s value is its active count, `FeedScreen.swift:922`), with no
+        // loading surface still up. Every step above is skipped when its control is absent, so without this gate a run
+        // that exercised nothing still ended green — the pass UI-28 names.
+        let contractCards = app.descendants(matching: .any).matching(reopenCardPredicate).allElementsBoundByIndex
+        let contractUnparsed = contractCards.map(\.identifier).filter { Self.cardLanguage(of: $0) == nil }
+        let contractLanguages = Set(contractCards.compactMap { Self.cardLanguage(of: $0.identifier) }).sorted()
+        let contractLoading = app.descendants(matching: .any).matching(loadingPredicate).firstMatch.exists
+        let contractFilterValue = app.buttons["filter-button"].value as? String ?? ""
+        print("CONTRACT cards=\(contractCards.count) hittable=\(contractCards.filter { $0.isHittable }.count) languages=\(contractLanguages) unparsed_ids=\(contractUnparsed.count) filter_active=\(contractFilterValue.isEmpty ? "n/a" : contractFilterValue) loading_pending=\(contractLoading ? 1 : 0)")
+
+        if contractCards.isEmpty {
+            XCTFail("contract: the journey ends with no `feed-item-` card in the tree — the page it promises did not survive the run")
+        }
+        if !contractUnparsed.isEmpty {
+            XCTFail("contract: \(contractUnparsed.count) card identifier(s) no longer carry the advertised `feed-item-<lang>-<id>` shape (`FeedItemView.swift:82`) — first=\(contractUnparsed.first ?? "")")
+        }
+        if contractFilterValue != "0" {
+            XCTFail("contract: the prepared context is no longer the unfiltered feed the launch arguments promise — `filter-button` reports active=\(contractFilterValue.isEmpty ? "n/a" : contractFilterValue) filter(s), expected 0")
+        }
+        if contractLoading {
+            XCTFail("contract: a loading surface is still up at the end of the journey while its page is on screen (`initial-feed-loading` / `feed-empty-state`)")
         }
 
         print("✅ All exploration screenshots saved to: \(screenshotDir)")
@@ -554,8 +615,9 @@ final class PersonaExplorationUITests: XCTestCase {
     /// Drives the one flow that reaches the breadth branch: a **manual refresh** (`forceFetch`). The filter
     /// combos do not reach it — with a full page and `needsFilteredBreadth` false for `.all`, `wantsFetch` is
     /// false and no fetch happens at all, which is why no `branch=` line ever appeared for them.
-    func testRefreshReachesBreadthFetch() {
-        waitForAppReady()
+    func testRefreshReachesBreadthFetch() throws {
+        let pageReady = try waitForAppReady()
+        XCTAssertTrue(pageReady, "the refresh probe needs a prepared page, not only the app chrome")
         XCTAssertNotNil(firstHittableCard(), "need a page before refreshing")
         for _ in 0..<3 {
             app.swipeDown()
@@ -587,9 +649,9 @@ final class PersonaExplorationUITests: XCTestCase {
     /// - A change target is not "prepared" or "radical" by construction: the label is only allowed to be attached once
     ///   the app log reports the matching row count (`reloadFromSQLite … filtered=N`, `localOfType=N`) for that
     ///   generation. The probe supplies the timing; the log supplies the classification.
-    func testFilterChangeClassification() {
-        waitForAppReady()
-        guard firstHittableCard() != nil else {
+    func testFilterChangeClassification() throws {
+        let pageReady = try waitForAppReady()
+        guard pageReady, firstHittableCard() != nil else {
             XCTFail("classification needs a prepared page first")
             return
         }
@@ -815,14 +877,20 @@ final class PersonaExplorationUITests: XCTestCase {
         print("📸 Captured: \(name)")
     }
 
-    private func waitForAppReady() {
+    /// Wait for the app's chrome, then for a real page; `true` means a card is on screen.
+    ///
+    /// Throws `AppNeverReady` when the app never reached its own chrome — a failure, not a precondition, and one the
+    /// old shape followed with "continuing anyway", spending ~2.5 minutes producing zero evidence.
+    /// Returns `false` when the chrome is up but no card ever arrived. That one is the *caller's* call, because it has
+    /// two causes: a fresh install fetches its first page over the network (a precondition for a journey run), while a
+    /// page that was already prepared and still does not render is a failure.
+    private func waitForAppReady() throws -> Bool {
         guard app.buttons["filter-button"].waitForExistence(timeout: 45) else {
             // Fail loudly instead of "continuing anyway": without the app there is nothing to capture,
             // and continuing spends ~2.5 minutes producing zero evidence (measured: a hung launch showed
             // 60 s waiting for the app to idle, then 45 s here, then "cannot request screenshot data
             // because it does not exist" and 0 captures). Restart/reinstall the simulator and re-run.
-            XCTFail("App never became ready: no filter button within 45 s — nothing to capture")
-            return
+            throw AppNeverReady(message: "App never became ready: no filter button within 45 s — nothing to capture")
         }
         // Chrome is not content. `filter-button` exists before anything is on screen, and the first page
         // on a **fresh install** is not the ~11 s this comment used to claim: measured on the frozen
@@ -838,10 +906,12 @@ final class PersonaExplorationUITests: XCTestCase {
         let cardWaitStart = Date()
         let cardArrived = card.waitForExistence(timeout: 150)
         print("READY card_after_ms=\(Int(Date().timeIntervalSince(cardWaitStart) * 1000)) arrived=\(cardArrived ? 1 : 0)")
-        if !cardArrived {
-            print("⚠️ No feed card within 150s — content-dependent steps will skip")
+        guard cardArrived else {
+            print("⚠️ No feed card within 150s — the content-dependent surfaces cannot be exercised; the caller classifies this as precondition or failure")
+            return false
         }
         sleep(8)
+        return true
     }
 
     // MARK: - Reopen measurement helpers
@@ -915,5 +985,16 @@ final class PersonaExplorationUITests: XCTestCase {
               let fields = object as? [String: Any],
               let items = fields["items"] as? [Any] else { return -1 }
         return items.count
+    }
+
+    /// The `<lang>` segment of a card identity, `feed-item-<lang>-<id>` (`FeedItemView.swift:82`).
+    ///
+    /// `nil` when the identifier no longer carries the advertised shape, which is the contract every card assertion
+    /// in this journey rests on: the card says what it is. `und` is a legitimate value — it is what the view writes
+    /// for an item whose language is nil — so it is returned, not filtered out.
+    private static func cardLanguage(of identifier: String) -> String? {
+        let parts = identifier.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count >= 3, parts[0] == "feed", parts[1] == "item", !parts[2].isEmpty else { return nil }
+        return String(parts[2])
     }
 }

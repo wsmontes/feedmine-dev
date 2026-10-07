@@ -92,11 +92,20 @@ public enum EndpointPolicy {
     ///
     /// It may not move to another host: an `ETag` is scoped to the resource that produced it, and
     /// sending it to a third party leaks the request pattern (ADR-005 D12).
+    ///
+    /// It may not move to another *resource* either. Comparing the host alone let a validator for
+    /// `/feed-a` be replayed against `/feed-b` on the same host, and a `304` is a confirmation: the
+    /// endpoint that issued the validator would then answer for a feed this runtime had never read,
+    /// suppressing its acquisition (ADR-005 D12, `invariant 7`). "One resource" is the same notion the
+    /// checkpoint's endpoint key uses — scheme, host, port and path, with the query excluded because a
+    /// query string is not persisted and two spellings of one endpoint are one endpoint (D14).
     public static func allowsValidatorTransfer(from source: URL, to destination: URL) -> Bool {
         guard let sourceHost = source.host()?.lowercased(),
               let destinationHost = destination.host()?.lowercased()
         else { return false }
         let sameScheme = source.scheme?.lowercased() == destination.scheme?.lowercased()
-        return sourceHost == destinationHost && sameScheme
+        return sourceHost == destinationHost
+            && sameScheme
+            && effectiveEndpoint(of: source) == effectiveEndpoint(of: destination)
     }
 }

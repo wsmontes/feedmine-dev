@@ -969,11 +969,15 @@ extension UserStateStore {
     /// One-time migration: import the legacy `imported_sources.json` into
     /// `imported_source`.
     ///
-    /// The rows and the completion marker commit in the same transaction, and
-    /// the legacy file is removed only after that commit. The marker is what
-    /// authorises the deletion — no other code path may remove the file, so a
-    /// crash between "rows written" and "file removed" leaves the file as the
-    /// source of truth for the next launch instead of losing it.
+    /// The rows and the completion marker commit in the same transaction. The legacy
+    /// file is then removed only when every entry it holds is accounted for in the
+    /// table: either because this migration imported it (the table was empty) or
+    /// because the table already holds the same identity. When the table already has
+    /// sources *and* the file holds identities the table does not, the file is kept
+    /// as a recoverable copy under `imported_sources.json.unmerged-backup` and the
+    /// count is logged — deleting it there would drop sources this migration never
+    /// incorporated. A crash before that point leaves the file as the source of
+    /// truth for the next launch instead of losing it.
     func migrateImportedSourcesFromJSONIfNeeded() {
         do {
             guard try !hasMigrationMarker(Self.importedSourcesJSONMigrationMarker) else { return }
@@ -995,19 +999,32 @@ extension UserStateStore {
 
             // Copy into the table only while it is still empty — a database that
             // already holds imported sources is newer than the JSON.
-            let existingCount = try db.read { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM imported_source") ?? 0
+            let existingIdentities = try db.read { db in
+                try Set(String.fetchAll(db, sql: "SELECT source_identity FROM imported_source"))
             }
 
             try db.write { db in
-                if existingCount == 0, !imported.isEmpty {
+                if existingIdentities.isEmpty, !imported.isEmpty {
                     try Self.replaceImportedSources(db, with: imported)
                 }
                 try Self.writeMigrationMarker(db, key: Self.importedSourcesJSONMigrationMarker)
             }
 
-            try FileManager.default.removeItem(at: fileURL)
-            Log.db.info("Migrated \(imported.count) imported sources from JSON to user.sqlite")
+            let unaccounted = imported
+                .map { OPMLParser.normalizeURL($0.url) }
+                .filter { !existingIdentities.contains($0) }
+            if existingIdentities.isEmpty || unaccounted.isEmpty {
+                try FileManager.default.removeItem(at: fileURL)
+                Log.db.info("Migrated \(imported.count) imported sources from JSON to user.sqlite")
+            } else {
+                let keptURL = fileURL.appendingPathExtension("unmerged-backup")
+                try? FileManager.default.removeItem(at: keptURL)
+                try FileManager.default.moveItem(at: fileURL, to: keptURL)
+                Log.db.warning("""
+                    Imported-source migration kept \(unaccounted.count) JSON entries \
+                    user.sqlite does not hold in \(keptURL.lastPathComponent)
+                    """)
+            }
         } catch {
             Log.db.error("Failed to migrate imported_sources.json: \(error)")
         }

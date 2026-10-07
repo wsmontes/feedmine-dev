@@ -571,13 +571,12 @@ final class FeedDisplayStateTests: XCTestCase {
         XCTAssertEqual(state.visibleItemsGeneration, 2) // initial set + toggle
     }
 
-    // MARK: - Published presentations are immutable
+    // MARK: - Published presentations: layout is frozen, media can be healed
 
-    /// A card that has been published keeps its presentation: there is no API
-    /// to swap media or layout into `visibleCards` after publication, because
-    /// activating the hero slot changes the card's height and would shift every
-    /// card below it while the user is reading. A late image is served by the
-    /// next publication instead.
+    /// A card that has been published keeps its **layout**: activating the hero slot where there was none
+    /// changes the card's height and would shift every card below it while the user is reading — which is
+    /// why a late image waits for the next publication. `healPublishedMedia` is the one exception, and only
+    /// for a card that already reserved its frame.
     func test_publishedCardsOnlyChangeThroughPublication() {
         let state = FeedDisplayState()
         let item = FeedItem.makeMock(id: "a")
@@ -598,6 +597,52 @@ final class FeedDisplayStateTests: XCTestCase {
         XCTAssertEqual(state.visibleCards[0].layout, .hero)
         XCTAssertGreaterThan(state.visibleItemsGeneration, generations.0)
         XCTAssertGreaterThan(state.visibleCardsGeneration, generations.1)
+    }
+
+    /// The late-artwork heal: one card's media, in place, and only where the frame was already reserved.
+    ///
+    /// This is the fix for the reported podcast defect — the art arrived seconds after the card was on
+    /// screen and stayed invisible until the next composition (which a stalled feed never reaches). What
+    /// makes it safe is the refusal: a heal that would change the layout is rejected, because that is the
+    /// height shift the frozen presentation exists to prevent.
+    func test_healPublishedMedia_onlyFillsAnAlreadyReservedFrame() {
+        let state = FeedDisplayState()
+        let item = FeedItem.makeMock(id: "late")
+        let reserving = FeedCardPresentation(
+            item: item, media: .placeholder, layout: .hero,
+            isRead: false, isBookmarked: false
+        )
+        state.publishCards([reserving], items: [item], readItemIDs: [], bookmarkItemIDs: [], isAppend: false)
+        let generation = state.visibleCardsGeneration
+
+        let withImage = FeedCardPresentation(
+            item: item, media: .image(UIImage()), layout: .hero,
+            isRead: false, isBookmarked: false
+        )
+        XCTAssertTrue(state.healPublishedMedia(withImage, cacheKey: "late-key"))
+        XCTAssertEqual(state.visibleCardsGeneration, generation + 1, "the heal must invalidate the card cache key")
+        XCTAssertEqual(state.visibleCardCacheKeys["late"], "late-key")
+        guard case .image = state.visibleCards[0].media else {
+            return XCTFail("the heal did not land on the published card")
+        }
+        XCTAssertEqual(state.visibleItems.count, 1, "the heal never inserts or removes an item")
+
+        // A heal that would grow a hero where there was none is refused.
+        let textOnlyState = FeedDisplayState()
+        let textOnly = FeedCardPresentation(
+            item: item, media: .none, layout: .textOnly,
+            isRead: false, isBookmarked: false
+        )
+        textOnlyState.publishCards([textOnly], items: [item], readItemIDs: [], bookmarkItemIDs: [], isAppend: false)
+        XCTAssertFalse(textOnlyState.healPublishedMedia(withImage, cacheKey: nil))
+
+        // An id that is not on the page is refused, not appended.
+        let absent = FeedCardPresentation(
+            item: FeedItem.makeMock(id: "absent"), media: .image(UIImage()), layout: .hero,
+            isRead: false, isBookmarked: false
+        )
+        XCTAssertFalse(state.healPublishedMedia(absent, cacheKey: nil))
+        XCTAssertEqual(state.visibleCards.count, 1)
     }
 
     // MARK: - advanceEpoch

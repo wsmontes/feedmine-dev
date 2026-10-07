@@ -17,6 +17,11 @@ extension FeedHTTPSync: FeedHTTPTransport {}
 /// Retry-After parsing, and redirect canonical URL resolution.
 actor FeedHTTPSync {
     private let session: URLSession
+    /// Per-request timeout. The session's own timeout is not enough: `URLRequest.timeoutInterval`
+    /// overrides it, and a hardcoded 15 s silently undid the starter lane's 5 s session — a slow publisher
+    /// then held the first paint's fetch for 15 s, and the fetch's task group cannot return before every
+    /// child does. The lane that built the session states its own budget here.
+    private let requestTimeout: TimeInterval
 
     /// Shared headers for all feed requests.
     private static let requestHeaders: [String: String] = [
@@ -24,7 +29,8 @@ actor FeedHTTPSync {
         "Accept": "application/rss+xml, application/atom+xml, application/feed+json, application/json, application/xml, text/xml;q=0.9"
     ]
 
-    init(session: URLSession? = nil) {
+    init(session: URLSession? = nil, requestTimeout: TimeInterval = 15) {
+        self.requestTimeout = requestTimeout
         if let session {
             self.session = session
         } else {
@@ -79,7 +85,7 @@ actor FeedHTTPSync {
         }()
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 15
+        request.timeoutInterval = requestTimeout
 
         // Conditional GET headers
         if let etag = validators.etag {

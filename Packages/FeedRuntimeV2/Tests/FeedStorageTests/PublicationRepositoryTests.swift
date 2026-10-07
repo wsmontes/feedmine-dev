@@ -895,4 +895,66 @@ final class PublicationRepositoryTests: RuntimeV2TestCase {
         XCTAssertEqual(try repositories().cards(in: published.edition.editionID).count, 1)
         try assertPublicationIntegrity()
     }
+
+    /// An edition stored under the text a context used before its fields were escaped is still that
+    /// context's edition: the reads find it, a successor of it is a successor of the same context, and the
+    /// activation retires it (ADR-002 D1; V2-12).
+    func testAnEditionStoredUnderThePreEscapeContextTextIsReadAndRetired() throws {
+        let published = try publishEdition()
+        let context = try planContext("preset=home|box=-")
+        XCTAssertNotEqual(context.canonicalSerialization, context.legacySerialization)
+
+        // The build before the escape wrote this context under the older text.
+        try database.write { db in
+            try db.execute(
+                sql: "UPDATE feed_edition SET context_key = ? WHERE edition_id = ?",
+                arguments: [context.legacySerialization, published.edition.editionID.rawValue]
+            )
+        }
+
+        let repositories = repositories()
+        guard case .restored(let restored, _) = try repositories.restore(context: context) else {
+            return XCTFail("the edition of the older text is still this context's edition")
+        }
+        XCTAssertEqual(restored.editionID, published.edition.editionID)
+        XCTAssertEqual(try repositories.activeEdition(for: context)?.editionID, published.edition.editionID)
+        XCTAssertEqual(try repositories.latestEdition(for: context)?.editionID, published.edition.editionID)
+
+        let successor = try openDraft(
+            context: context,
+            revisionTag: "revision-b",
+            epoch: 2,
+            successorOf: published.edition.editionID
+        )
+        _ = try publish(
+            repositories,
+            token: successor.token,
+            cards: [
+                try card(
+                    edition: successor,
+                    record: published.rows[0],
+                    absoluteOrdinal: 0,
+                    title: "Headline 0",
+                    primaryText: "Excerpt 0",
+                    sourceDisplayName: "Alpha",
+                    sourceID: published.source,
+                    publishedAt: TestInstant.epoch,
+                    revisionTag: "revision-b"
+                )
+            ],
+            activation: .activate(successorOf: published.edition.editionID),
+            pinned: [try OriginRevisionID(published.rows[0].revisionID)]
+        )
+
+        XCTAssertEqual(
+            try string("SELECT state FROM feed_edition WHERE edition_id = \(published.edition.editionID.rawValue)"),
+            "superseded",
+            "the older spelling is retired rather than shadowed"
+        )
+        let activeKeys = try database.read { db in
+            try String.fetchAll(db, sql: "SELECT context_key FROM feed_edition WHERE state = 'active'")
+        }
+        XCTAssertEqual(activeKeys, [context.canonicalSerialization])
+        try assertPublicationIntegrity()
+    }
 }

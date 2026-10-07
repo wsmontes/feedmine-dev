@@ -160,7 +160,10 @@ struct FeedItemCardView: View, Equatable {
                 .lineLimit(2)
                 .foregroundStyle(isRead ? .secondary : .primary)
                 .padding(.horizontal, 12)
-                .padding(.top, hasImage ? 10 : 6)
+                // Keyed on the reserved frame, never on whether bytes have arrived: with `hasImage` the
+                // title jumped 4 pt the moment an image landed — including in the in-place media heal,
+                // whose whole promise is that nothing below the card moves.
+                .padding(.top, mediaSlot.reservesFrame ? 10 : 6)
 
             // Excerpt
             Text(item.excerpt)

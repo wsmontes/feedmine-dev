@@ -118,6 +118,8 @@ private struct TaxonomyLevelView: View {
                         } label: {
                             taxonomyRow(child)
                         }
+                        .accessibilityIdentifier("topic-node-\(child.id)")
+                        .accessibilityValue(store.selectedNodeIDs.contains(child.id) ? "selected" : "not selected")
                     } else {
                         // Leaf — no children, just toggle
                         Button {
@@ -126,6 +128,8 @@ private struct TaxonomyLevelView: View {
                             taxonomyRow(child)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("topic-node-\(child.id)")
+                        .accessibilityValue(store.selectedNodeIDs.contains(child.id) ? "selected" : "not selected")
                     }
                 }
             }

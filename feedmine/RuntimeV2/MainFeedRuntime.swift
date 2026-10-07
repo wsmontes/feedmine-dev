@@ -307,11 +307,13 @@ final class MainFeedRuntime {
     }
 
     private weak var loader: FeedLoader?
-    /// Schedules replenishment for one viewport observation.
+    /// Schedules replenishment for one viewport observation the session did not take.
     ///
-    /// Production routes it to the legacy store, which owns acquisition in every mode this build ships;
-    /// the seam exists so the trigger itself is observable without publishing a page (a real
-    /// publication writes the process-wide page cache — `docs/runtime-v2/baseline.md` §8.3).
+    /// Production routes it to the legacy store: a launch that owns acquisition answers the viewport
+    /// through the session (`handle(.viewportChanged)`), so every trigger that reaches here belongs to the
+    /// legacy lane — the modes that own no acquisition, and a launch whose composition failed. The seam
+    /// exists so the trigger itself is observable without publishing a page (a real publication writes the
+    /// process-wide page cache — `docs/runtime-v2/baseline.md` §8.3).
     private var replenishHandler: (@MainActor (_ lastVisibleOrdinal: Int, _ publishedOrdinalCount: Int) async -> Void)?
     private var refreshTask: Task<Void, Never>?
     private var lastCenterCardID: PublicationCardID?
@@ -398,7 +400,14 @@ final class MainFeedRuntime {
         // and not in `RuntimeCompositionRoot.compose` because composition is also what a test drives
         // directly, and a process-wide gate installed by a test's composition would leak into every
         // other test in the same process. `stop()` reopens it.
-        if decision.mode.ownsAcquisition {
+        //
+        // The owner is the runtime that *composed*, not the mode that asked for one: a `v2Full` launch
+        // whose composition threw has no `V2FullRuntime` to acquire with, and closing its producers there
+        // would leave the launch with no owner at all — the cached page on screen and nothing able to
+        // fill it. `ownsAcquisition` is the same statement every other effect in this type routes by
+        // (`attach`, `adoptSelectionIfNeeded`, `handle`), and the shadow's install above is guarded the
+        // same way.
+        if runtime.ownsAcquisition {
             LegacyAcquisitionGate.close()
         }
         Log.feed.info("\(runtime.diagnostics)")
@@ -438,15 +447,11 @@ final class MainFeedRuntime {
     func attach(loader: FeedLoader) {
         self.loader = loader
         replenishHandler = { [weak self] lastVisibleOrdinal, publishedOrdinalCount in
-            guard let self else { return }
-            if self.ownsAcquisition {
-                await self.replenishFromSession()
-            } else {
-                await loader.loadMoreIfNeeded(
-                    viewportLastVisibleOrdinal: lastVisibleOrdinal,
-                    publishedOrdinalCount: publishedOrdinalCount
-                )
-            }
+            guard let self, let loader = self.loader else { return }
+            await loader.loadMoreIfNeeded(
+                viewportLastVisibleOrdinal: lastVisibleOrdinal,
+                publishedOrdinalCount: publishedOrdinalCount
+            )
         }
         guard let full = composition?.full else {
             presentation.attach(loader)
@@ -638,12 +643,6 @@ final class MainFeedRuntime {
         return loader.enabledSources
     }
 
-    /// The session's reply to a viewport observation: the composition runs again through the plan's own
-    /// acquisition step, so replenishment is a demand rather than a second owner.
-    private func replenishFromSession() async {
-        await composition?.full?.refresh()
-    }
-
     private var sessionTask: Task<Void, Never>?
 
     /// Releases the mode's process-wide state: the mirror sink and the drain loop.
@@ -685,7 +684,10 @@ final class MainFeedRuntime {
             if first == nil || ordinal < first!.ordinal { first = (id, ordinal) }
             if last == nil || ordinal > last!.ordinal { last = (id, ordinal) }
         }
-        guard let first, let last else { return }
+        guard let first, let last else {
+            Log.feed.info("[Viewport] ids=\(visibleItemIDs.count) resolved=0 pageSource=\(String(describing: self.presentation.pageSource)) ordinals=\(self.presentation.ordinalByItemID.count) — observation dropped before the load-more path")
+            return
+        }
 
         let anchor = presentation.viewportAnchor(firstVisibleItemID: first.id)
         let sent = presentation.sendViewport(
@@ -693,6 +695,7 @@ final class MainFeedRuntime {
             lastVisibleOrdinal: last.ordinal,
             anchor: anchor
         )
+        Log.feed.info("[Viewport] ids=\(visibleItemIDs.count) first=\(first.ordinal) last=\(last.ordinal) sent=\(sent ? 1 : 0) ownsAcq=\(self.ownsAcquisition ? 1 : 0) pageSource=\(String(describing: self.presentation.pageSource))")
         if !sent {
             replenish(lastVisibleOrdinal: last.ordinal)
         }
@@ -785,10 +788,36 @@ final class MainFeedRuntime {
 
     private func handle(_ intent: FeedSessionIntent) {
         switch intent {
-        case .viewportChanged(_, let lastVisibleOrdinal, _):
-            replenish(lastVisibleOrdinal: lastVisibleOrdinal)
-        case .centerCrossed:
+        case let .viewportChanged(firstVisibleOrdinal, lastVisibleOrdinal, anchor):
+            // The observation is the session's to reduce, anchor included: it sets the anchor, shifts its
+            // own window, closes the intervals of the cards it evicted and asks for at most one page per
+            // tail ordinal (ADR-007 H-16, plan §11 — `FeedSessionReducer.shouldReplenish`). Replenishing
+            // here instead — which the runtime did, through a refresh — made every visible update a
+            // successor edition and acquired for it, whether or not the reader asked for one, and recorded
+            // nothing from the anchor the renderer sent. A launch that owns no acquisition has no session
+            // and keeps the legacy lane's own trigger.
+            guard ownsAcquisition else {
+                replenish(lastVisibleOrdinal: lastVisibleOrdinal)
+                return
+            }
+            Task { [weak self] in
+                await self?.composition?.full?.viewportChanged(
+                    firstVisibleOrdinal: firstVisibleOrdinal,
+                    lastVisibleOrdinal: lastVisibleOrdinal,
+                    anchor: anchor
+                )
+            }
+        case let .centerCrossed(cardID, direction):
             centerCrossingCount += 1
+            // `centerCrossed` is a fact of its own (ADR-007 D5) and the interval it belongs to lives in
+            // the session's tracker, so it has to reach the session: counting it here and handing it to no
+            // one was telemetry the reader's own exposure history never saw. The count above stays the
+            // boundary's own instrument, and on a page the session does not own it is the whole of what
+            // this does — the rows there are not the session's cards.
+            guard ownsAcquisition, presentation.pageSource == .sessionSnapshot else { return }
+            Task { [weak self] in
+                await self?.composition?.full?.centerCrossed(cardID: cardID, direction: direction)
+            }
         case .cardVisibility(let observation):
             cardVisibilityCount += 1
             // The intent's effect is the session's: exposure is its own record of the cards it showed

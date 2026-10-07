@@ -511,6 +511,33 @@ final class AdmissionTests: RuntimeV2TestCase {
         XCTAssertEqual(try string("SELECT headline FROM origin_revision WHERE id = 1"), "One")
     }
 
+    /// A representation that changed for an object which already has one becomes current: the connector
+    /// names no revision row, so `nil` is resolved against what is durable when the batch commits
+    /// (ADR-006 D3; V2-15).
+    func testAnUpdateWithoutAnExpectedRevisionBecomesCurrent() throws {
+        try registerTarget()
+        let first = try observation(object: "item-1", version: "v1", headline: "One")
+        try admitRequiringSuccess(try batch(id: "batch-1", expectedCheckpoint: 0, observations: [first]))
+
+        // The connector's own vocabulary: a changed representation of a known object, with no revision
+        // named because a revision row id belongs to the core.
+        let second = try observation(object: "item-1", version: "v2", headline: "Two")
+        XCTAssertEqual(second.precedence, .makeCurrent(expectedRevision: nil))
+        let receipt = try admitRequiringSuccess(
+            try batch(id: "batch-2", expectedCheckpoint: 1, observations: [second])
+        )
+
+        let recordID = try XCTUnwrap(try ledger.recordIDs(in: database).first)
+        XCTAssertEqual(receipt.admittedRevisionCount, 1)
+        XCTAssertTrue(receipt.supplyChanged, "a new revision became current")
+        XCTAssertEqual(try ledger.currentRevisionID(ofRecord: recordID, in: database)?.rawValue, 2)
+        XCTAssertEqual(try ledger.searchProjection(ofRecord: recordID, in: database), "Two")
+        XCTAssertEqual(try string("SELECT origin_revision_id FROM selection_supply"), "2")
+        // The pointer moves; history does not. The representation it replaced is preserved bit-for-bit.
+        XCTAssertEqual(try string("SELECT headline FROM origin_revision WHERE id = 1"), "One")
+        XCTAssertEqual(try rowCount("origin_revision"), 2)
+    }
+
     func testReAdmittingTheSameRepresentationMovesNothingAndChangesNoSupply() throws {
         try registerTarget()
         let first = try observation(object: "item-1", version: "v1", headline: "One")

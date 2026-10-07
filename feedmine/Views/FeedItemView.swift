@@ -35,6 +35,11 @@ struct FeedItemView: View {
     }
 
     var body: some View {
+        // Frozen once per render. Reading `presentedAction` inside the tap's `Task` evaluated it when
+        // the task ran, against whatever edition was current then — the opposite of what this file
+        // documents: a card still tappable after its surface moved on would have been granted the new
+        // surface's capability instead of being refused for the offer it was rendered with (ADR-001 D16).
+        let offer = presentedAction
         Group {
             if loader.layout == .card {
                 FeedItemCardView(
@@ -47,7 +52,7 @@ struct FeedItemView: View {
                     onViewSource: onViewSource,
                     onAddSourceToCollection: onAddSourceToCollection,
                     onCopy: onCopy,
-                    onImageTap: mediaSlotPlaysAudio ? { Task { await performCardAction(presentedAction) } } : nil,
+                    onImageTap: mediaSlotPlaysAudio ? { Task { await performCardAction(offer) } } : nil,
                     isInBookmarkBox: loader.selectedBookmarkListID != nil
                 )
                 .padding(.horizontal, 12)
@@ -62,7 +67,7 @@ struct FeedItemView: View {
                     isBookmarked: card.isBookmarked,
                     mediaSlot: mediaSlot,
                     affordances: card.affordances,
-                    onImageTap: mediaSlotPlaysAudio ? { Task { await performCardAction(presentedAction) } } : nil
+                    onImageTap: mediaSlotPlaysAudio ? { Task { await performCardAction(offer) } } : nil
                 )
                 .contextMenu { contextMenuContent }
                 Divider()
@@ -76,7 +81,7 @@ struct FeedItemView: View {
             Log.ui.info("card tap id=\(item.id) lang=\(item.language ?? "und") action=\(String(describing: card.affordances.tap)) read=\(card.isRead)")
             let impact = UIImpactFeedbackGenerator(style: .light)
             impact.impactOccurred()
-            Task { await performCardAction(presentedAction) }
+            Task { await performCardAction(offer) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("feed-item-\(item.language ?? "und")-\(item.id)")

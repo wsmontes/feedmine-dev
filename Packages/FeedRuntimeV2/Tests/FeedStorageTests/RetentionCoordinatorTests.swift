@@ -1149,4 +1149,204 @@ final class RetentionCoordinatorTests: RuntimeV2TestCase {
         XCTAssertEqual(resumed.result(for: .connectorEvidence)?.collected, 1, "the stale row is collected")
         XCTAssertEqual(try string("SELECT batch_id FROM connector_evidence"), "current")
     }
+
+    // MARK: - The two dimensions a policy declares (V2-17)
+
+    /// A byte-only evidence policy still has to execute: the age dimension is absent, so before the fix
+    /// the class was skipped for ever and the declared `maxBytes` was a limit nobody applied (ADR-004
+    /// D8; V2-17). The evidence here is recent by construction — the byte pass is the only reason any of
+    /// it can go.
+    func testAByteOnlyEvidencePolicyStillCollects() async throws {
+        let clock = SteppingClock(TestInstant.epoch)
+        try declare(RetentionPolicy(retentionClass: .connectorEvidence, maxBytes: 50))
+        // 80 bytes of evidence written "now": no age rule could select either row.
+        try insertEvidence(
+            batchID: "older",
+            bytes: 40,
+            createdAtMilliseconds: RetentionTimestamp.milliseconds(clock.now) - 1_000
+        )
+        try insertEvidence(
+            batchID: "newer",
+            bytes: 40,
+            createdAtMilliseconds: RetentionTimestamp.milliseconds(clock.now)
+        )
+
+        let report = try await coordinator(clock: clock).run()
+
+        XCTAssertNil(
+            report.result(for: .connectorEvidence)?.skipped,
+            "a byte limit is a reason to run even when no age is declared"
+        )
+        XCTAssertGreaterThanOrEqual(report.result(for: .connectorEvidence)?.collected ?? 0, 1)
+        XCTAssertGreaterThan(report.result(for: .connectorEvidence)?.freedBytes ?? 0, 0)
+        XCTAssertLessThanOrEqual(
+            try scalar("SELECT COALESCE(SUM(COALESCE(length(bytes), 0)), 0) FROM connector_evidence"),
+            50,
+            "the class is left under the declared byte limit"
+        )
+        XCTAssertEqual(
+            try string("SELECT batch_id FROM connector_evidence"),
+            "newer",
+            "the byte pass spends the oldest bytes first"
+        )
+    }
+
+    /// A byte-only canonical policy is a reason to run, and the byte pass takes the oldest non-current
+    /// revision first: before the fix the class demanded an age and ignored `maxBytes`, so a byte-only
+    /// declaration never took a revision at all (ADR-004 D8; V2-17).
+    func testAByteOnlyCanonicalSupplyPolicyCollectsOldestRevisions() async throws {
+        let source = try ensureSource("catalog:alpha")
+        let row = try insertSupplyRow(
+            objectKey: "supply",
+            sourceIDs: [source],
+            headline: "current",
+            observedAt: 0
+        )
+        // Two non-current revisions of one record, 32 payload bytes each, a second apart. With the
+        // current revision (7 bytes) the class holds 71 bytes; a 40-byte limit only clears the oldest.
+        let oldest = try insertSupersededRevision(of: row.recordID, createdAtMilliseconds: 0)
+        let newest = try insertSupersededRevision(of: row.recordID, createdAtMilliseconds: 1_000)
+        try declare(RetentionPolicy(retentionClass: .canonicalSupply, maxBytes: 40))
+
+        let report = try await coordinator(clock: SteppingClock(TestInstant.epoch)).run()
+
+        XCTAssertNil(
+            report.result(for: .canonicalSupply)?.skipped,
+            "a byte limit is a reason to run even when no age is declared"
+        )
+        XCTAssertGreaterThanOrEqual(report.result(for: .canonicalSupply)?.collected ?? 0, 1)
+        XCTAssertEqual(
+            try scalar("SELECT COUNT(*) FROM origin_revision WHERE id = \(oldest)"),
+            0,
+            "the oldest non-current revision is the one the byte budget takes"
+        )
+        XCTAssertEqual(
+            try scalar("SELECT COUNT(*) FROM origin_revision WHERE id = \(newest)"),
+            1,
+            "the newer non-current revision fits in the budget the oldest released"
+        )
+        XCTAssertEqual(
+            try scalar("SELECT COUNT(*) FROM origin_revision WHERE id = \(row.revisionID)"),
+            1,
+            "the current revision is never this class's to take"
+        )
+    }
+
+    /// An age-only asset policy bounds what may be taken: before the fix it ignored `maxAgeSeconds`
+    /// entirely and took every unreferenced version, however recently it was written (ADR-004 D8;
+    /// V2-17). The version is committed without a `published_asset_ref`, so only its age decides.
+    func testAnAgeOnlyAssetPolicyLeavesRecentAssets() async throws {
+        let source = try ensureSource("catalog:alpha")
+        let row = try insertSupplyRow(objectKey: "supply", sourceIDs: [source], observedAt: 0)
+        let context = try planContext()
+        let digest = String(repeating: "e", count: 64)
+        // `assetVersion` dates the version at `TestInstant.epoch`, which is where the run's clock starts.
+        let recent = try assetVersion(digest: digest, byteCount: 90)
+        _ = try activateEdition(
+            context: context,
+            revisionTag: "rev-1",
+            epoch: 1,
+            successorOf: nil,
+            committedAt: TestInstant.seconds(1),
+            assets: [recent]
+        ) { edition in
+            [try oneCard(edition: edition, ordinal: 0, row: row, revisionTag: "rev-1")]
+        }
+        try declare(RetentionPolicy(retentionClass: .publishedAssetBytes, maxAgeSeconds: 86_400))
+        let assetRow = try assetID(digest: digest)
+
+        let clock = SteppingClock(TestInstant.epoch)
+        let first = try await coordinator(media: CountingMediaPort(), clock: clock).run()
+
+        XCTAssertEqual(
+            first.result(for: .publishedAssetBytes)?.collected,
+            0,
+            "a version written now is inside the declared age, even though nothing names it"
+        )
+        XCTAssertEqual(try durabilityState(ofAssetID: assetRow), "committed")
+
+        // The same bytes, one clock jump later: now the age bound really does select them.
+        clock.move(to: TestInstant.seconds(2 * 86_400))
+        let second = try await coordinator(media: CountingMediaPort(), clock: clock).run()
+
+        XCTAssertGreaterThanOrEqual(second.result(for: .publishedAssetBytes)?.collected ?? 0, 1)
+        XCTAssertEqual(try durabilityState(ofAssetID: assetRow), "bytes_removed")
+    }
+
+    /// A pinned version cannot be taken, so it must not consume the byte budget either: before the fix
+    /// the pinned (older) version was charged to the budget, the run stopped short, and the newer
+    /// unreferenced version was never collected (ADR-004 D8; V2-17). The pin is the production one —
+    /// a `published_asset_ref` from a retained card, which is what `SqlRetentionRootProvider` derives
+    /// `protectedAssetVersions` from; the file has no fixture that pins a bare `asset_version`.
+    func testAPinnedAssetDoesNotConsumeTheByteBudget() async throws {
+        let source = try ensureSource("catalog:alpha")
+        let row = try insertSupplyRow(objectKey: "supply", sourceIDs: [source], observedAt: 0)
+        let pinnedDigest = String(repeating: "f", count: 64)
+        let freeDigest = String(repeating: "0", count: 64)
+        // Inserted first, so it is the oldest by `(created_at_ms, asset_version_id)` — the order the byte
+        // pass walks — and the card below pins it.
+        let pinned = try assetVersion(digest: pinnedDigest, byteCount: 120)
+        let free = try assetVersion(digest: freeDigest, byteCount: 90)
+        let media = PublishedMediaSet(
+            primary: PublishedMediaRef(
+                contentDigest: pinnedDigest,
+                recipeVersion: 1,
+                pixelWidth: 30,
+                pixelHeight: 10,
+                mimeType: "image/png"
+            ),
+            alternates: [],
+            placeholder: nil
+        )
+        let context = try planContext()
+        _ = try activateEdition(
+            context: context,
+            revisionTag: "rev-1",
+            epoch: 1,
+            successorOf: nil,
+            committedAt: TestInstant.seconds(1),
+            assets: [pinned, free]
+        ) { edition in
+            [
+                try oneCard(
+                    edition: edition,
+                    ordinal: 0,
+                    row: row,
+                    revisionTag: "rev-1",
+                    media: media,
+                    assetReferences: [
+                        PublishedAssetRefRecord(
+                            slot: .primary,
+                            role: .image,
+                            renderSlot: .primary,
+                            contentDigest: pinnedDigest,
+                            recipeVersion: 1,
+                            aspectRatio: 3.0
+                        )
+                    ]
+                )
+            ]
+        }
+        try declare(RetentionPolicy(retentionClass: .publishedAssetBytes, maxBytes: 100))
+        let pinnedRow = try assetID(digest: pinnedDigest)
+        let freeRow = try assetID(digest: freeDigest)
+
+        let report = try await coordinator(
+            media: CountingMediaPort(),
+            clock: SteppingClock(TestInstant.seconds(60))
+        ).run()
+
+        XCTAssertEqual(
+            report.result(for: .publishedAssetBytes)?.collected,
+            1,
+            "the pinned version is charged to no budget, so the newer unreferenced one is collected"
+        )
+        XCTAssertEqual(try durabilityState(ofAssetID: freeRow), "bytes_removed")
+        XCTAssertEqual(
+            try durabilityState(ofAssetID: pinnedRow),
+            "committed",
+            "the pin still blocks collection unconditionally"
+        )
+        XCTAssertGreaterThanOrEqual(report.result(for: .publishedAssetBytes)?.protected ?? 0, 1)
+    }
 }

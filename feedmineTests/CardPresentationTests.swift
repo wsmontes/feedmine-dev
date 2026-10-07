@@ -135,9 +135,38 @@ final class CardPresentationTests: XCTestCase {
         XCTAssertEqual(cases.count, 3)
     }
 
+    /// `durationFormatted` reads metadata that arrives from the feed, so it must not trap on any Double
+    /// a parser can hand it: `Int(_:)` traps on values outside Int's range even when they are finite, and
+    /// duration is `TimeInterval?` straight from the enclosure.
+    func testDurationFormattedSurvivesExtremeMetadataWithoutTrapping() {
+        let cases: [(TimeInterval?, String?)] = [
+            (nil, nil),
+            (0, nil),
+            (59.9, nil),
+            (60, "1 min"),
+            (90, "1 min"),
+            (3599, "59 min"),
+            (3600, "1h"),
+            (3660, "1h 1m"),
+            (-60, nil),
+            (.nan, nil),
+            (.infinity, nil),
+            (-.infinity, nil),
+            (1e30, nil),
+            (Double.greatestFiniteMagnitude, nil),
+        ]
+        for (duration, expected) in cases {
+            XCTAssertEqual(
+                makeItem(id: "duration", duration: duration).durationFormatted,
+                expected,
+                "duration \(duration.map { "\($0)" } ?? "nil") must format as \(expected ?? "nil")"
+            )
+        }
+    }
+
     // MARK: - Helpers
 
-    private func makeItem(id: String, imageURL: String? = nil) -> FeedItem {
+    private func makeItem(id: String, imageURL: String? = nil, duration: TimeInterval? = nil) -> FeedItem {
         FeedItem(
             id: id,
             sourceTitle: "Test Source",
@@ -149,7 +178,7 @@ final class CardPresentationTests: XCTestCase {
             imageURL: imageURL,
             publishedAt: Date(),
             audioURL: nil,
-            duration: nil,
+            duration: duration,
             region: "imported",
             language: "en",
             updatedAt: nil,

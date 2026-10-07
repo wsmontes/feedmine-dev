@@ -4,6 +4,29 @@ import GRDB
 /// Persisted image resolution state for a feed item. Separates transient
 /// failures (retry-able) from confirmed absence (no image exists).
 struct ImageResolutionRecord: Codable, FetchableRecord, PersistableRecord {
+    /// Explicit mapping: GRDB's defaults would derive `imageResolutionRecord` from
+    /// the type name and use the property names as columns, while the migration
+    /// creates `image_resolution` with snake_case columns — every `save`/`fetch`
+    /// failed with "no such table" before this.
+    static var databaseTableName: String { "image_resolution" }
+
+    enum CodingKeys: String, CodingKey {
+        case itemID = "item_id"
+        case candidateFingerprint = "candidate_fingerprint"
+        case state
+        case cacheKey = "cache_key"
+        case resolvedURL = "resolved_url"
+        case pixelWidth = "pixel_width"
+        case pixelHeight = "pixel_height"
+        case byteCount = "byte_count"
+        case attemptCount = "attempt_count"
+        case lastAttemptAt = "last_attempt_at"
+        case nextRetryAt = "next_retry_at"
+        case failureClass = "failure_class"
+        case failureCode = "failure_code"
+        case updatedAt = "updated_at"
+    }
+
     var itemID: String
     var candidateFingerprint: String
     var state: String  // "unknown", "resolved", "no_image_confirmed", "transient_failure", "permanent_failure"

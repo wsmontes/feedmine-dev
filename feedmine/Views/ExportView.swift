@@ -7,11 +7,25 @@ struct ExportView: View {
     @State private var engine = CircadianEngine.shared
     @State private var selectedScope: ExportScope = .all
     @State private var selectedFormat: ExportFormat = .opml
+    /// Collection scope's selection. Deliberately not shared with the country picker: the two scopes
+    /// filter on different keys, and one `String?` serving both leaked a category into the region
+    /// picker (and the reverse), exporting zero feeds with no visible cause.
     @State private var selectedCollection: String?
+    /// Country scope's selection — independent of `selectedCollection` for the same reason.
+    @State private var selectedCountry: String?
+    /// Bookmark box to export. `nil` means every box, deduplicated by item.
+    @State private var selectedBookmarkListID: Int64?
+    @State private var bookmarkLists: [BookmarkList] = []
+    /// True while the bookmark composition is being read: export actions are blocked until it resolves
+    /// so a fast tap cannot share an empty file, and the preview is rebuilt when it completes.
+    @State private var isLoadingBookmarks = false
     @State private var preview: String = ""
     @State private var showDocumentPicker = false
     @State private var exportFileURL: URL?
     @State private var bookmarkedArticles: [FeedItem] = []
+    /// Scope pickers group the whole catalog; cached instead of regrouped on every body pass.
+    @State private var collectionOptions: [String] = []
+    @State private var countryOptions: [String] = []
 
     private var scopedSources: [FeedSource] {
         switch selectedScope {
@@ -21,7 +35,7 @@ struct ExportView: View {
             guard let col = selectedCollection else { return loader.sources }
             return loader.sources.filter { $0.category == col }
         case .country:
-            guard let col = selectedCollection else { return loader.sources }
+            guard let col = selectedCountry else { return loader.sources }
             return loader.sources.filter { $0.region == col || $0.region.hasPrefix(col + "/") }
         case .bookmarks: return loader.sources  // Bookmarks export uses articles, not sources
         case .fullBackup: return loader.sources
@@ -32,12 +46,11 @@ struct ExportView: View {
         Set(loader.enabledSources.map(\.url))
     }
 
-    private var collections: [String] {
-        Set(loader.sources.map(\.category)).sorted()
-    }
-
-    private var countries: [String] {
-        Set(loader.sources.map(\.region).filter { $0.hasPrefix("countries/") }
+    /// Regroups the catalog once per presentation instead of on every body evaluation — the body used
+    /// to rebuild both option lists (whole-catalog map + sort) for each state change of the sheet.
+    private func refreshScopeOptions() {
+        collectionOptions = Set(loader.sources.map(\.category)).sorted()
+        countryOptions = Set(loader.sources.map(\.region).filter { $0.hasPrefix("countries/") }
             .map { $0.components(separatedBy: "/").prefix(2).joined(separator: "/") }).sorted()
     }
 
@@ -56,17 +69,34 @@ struct ExportView: View {
                     if selectedScope == .collection {
                         Picker("Collection", selection: $selectedCollection) {
                             Text("All").tag(nil as String?)
-                            ForEach(collections, id: \.self) { col in
+                            ForEach(collectionOptions, id: \.self) { col in
                                 Text(col).tag(col as String?)
                             }
                         }
                     }
                     if selectedScope == .country {
-                        Picker("Country", selection: $selectedCollection) {
+                        Picker("Country", selection: $selectedCountry) {
                             Text("All").tag(nil as String?)
-                            ForEach(countries, id: \.self) { country in
+                            ForEach(countryOptions, id: \.self) { country in
                                 Text(CountryStore.countryName(for: country.replacingOccurrences(of: "countries/", with: "")))
                                     .tag(country as String?)
+                            }
+                        }
+                    }
+                    if selectedScope == .bookmarks {
+                        // "All" is every box, deduplicated by item: the export is named "Bookmarks",
+                        // so an article saved to a non-default box must not be missing from it.
+                        Picker("Box", selection: $selectedBookmarkListID) {
+                            Text("All Boxes").tag(nil as Int64?)
+                            ForEach(bookmarkLists) { box in
+                                Text(box.name).tag(box.id as Int64?)
+                            }
+                        }
+                        .disabled(isLoadingBookmarks)
+                        if isLoadingBookmarks {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("Loading bookmarks…").foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -132,6 +162,7 @@ struct ExportView: View {
                             .foregroundStyle(engine.accent)
                     }
                 }
+                .disabled(selectedScope == .bookmarks && isLoadingBookmarks)
             }
             .navigationTitle("Export")
             .navigationBarTitleDisplayMode(.inline)
@@ -140,12 +171,22 @@ struct ExportView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .onAppear { updatePreview() }
+            .onAppear {
+                refreshScopeOptions()
+                updatePreview()
+            }
             .onChange(of: selectedScope) { _, newScope in
-                if newScope == .bookmarks { loadBookmarks() }
+                if newScope == .bookmarks {
+                    Task { await loadBookmarks() }
+                }
                 updatePreview()
             }
             .onChange(of: selectedCollection) { _, _ in updatePreview() }
+            .onChange(of: selectedCountry) { _, _ in updatePreview() }
+            .onChange(of: selectedBookmarkListID) { _, _ in
+                guard selectedScope == .bookmarks else { return }
+                Task { await loadBookmarks() }
+            }
         }
         .presentationDetents([.medium, .large])
     }
@@ -165,17 +206,38 @@ struct ExportView: View {
 
     // MARK: - Actions
 
-    private func loadBookmarks() {
-        Task {
-            do {
-                let lists = try await loader.loadBookmarkLists()
-                let defaultID = lists.first(where: \.isDefault)?.id ?? lists.first?.id ?? 1
-                bookmarkedArticles = try await loader.loadBookmarkedItems(listID: defaultID)
-            } catch {
-                bookmarkedArticles = []
+    /// Reads the bookmark composition for the selected box — every box when `selectedBookmarkListID`
+    /// is nil — and rebuilds the preview from what was actually loaded. The caller blocks the export
+    /// actions while this is in flight, so an export can never share the empty array the scope opened with.
+    private func loadBookmarks() async {
+        isLoadingBookmarks = true
+        defer { isLoadingBookmarks = false }
+        do {
+            let lists = try await loader.loadBookmarkLists()
+            bookmarkLists = lists
+            if let selected = selectedBookmarkListID, !lists.contains(where: { $0.id == selected }) {
+                selectedBookmarkListID = nil
             }
+            let target = selectedBookmarkListID
+            var seen = Set<String>()
+            var articles: [FeedItem] = []
+            for list in lists where target == nil || list.id == target {
+                for item in try await loader.loadBookmarkedItems(listID: list.id)
+                where seen.insert(item.id).inserted {
+                    articles.append(item)
+                }
+            }
+            bookmarkedArticles = articles
+        } catch {
+            bookmarkedArticles = []
         }
+        updatePreview()
     }
+
+    /// The preview is a *sample*: OPML/JSON/CSV/text/Markdown build the entire document, and the sheet
+    /// used to serialize the whole catalog on the main actor only to cut it to 500 characters. The real
+    /// export (`generateExportData`) still serializes the complete selection.
+    private static let previewSourceLimit = 25
 
     private func updatePreview() {
         // Reset format if not available for current scope
@@ -183,7 +245,8 @@ struct ExportView: View {
             selectedFormat = availableFormats.first ?? .opml
         }
 
-        let sources = scopedSources
+        let allSources = scopedSources
+        let sources = Array(allSources.prefix(Self.previewSourceLimit))
         switch selectedFormat {
         case .opml:
             preview = String(data: ExportEngine.opml(sources: sources).prefix(500), encoding: .utf8) ?? ""
@@ -213,24 +276,40 @@ struct ExportView: View {
             if selectedScope == .bookmarks {
                 preview = "HTML reading list (\(bookmarkedArticles.count) articles). Dark mode ready."
             } else {
-                preview = "HTML blogroll (\(sources.count) feeds, \(Set(sources.map(\.category)).count) collections). Dark mode ready."
+                preview = "HTML blogroll (\(allSources.count) feeds, \(Set(allSources.map(\.category)).count) collections). Dark mode ready."
             }
         case .shareLink:
-            let result = ExportEngine.shareLink(sources: sources)
-            switch result {
-            case .text(let s): preview = s
-            case .file(_, let desc): preview = desc
+            // `ExportEngine.shareLink` writes a temp OPML for a batch selection: the preview used to call
+            // it and write that file — for the whole catalog — on every scope/format change. Describe the
+            // batch instead of materializing it; the real share builds it in `shareExport`.
+            if allSources.count == 1, let only = allSources.first {
+                if case .text(let s) = ExportEngine.shareLink(sources: [only]) { preview = s }
+            } else {
+                preview = "Share \(allSources.count) feeds as an OPML attachment"
             }
         case .socialCard:
             let stats = ExportEngine.SocialCardStats(
                 streak: Settings.sessionStreak,
                 articlesRead: loader.readItemIDs.count
             )
-            preview = ExportEngine.socialCard(sources: sources, stats: stats)
+            preview = ExportEngine.socialCard(sources: allSources, stats: stats)
+        }
+        // Bookmarks scope previews articles, not sources: the sample note belongs only to a source preview.
+        if selectedScope != .bookmarks,
+           Self.wholeDocumentFormats.contains(selectedFormat),
+           allSources.count > sources.count {
+            preview += "\n… preview of the first \(sources.count) of \(allSources.count) sources"
         }
     }
 
+    /// Formats whose preview builds an entire document. Only these are sampled; the count-only and
+    /// single-string previews above still describe the complete selection.
+    private static let wholeDocumentFormats: Set<ExportFormat> = [.opml, .json, .csv, .text, .markdown]
+
     private func generateExportData() -> (data: Data, filename: String)? {
+        // The actions are disabled while the bookmark composition loads; this is the second line of
+        // defence for any other caller: an unresolved bookmarks scope must never produce a file.
+        guard !(selectedScope == .bookmarks && isLoadingBookmarks) else { return nil }
         let sources = scopedSources
         let name = "feedmine-export-\(Int(Date().timeIntervalSince1970))"
 

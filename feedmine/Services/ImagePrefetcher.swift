@@ -33,7 +33,18 @@ actor ImagePrefetcher {
         }
         guard !toFetch.isEmpty else { return }
 
-        for url in toFetch { await ImageCache.registerDownload(for: url) }
+        // Ownership handshake, not just a de-duplication hint: `registerDownload`
+        // answers `false` when another path (a card's resolution, another
+        // prefetch) already holds the URL. Downloading anyway sent a second
+        // request for the same bytes, and the unconditional unregister in
+        // `download(_:)` cleared the *other* owner's mark, which let a third
+        // caller start a duplicate it was meant to avoid. Only the URLs this
+        // call registered are kept — and only they are unregistered later.
+        var owned: [URL] = []
+        for url in toFetch {
+            if await ImageCache.registerDownload(for: url) { owned.append(url) }
+        }
+        guard !owned.isEmpty else { return }
 
         // Sliding-window concurrency: keep up to `maxConcurrent` downloads in
         // flight and refill each freed slot immediately. The previous fixed
@@ -43,7 +54,7 @@ actor ImagePrefetcher {
         // defer clears it from inFlightURLs.
         let maxConcurrent = 16
         await withTaskGroup(of: Void.self) { group in
-            var iterator = toFetch.makeIterator()
+            var iterator = owned.makeIterator()
             var started = 0
             while started < maxConcurrent, let url = iterator.next() {
                 group.addTask { await self.download(url) }
@@ -57,13 +68,13 @@ actor ImagePrefetcher {
         }
     }
 
+    /// Only ever called for URLs this prefetch registered (see `prefetch(urls:)`),
+    /// so the `defer` removes a mark this call owns.
     private func download(_ url: URL) async {
         defer { Task { await ImageCache.unregisterDownload(for: url) } }
         for candidate in ImageURLCandidates.candidates(for: url) {
             do {
-                let (data, response) = try await session.data(from: candidate)
-                if let http = response as? HTTPURLResponse,
-                   !(200...299).contains(http.statusCode) { continue }
+                let data = try await downloadBounded(candidate)
                 guard UIImage(data: data) != nil else { continue }
                 // Cache fallback bytes under the requested URL so the view's
                 // normal memory/disk lookup finds them.
@@ -73,6 +84,32 @@ actor ImagePrefetcher {
                 continue
             }
         }
+    }
+
+    /// Ceiling for one prefetched body. The resolution path (`MediaAssetStore`)
+    /// already refuses to buffer more than this; a page-supplied URL must not
+    /// get an unbounded buffer just because this call is only a prefetch.
+    private static let maxImageBytes = 12_000_000
+
+    private enum PrefetchError: Error {
+        case badStatus
+        case tooLarge
+    }
+
+    /// Stream the body and stop at the ceiling instead of buffering whatever the
+    /// response announces.
+    private func downloadBounded(_ url: URL) async throws -> Data {
+        let (bytes, response) = try await session.bytes(from: url)
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
+            throw PrefetchError.badStatus
+        }
+        var data = Data()
+        for try await chunk in bytes {
+            data.append(chunk)
+            if data.count >= Self.maxImageBytes { throw PrefetchError.tooLarge }
+        }
+        return data
     }
 
     /// Resolve article-page artwork (Open Graph / Twitter / srcset) and cache

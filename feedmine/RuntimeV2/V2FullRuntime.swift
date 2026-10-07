@@ -428,6 +428,38 @@ final class V2FullRuntime {
         await session.send(.cardVisibility(observation))
     }
 
+    /// One viewport observation from the screen, reduced by the session (plan §11, ADR-007 H-16).
+    ///
+    /// The anchor is the one the renderer holds, and the session is what decides what the observation
+    /// costs: it sets the anchor, shifts its own window, closes the intervals of the cards it evicted and
+    /// asks for at most one page per tail ordinal (`FeedSessionReducer`, `shouldReplenish`). It is
+    /// deliberately not a refresh: a scroll is not a demand for a successor edition, and routing it as one
+    /// acquired and composed on every visible update. Without a session there is no window to move and no
+    /// page to ask for, so the observation is dropped rather than turned into acquisition.
+    func viewportChanged(
+        firstVisibleOrdinal: Int,
+        lastVisibleOrdinal: Int,
+        anchor: FeedWindowAnchor?
+    ) async {
+        guard let session else { return }
+        await session.send(.viewportChanged(
+            firstVisibleOrdinal: firstVisibleOrdinal,
+            lastVisibleOrdinal: lastVisibleOrdinal,
+            anchor: anchor
+        ))
+    }
+
+    /// One center crossing from the screen, recorded by the session's tracker (ADR-007 D5).
+    ///
+    /// `centerCrossed` is a fact of its own and the interval it belongs to lives in the tracker, so the
+    /// observation has to arrive where that interval is: the runtime used to count the crossing and hand
+    /// it to no one, and no fact could exist for it. A crossing for a card with no open interval is a
+    /// no-op there, which is what makes a fast scroll past a card record nothing.
+    func centerCrossed(cardID: PublicationCardID, direction: Int) async {
+        guard let session else { return }
+        await session.send(.centerCrossed(cardID: cardID, direction: direction))
+    }
+
     func currentSnapshot() async -> FeedPresentationSnapshot? {
         await session?.currentSnapshot()
     }

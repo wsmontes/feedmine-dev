@@ -746,6 +746,40 @@ final class AcquisitionCoordinatorTests: AcquisitionTestCase {
         XCTAssertEqual(summary.stop, .planCompleted, "the item ends; the plan's other targets still run")
         XCTAssertEqual(try rowCount("origin_revision"), 1, "no replay appended a revision")
     }
+
+    /// `notModifiedIsNotTheEndOfTheStream` (ADR-005 D8, D12; V2-01).
+    ///
+    /// A conditional fetch the endpoint answers `304` says the checkpoint it resumed from is still current.
+    /// It does not say the stream ended: reporting it as `finished` marked the target exhausted for the
+    /// rest of the session, so a feed that published afterwards was never consulted again. `upToDate` ends
+    /// the episode and leaves the target eligible.
+    func testAnUpToDateSourceStaysEligibleForTheNextDemand() async throws {
+        try registerTarget()
+        let target = try acquisitionTarget()
+        let source = RenewableSource([.published("first"), .unchanged, .published("second")])
+        let coordinator = makeCoordinator(sources: [target.id: source])
+
+        let first = await coordinator.run(demand(deficit: 1), catalogue: [target], in: database)
+        XCTAssertEqual(first.stop, .planCompleted)
+        XCTAssertEqual(first.admittedBatches, 1)
+        XCTAssertEqual(try rowCount("origin_revision"), 1)
+
+        // Nothing changed upstream: the episode ends admitting nothing, and the target is still eligible.
+        let second = await coordinator.run(demand(deficit: 1), catalogue: [target], in: database)
+        XCTAssertEqual(second.pulls, 1, "an unchanged feed is checked again, once per demand")
+        XCTAssertEqual(second.admittedBatches, 0)
+        XCTAssertEqual(second.stop, .planCompleted)
+        let state = await coordinator.frontierState
+        XCTAssertEqual(state, .work(eligible: 1, runnable: 1), "current is not exhausted")
+
+        // It published after all: the next demand finds the target and admits the new representation.
+        let third = await coordinator.run(demand(deficit: 1), catalogue: [target], in: database)
+        XCTAssertEqual(third.pulls, 1)
+        XCTAssertEqual(third.admittedBatches, 1)
+        XCTAssertEqual(try rowCount("origin_revision"), 2)
+        let pulls = await source.pullCount
+        XCTAssertEqual(pulls, 3, "three demands, three checks: the feed was never frozen")
+    }
 }
 
 /// The smallest implementation of the PR-01 domain port: one unconditional, bounded fetch.
@@ -773,5 +807,44 @@ private struct StuckSource: AcquisitionSource {
 
     func pull(_ request: AcquisitionPull) async throws -> AcquisitionSourceEvent {
         .batch(batch)
+    }
+}
+
+/// A renewable source: one batch per scripted publication and `upToDate` in between, so a test can drive
+/// "content, unchanged, content again" without a transport.
+///
+/// `.upToDate` is what a `304` means to the acquisition layer: the checkpoint resumed from is still
+/// current. `.finished` — what the app used to report for a `304` — means the stream is over, and a target
+/// in that state is never planned again for its binding revision.
+private actor RenewableSource: AcquisitionSource {
+    enum Step: Equatable {
+        case published(String)
+        case unchanged
+    }
+
+    private let steps: [Step]
+    private var next = 0
+    private(set) var pullCount = 0
+
+    init(_ steps: [Step]) {
+        self.steps = steps
+    }
+
+    func pull(_ request: AcquisitionPull) async throws -> AcquisitionSourceEvent {
+        pullCount += 1
+        let step = next < steps.count ? steps[next] : .unchanged
+        if next < steps.count { next += 1 }
+        switch step {
+        case .unchanged:
+            return .upToDate
+        case .published(let object):
+            // The fixture's version key is a plain token in the scope, not object-scoped: a distinct
+            // token per publication keeps this test about the frontier, not about identity.
+            return .batch(try FixtureBatchIdentity.makeBatch(
+                sequence: pullCount,
+                observations: [try fixtureObservation(object: object, version: "\(object)-v1")],
+                request: request
+            ))
+        }
     }
 }

@@ -353,20 +353,39 @@ final class SelectionSupplyRepositoryTests: RuntimeV2TestCase {
         XCTAssertEqual(edge.object.canonical, page.candidates[0].stableKey.canonical)
     }
 
-    func testAnEdgeWhoseObjectIsNotInThePageIsDropped() throws {
+    func testAnEdgeWhoseObjectIsInAnotherPageIsStillResolved() throws {
         let source = try ensureSource("catalog:half-edge")
         let first = try insertSupplyRow(objectKey: "first", sourceIDs: [source], observedAt: 1000)
         let second = try insertSupplyRow(objectKey: "second", sourceIDs: [source], observedAt: 1001)
         try insertRelation(subject: second.recordID, verb: "repostOf", object: first.recordID)
 
-        // A page of one row cannot resolve the edge: the grouping is pool-local and never invents a
-        // member it did not read.
-        let page = try repository.page(
+        // A page of one row reads only the original, which declares no edge of its own.
+        let firstPage = try repository.page(
             SupplyPageRequest(sourceSelection: [], after: nil, windowRows: 1),
             in: database
         )
-        XCTAssertEqual(page.candidates.count, 1)
-        XCTAssertTrue(page.clusterEdges.isEmpty)
+        XCTAssertEqual(firstPage.candidates.count, 1)
+        XCTAssertTrue(firstPage.clusterEdges.isEmpty)
+
+        // The next page reads the repost. Its relation to a record this page never read is still a
+        // relation: dropping it here left the pair uncollapsed whenever the keyset window split them, and
+        // the same editorial object reached the draft twice (V2-13). The engine intersects the edges it
+        // accumulates with the pool it assembled, so an object that never becomes a candidate is ignored
+        // where the cluster is decided.
+        let secondPage = try repository.page(
+            SupplyPageRequest(sourceSelection: [], after: firstPage.nextCursor, windowRows: 1),
+            in: database
+        )
+        XCTAssertEqual(secondPage.candidates.count, 1)
+        let edge = try XCTUnwrap(secondPage.clusterEdges.first)
+        XCTAssertEqual(secondPage.clusterEdges.count, 1)
+        XCTAssertEqual(edge.verb, .repostOf)
+        XCTAssertEqual(edge.subject, secondPage.candidates[0].stableKey)
+        XCTAssertEqual(
+            edge.object,
+            firstPage.candidates[0].stableKey,
+            "the object is resolved to its durable key although this page never read its record"
+        )
     }
 
     // MARK: - Evidence independence (I-03)

@@ -9,6 +9,9 @@ struct BookmarkBoxesView: View {
     @State private var renameTarget: BookmarkList?
     @State private var renameName = ""
     @State private var reorderEnabled = false
+    /// Shown when a write fails. Every mutation below used `try?` and then changed the list anyway, so a
+    /// failed delete/rename looked like a success until the next launch showed the box again.
+    @State private var errorMessage: String?
 
     var body: some View {
         List {
@@ -61,27 +64,13 @@ struct BookmarkBoxesView: View {
                         }
                         .tint(.blue)
                         Button(role: .destructive) {
-                            Task {
-                                try? await loader.deleteBookmarkList(box.id)
-                                boxes.removeAll { $0.id == box.id }
-                                if loader.selectedBookmarkListID == box.id {
-                                    loader.selectedBookmarkListID = nil
-                                }
-                                if loader.preferredBookmarkListID == box.id {
-                                    loader.preferredBookmarkListID = nil
-                                }
-                            }
+                            Task { await delete(box) }
                         } label: { Label("Delete", systemImage: "trash") }
                     }
                 }
                 .onMove { from, to in
                     boxes.move(fromOffsets: from, toOffset: to)
-                    Task {
-                        for (idx, box) in boxes.enumerated() {
-                            try? await loader.reorderBookmarkList(box.id, sortOrder: idx)
-                        }
-                        await loader.refreshBookmarkLists()
-                    }
+                    Task { await persistOrder() }
                 }
             } header: { Text("Bookmark Boxes") }
 
@@ -101,7 +90,8 @@ struct BookmarkBoxesView: View {
                 let name = newBoxName.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !name.isEmpty else { return }
                 Task {
-                    try? await loader.createBookmarkList(name: name)
+                    do { try await loader.createBookmarkList(name: name) }
+                    catch { errorMessage = error.localizedDescription }
                     await loadBoxes()
                 }
             }
@@ -124,20 +114,70 @@ struct BookmarkBoxesView: View {
                 guard let box = renameTarget else { return }
                 let name = renameName.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !name.isEmpty else { return }
-                Task {
-                    try? await loader.renameBookmarkList(box.id, name: name)
-                    if let idx = boxes.firstIndex(where: { $0.id == box.id }) {
-                        boxes[idx].name = name
-                    }
-                }
+                Task { await rename(box, to: name) }
                 renameTarget = nil
             }
+        }
+        .alert("Couldn’t update bookmark boxes", isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "")
         }
         .task { await loadBoxes() }
     }
 
     private func loadBoxes() async {
         do { boxes = try await loader.loadBookmarkLists() }
-        catch {}
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    /// Drops the box from the list only after the store accepted the delete; on failure the list is
+    /// reloaded from the store so what is shown is what is persisted.
+    private func delete(_ box: BookmarkList) async {
+        do {
+            try await loader.deleteBookmarkList(box.id)
+        } catch {
+            errorMessage = error.localizedDescription
+            await loadBoxes()
+            return
+        }
+        boxes.removeAll { $0.id == box.id }
+        if loader.selectedBookmarkListID == box.id {
+            loader.selectedBookmarkListID = nil
+        }
+        if loader.preferredBookmarkListID == box.id {
+            loader.preferredBookmarkListID = nil
+        }
+    }
+
+    private func rename(_ box: BookmarkList, to name: String) async {
+        do {
+            try await loader.renameBookmarkList(box.id, name: name)
+        } catch {
+            errorMessage = error.localizedDescription
+            await loadBoxes()
+            return
+        }
+        if let idx = boxes.firstIndex(where: { $0.id == box.id }) {
+            boxes[idx].name = name
+        }
+    }
+
+    /// Persists the order the drag already applied to the list. A failed write reloads the stored
+    /// order instead of leaving the screen showing an order the database never received.
+    private func persistOrder() async {
+        do {
+            for (idx, box) in boxes.enumerated() {
+                try await loader.reorderBookmarkList(box.id, sortOrder: idx)
+            }
+            await loader.refreshBookmarkLists()
+        } catch {
+            errorMessage = error.localizedDescription
+            await loadBoxes()
+            await loader.refreshBookmarkLists()
+        }
     }
 }

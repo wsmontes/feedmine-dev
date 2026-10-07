@@ -33,6 +33,7 @@
     {
       "parallelizable": false,
       "skippedTests": [
+        "DumpStateTests",
         "FeedmineFilterUITests",
         "PersonaExplorationUITests"
       ],

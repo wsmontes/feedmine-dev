@@ -7,6 +7,14 @@ struct SourceManagementView: View {
     /// collide and overwrite each other's result. Title is carried in the value
     /// for display.
     @State private var testResults: [String: TestResult] = [:]
+    /// Display order for the health results, computed once per run. The body used to sort the whole
+    /// result set on every evaluation, so each completed request re-sorted every result by title.
+    @State private var healthOrder: [String] = []
+    /// Running count of `.ok` results, so the footer does not rescan the whole dictionary per body pass.
+    @State private var healthSucceeded = 0
+    /// The run in flight, held so it can be cancelled: the button used to start an untracked task that
+    /// kept testing the whole catalog after the sheet was dismissed.
+    @State private var healthTask: Task<Void, Never>?
     @State private var showFileImporter = false
     @State private var importError: String?
     @State private var pendingCategoryIDs = Set<String>()
@@ -129,7 +137,7 @@ struct SourceManagementView: View {
 
                 Section {
                     Button {
-                        Task { await testSources() }
+                        startHealthCheck()
                     } label: {
                         HStack {
                             Label("Test All Sources", systemImage: "checkmark.circle")
@@ -142,17 +150,19 @@ struct SourceManagementView: View {
                     .disabled(isTesting)
 
                     if !testResults.isEmpty {
-                        ForEach(testResults.sorted(by: { $0.value.title < $1.value.title }), id: \.key) { _, result in
-                            HStack {
-                                Image(systemName: result.status.icon)
-                                    .font(.caption)
-                                    .foregroundStyle(result.status.color)
-                                Text(result.title)
-                                    .font(.caption)
-                                Spacer()
-                                Text(result.status.label)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                        ForEach(healthOrder, id: \.self) { url in
+                            if let result = testResults[url] {
+                                HStack {
+                                    Image(systemName: result.status.icon)
+                                        .font(.caption)
+                                        .foregroundStyle(result.status.color)
+                                    Text(result.title)
+                                        .font(.caption)
+                                    Spacer()
+                                    Text(result.status.label)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
@@ -160,8 +170,7 @@ struct SourceManagementView: View {
                     Text("Health Check")
                 } footer: {
                     if !testResults.isEmpty {
-                        let ok = testResults.values.filter { $0.status == .ok }.count
-                        Text("\(ok)/\(testResults.count) sources responding")
+                        Text("\(healthSucceeded)/\(testResults.count) sources responding")
                     }
                 }
 
@@ -192,6 +201,8 @@ struct SourceManagementView: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .presentationDetents([.medium, .large])
+        // The health run belongs to this sheet: dismissing it must stop the requests it started.
+        .onDisappear { healthTask?.cancel() }
         .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.xml, .init(filenameExtension: "opml")!]) { result in
             switch result {
             case .success(let url):
@@ -227,9 +238,20 @@ struct SourceManagementView: View {
         }
     }
 
+    private func startHealthCheck() {
+        healthTask?.cancel()
+        healthTask = Task { await testSources() }
+    }
+
+    /// Tests every source with a bounded sliding window. Cancelled when the sheet goes away or a new run
+    /// starts, and it stops issuing requests the moment it is cancelled: the button used to launch an
+    /// untracked task that kept walking a catalog of tens of thousands of feeds after dismissal.
     private func testSources() async {
         isTesting = true
         testResults = [:]
+        healthSucceeded = 0
+        // Order computed once, in the order the results are displayed (by title, as before).
+        healthOrder = loader.sources.sorted { $0.title < $1.title }.map(\.url)
 
         for source in loader.sources {
             testResults[source.url] = TestResult(title: source.title, status: .testing)
@@ -243,16 +265,18 @@ struct SourceManagementView: View {
         await withTaskGroup(of: (String, SourceStatus).self) { group in
             var iterator = loader.sources.makeIterator()
             var started = 0
-            while started < cap, let source = iterator.next() {
+            while started < cap, !Task.isCancelled, let source = iterator.next() {
                 group.addTask { await Self.testSource(source) }
                 started += 1
             }
             while let (url, status) = await group.next() {
+                guard !Task.isCancelled else { break }
                 testResults[url]?.status = status
-                if let source = iterator.next() {
-                    group.addTask { await Self.testSource(source) }
-                }
+                if status == .ok { healthSucceeded += 1 }
+                guard !Task.isCancelled, let source = iterator.next() else { continue }
+                group.addTask { await Self.testSource(source) }
             }
+            group.cancelAll()
         }
 
         isTesting = false

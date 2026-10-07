@@ -486,7 +486,13 @@ final class Reservoir {
     ) -> [FeedItem] {
         guard items.count > 2 else { return items }
 
-        var pool = items
+        // Taken positions are marked instead of removed. `remove(at:)` inside the search window shifted every
+        // later element on every step, so a large batch paid quadratic element movement for a pass that only
+        // ever looks at the first 96 live candidates (S14). What the loop sees is unchanged: a candidate's
+        // rank is still its position among the candidates not yet taken, in the input's order.
+        let pool = items
+        var consumed = [Bool](repeating: false, count: items.count)
+        var liveCount = items.count
         var result: [FeedItem] = []
         result.reserveCapacity(items.count)
 
@@ -499,8 +505,8 @@ final class Reservoir {
         let regionWindow = min(6, max(0, regionVariety - 1))
         let mediaWindow = min(4, max(0, mediaVariety - 1))
 
-        while !pool.isEmpty {
-            let searchCount = min(96, pool.count)
+        while liveCount > 0 {
+            let searchCount = min(96, liveCount)
             let recentProviders = Set(result.suffix(providerWindow).map(providerKey))
             let recentCategories = Set(result.suffix(categoryWindow).map(\.category))
             let recentRegions = Set(result.suffix(regionWindow).map {
@@ -508,12 +514,17 @@ final class Reservoir {
             })
             let recentMedia = Set(result.suffix(mediaWindow).map(mediaKey))
 
-            var bestIndex = 0
+            var bestIndex = -1
             var bestPenalty = Int.max
-            for index in 0..<searchCount {
+            var rank = 0
+            for index in pool.indices {
+                if rank == searchCount { break }
+                guard !consumed[index] else { continue }
                 let candidate = pool[index]
+                let position = rank
+                rank += 1
                 let region = sourceRegionMap[candidate.sourceURL] ?? candidate.region
-                var penalty = index
+                var penalty = position
                 if recentProviders.contains(providerKey(candidate)) {
                     let sourceMult = presetMultipliers[candidate.sourceURL] ?? 1.0
                     penalty += Int(100_000.0 / max(1.0, sourceMult))
@@ -524,11 +535,14 @@ final class Reservoir {
                 if penalty < bestPenalty {
                     bestPenalty = penalty
                     bestIndex = index
-                    if penalty == index { break }
+                    if penalty == position { break }
                 }
             }
+            guard bestIndex >= 0 else { break }
 
-            result.append(pool.remove(at: bestIndex))
+            consumed[bestIndex] = true
+            liveCount -= 1
+            result.append(pool[bestIndex])
         }
         return result
     }
@@ -537,8 +551,14 @@ final class Reservoir {
     /// Those URLs are distinct fetch targets, but they are not distinct content
     /// providers and must not occupy several diversity slots on the same screen.
     nonisolated static func providerKey(_ item: FeedItem) -> String {
-        guard let host = URLComponents(string: item.sourceURL)?.host?.lowercased() else {
-            return item.sourceURL
+        providerKey(forSourceURL: item.sourceURL)
+    }
+
+    /// Same key, for callers that hold a URL and not an item — the fetch's own stop condition measures
+    /// diversity in the publication gate's unit, so both sides count the same thing.
+    nonisolated static func providerKey(forSourceURL sourceURL: String) -> String {
+        guard let host = URLComponents(string: sourceURL)?.host?.lowercased() else {
+            return sourceURL
         }
         if host == "news.google.com" || host.hasSuffix(".news.google.com") {
             // Separate queries are still one Google News provider. Treating
@@ -546,7 +566,7 @@ final class Reservoir {
             // near-identical candidate cards look artificially diverse.
             return "aggregator:news.google.com"
         }
-        return item.sourceURL
+        return sourceURL
     }
 
     private nonisolated static func mediaKey(_ item: FeedItem) -> String {
@@ -579,6 +599,14 @@ final class Reservoir {
             let take = min(floorPerSource, items.count)
             selected.append(contentsOf: items.prefix(take))
             if items.count > take { remainingBySource[sourceURL] = Array(items.dropFirst(take)) }
+        }
+        // The floor is one item per source and the loop above honours it for *every* source, so a catalogue
+        // with more sources than `maxReservoirSize` (a page of generated feeds, each with a couple of items)
+        // put the reservoir over its cap in one pass: `floorSlots` was clamped to the cap but the allocation
+        // was not (S14). The cap is absolute, so the surplus is dropped here; `proportionalSlots` is already
+        // zero in this case, so nothing downstream can add items back.
+        if selected.count > Self.maxReservoirSize {
+            selected = Array(selected.prefix(Self.maxReservoirSize))
         }
         if proportionalSlots > 0, !remainingBySource.isEmpty {
             let totalRemaining = remainingBySource.values.map(\.count).reduce(0, +)

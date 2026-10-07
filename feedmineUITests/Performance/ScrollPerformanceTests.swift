@@ -1,10 +1,34 @@
+import Foundation
 import XCTest
 
-/// UI performance tests for scroll and concurrent operations.
+/// Scroll behaviour of the feed timeline: content actually moves, content survives, chrome stays live.
+///
+/// WHAT IS MEASURED, AND WHY IT IS DEFENSIBLE
+/// - `testScroll_FeedTimeline` attaches `XCTOSSignpostMetric.scrollDecelerationMetric` (the platform's
+///   scroll-frame instrument; its hitch/duration statistics land in the `.xcresult`) and keeps the
+///   measured block to the gesture alone, so the accessibility snapshot is not billed to it.
+/// - Everything else here is an *invariant*, because the previous versions asserted only that
+///   `app.exists` — a blank, frozen or fully-reset feed satisfied that. The invariants are: the
+///   visible card identifier set changes when the user scrolls, no two visible cards share an
+///   identifier, and the header control stays reachable.
+/// - The wall-clock budget (15 s for a 2-swipe measured session) is a catastrophic-regression guard
+///   for a DEBUG build on simulator/device, not a device baseline; device baselines live in the plan.
+///
+/// CONTRACT FACTS USED BY THE QUERIES: the feed is `ScrollView { LazyVStack { FeedItemView } }`
+/// (`FeedScreen.swift:936-961`) — there is no collection view to wait for — and cards publish
+/// `feed-item-<language>-<id>` (`FeedItemView.swift:82`).
+///
+/// `-fixture-profile` seeds nothing today (`TestConfiguration.swift:139` is its only reader), so
+/// content is whatever the app persisted or fetched and the content precondition waits up to
+/// `UIWaits.launchTimeout` (60 s); measured cold starts reach first content in 27–30 s
+/// (`docs/runtime-v2/feed-pipeline-measurements-2026-10-06.md` §9, series B).
 @MainActor
 final class ScrollPerformanceTests: XCTestCase {
 
     let app = XCUIApplication()
+
+    /// Catastrophic-only guard for one measured 2-swipe session.
+    private static let measuredSessionBudget: TimeInterval = 15.0
 
     override func setUp() {
         continueAfterFailure = false
@@ -13,90 +37,80 @@ final class ScrollPerformanceTests: XCTestCase {
     // MARK: - PERF-UI: Scroll stability
 
     func testScroll_FeedTimeline() {
-        app.launchArguments = [
-            "-performance-testing",
-            "-fixture-profile", "typical",
-            "-fixture-seed", "42001",
-            "-UITestSkipOnboarding",
-            "-UITestResetFilters",
-            "-AppleLanguages", "(en)",
-        ]
+        app.launchArguments = AppLauncher.performanceArguments(fixtureProfile: "typical", fixtureSeed: 42001)
         app.launch()
 
-        // Wait for timeline
-        let timeline = app.collectionViews.firstMatch
-        guard timeline.waitForExistence(timeout: 30) else {
-            // No collection view — app may use List or ScrollView
-            // Verify we're not in a broken state
-            XCTAssertTrue(app.buttons.firstMatch.exists || app.staticTexts.firstMatch.exists,
-                          "App must show content or a defined empty state")
-            return
+        let before = FeedSurface.requireCards(app)
+        let scroll = FeedSurface.requireScrollView(app)
+
+        let options = XCTMeasureOptions()
+        options.iterationCount = 2
+        let started = Date()
+        measure(metrics: [XCTOSSignpostMetric.scrollDecelerationMetric], options: options) {
+            scroll.swipeUp()
         }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(elapsed, Self.measuredSessionBudget,
+                          "2-swipe measured session took \(elapsed)s (> \(Self.measuredSessionBudget)s)")
 
-        // Scroll down and back up — verify no crash
-        let startY = timeline.frame.minY
-        timeline.swipeUp()
-        Thread.sleep(forTimeInterval: 0.3)
-        timeline.swipeUp()
-        Thread.sleep(forTimeInterval: 0.3)
-        timeline.swipeDown()
-        Thread.sleep(forTimeInterval: 0.3)
-        timeline.swipeDown()
-
-        // App must still be running
-        XCTAssertTrue(app.exists, "App must not crash during scroll")
+        let after = FeedSurface.visibleCardIDs(app)
+        XCTAssertFalse(after.isEmpty,
+                       "feed rendered zero cards after scrolling. Observed: \(AppSurface.observed(app))")
+        FeedSurface.assertUniqueIDs(after, "measured scroll")
+        XCTAssertNotEqual(after, before,
+                          "two page swipes left the visible card set/order unchanged — "
+                          + "before=\(before) after=\(after)")
+        XCTAssertTrue(AppSurface.element(app, ScreenID.moreMenu).exists,
+                      "feed chrome is unreachable after scrolling")
     }
 
     // MARK: - PERF-UI-CON-001: Scroll during refresh
 
     func testScroll_DuringRefresh() {
-        app.launchArguments = [
-            "-performance-testing",
-            "-fixture-profile", "typical",
-            "-fixture-seed", "42002",
-            "-UITestSkipOnboarding",
-            "-UITestResetFilters",
-            "-AppleLanguages", "(en)",
-        ]
+        app.launchArguments = AppLauncher.performanceArguments(fixtureProfile: "typical", fixtureSeed: 42002)
         app.launch()
 
-        let timeline = app.collectionViews.firstMatch
-        guard timeline.waitForExistence(timeout: 30) else {
-            XCTAssertTrue(app.exists, "App must be running")
-            return
-        }
+        let before = FeedSurface.requireCards(app)
+        let scroll = FeedSurface.requireScrollView(app)
 
-        // Scroll while refresh may be happening
+        // Scroll while refresh may be happening (the app refreshes on its own schedule).
         for _ in 0..<3 {
-            timeline.swipeUp()
+            scroll.swipeUp()
             Thread.sleep(forTimeInterval: 0.2)
         }
 
-        XCTAssertTrue(app.exists, "App must not crash during scroll+refresh")
+        let after = FeedSurface.visibleCardIDs(app)
+        XCTAssertFalse(after.isEmpty,
+                       "refresh+scroll emptied the feed. Observed: \(AppSurface.observed(app))")
+        FeedSurface.assertUniqueIDs(after, "scroll during refresh")
+        XCTAssertNotEqual(Set(after), Set(before),
+                          "scroll during refresh did not change the visible card set — "
+                          + "before=\(before) after=\(after)")
+        XCTAssertTrue(AppSurface.element(app, ScreenID.moreMenu).exists,
+                      "feed chrome is unreachable after scroll during refresh")
     }
 
     // MARK: - PERF-UI-CON-006: Background/foreground
 
     func testBackgroundForeground() {
-        app.launchArguments = [
-            "-performance-testing",
-            "-UITestSkipOnboarding",
-            "-UITestResetFilters",
-            "-AppleLanguages", "(en)",
-        ]
+        app.launchArguments = AppLauncher.performanceArguments(fixtureProfile: "typical", fixtureSeed: 42003)
         app.launch()
 
-        _ = app.buttons.firstMatch.waitForExistence(timeout: 20)
+        let before = FeedSurface.requireCards(app)
 
-        // Background and resume
         XCUIDevice.shared.press(.home)
         Thread.sleep(forTimeInterval: 1.0)
         app.activate()
 
-        // Verify state is preserved (not a blank screen)
-        let hasContent = app.buttons.firstMatch.exists ||
-                          app.collectionViews.firstMatch.exists ||
-                          app.staticTexts.firstMatch.exists
-        XCTAssertTrue(hasContent, "App must show content after resume")
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5),
+                      "app never returned to the foreground")
+
+        // State preservation, not "some element exists": the anchor card must still be on screen.
+        let after = FeedSurface.visibleCardIDs(app)
+        XCTAssertTrue(after.contains(before[0]),
+                      "feed lost its anchor card '\(before[0])' across background/resume — "
+                      + "before=\(before) after=\(after)")
+        XCTAssertTrue(AppSurface.element(app, ScreenID.moreMenu).exists,
+                      "feed chrome is not reachable after resume")
     }
 }

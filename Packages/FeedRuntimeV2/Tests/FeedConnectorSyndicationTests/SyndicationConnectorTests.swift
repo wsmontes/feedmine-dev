@@ -160,6 +160,67 @@ final class SyndicationConnectorTests: XCTestCase {
         XCTAssertEqual(unconsumed.proposedCheckpoint.validators.etag, "\"a-1\"")
     }
 
+    /// A document longer than one batch is consumed across pulls: every slice continues past the previous
+    /// one, no validator is confirmed until the document is whole, and the fetch that resumes a partial
+    /// document is unconditional — a conditional one would answer `304` and leave no body to slice
+    /// (ADR-005 D4, D12; V2-11).
+    func testADocumentLongerThanOneBatchIsConsumedAcrossPulls() async throws {
+        let target = try target()
+        let baseline = admittedCheckpoint(for: target)
+        let document = TestFixtures.rssDocument(itemCount: 5)
+        let (connector, transport) = makeConnector(
+            [
+                .ok(document, headers: ["ETag": "\"a-2\""]),
+                .ok(document, headers: ["ETag": "\"a-2\""]),
+                .ok(document, headers: ["ETag": "\"a-2\""]),
+            ],
+            target: target
+        )
+        let limit = TestFixtures.limit(maxItems: 2)
+
+        let first = try await connector.acquire(limit: limit, checkpoint: baseline)
+        guard case .batch(let slice1) = first else { return XCTFail("expected a batch, got \(first)") }
+        XCTAssertEqual(slice1.batch.observations.count, 2)
+        XCTAssertFalse(slice1.proposesValidatorConfirmation, "the document was cut short")
+        XCTAssertTrue(slice1.proposedCheckpoint.hasAdmittedBaseline, "the earlier baseline stays")
+        XCTAssertEqual(slice1.proposedCheckpoint.validators.etag, "\"a-1\"", "a partial body confirms nothing")
+        let partial = try XCTUnwrap(slice1.proposedCheckpoint.partialDocument)
+        XCTAssertEqual(partial.consumedItemCount, 2)
+        XCTAssertFalse(partial.sawItemRejection)
+        let firstConditional = await transport.header("If-None-Match", ofRequest: 0)
+        XCTAssertEqual(firstConditional, "\"a-1\"", "the first fetch is conditional")
+
+        let second = try await connector.acquire(limit: limit, checkpoint: slice1.proposedCheckpoint)
+        guard case .batch(let slice2) = second else { return XCTFail("expected a batch, got \(second)") }
+        XCTAssertEqual(slice2.batch.observations.count, 2)
+        XCTAssertNotEqual(
+            slice2.batch.fingerprint,
+            slice1.batch.fingerprint,
+            "the second slice is new content, not the first prefix emitted again"
+        )
+        XCTAssertEqual(
+            String(decoding: slice2.batch.observations[0].externalKey.bytes, as: UTF8.self),
+            "item-2"
+        )
+        XCTAssertEqual(slice2.proposedCheckpoint.partialDocument?.consumedItemCount, 4)
+        let resuming = await transport.header("If-None-Match", ofRequest: 1)
+        XCTAssertNil(
+            resuming,
+            "resuming a half-read document is unconditional: the body itself produces the next slice"
+        )
+
+        let third = try await connector.acquire(limit: limit, checkpoint: slice2.proposedCheckpoint)
+        guard case .batch(let slice3) = third else { return XCTFail("expected a batch, got \(third)") }
+        XCTAssertEqual(slice3.batch.observations.count, 1)
+        XCTAssertTrue(slice3.proposesValidatorConfirmation, "the last slice consumed the whole document")
+        XCTAssertNil(slice3.proposedCheckpoint.partialDocument, "the document ended, so no slice is in flight")
+        XCTAssertEqual(slice3.proposedCheckpoint.validators.etag, "\"a-2\"")
+        XCTAssertEqual(slice3.proposedCheckpoint.observedRepresentations.count, 5)
+
+        let requests = await transport.requestCount
+        XCTAssertEqual(requests, 3, "three slices, three pulls, no repeated prefix")
+    }
+
     func testParseFailureOnHTTP200DoesNotConfirmValidator() async throws {
         let target = try target()
         let checkpoint = admittedCheckpoint(for: target)

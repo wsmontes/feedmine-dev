@@ -27,6 +27,34 @@ enum AppLauncher {
         app.launch()
     }
 
+    /// Performance-test launch arguments, *without* launching.
+    ///
+    /// A launch measured with `XCTApplicationLaunchMetric` must call `app.launch()` itself inside the
+    /// `measure` block, so the arguments have to be obtainable separately from the launch. Passing a
+    /// nil `fixtureProfile` is the clean-install lane; `networkProfile: "offline"` is the only profile
+    /// `OfflineNetworkGuard` implements.
+    static func performanceArguments(
+        fixtureProfile: String? = "heavy",
+        fixtureSeed: Int = 42001,
+        fixedTheme: String = "afternoon",
+        networkProfile: String? = nil
+    ) -> [String] {
+        var args: [String] = [
+            "-performance-testing",
+            "-fixed-theme", fixedTheme,
+            "-UITestSkipOnboarding",
+            "-UITestResetFilters",
+            "-AppleLanguages", "(en)",
+        ]
+        if let profile = fixtureProfile {
+            args.append(contentsOf: ["-fixture-profile", profile, "-fixture-seed", "\(fixtureSeed)"])
+        }
+        if let net = networkProfile {
+            args.append(contentsOf: ["-network-profile", net])
+        }
+        return args
+    }
+
     /// Performance test launch — always skips onboarding, uses fixed data.
     static func launchPerformance(
         app: XCUIApplication,
@@ -34,31 +62,48 @@ enum AppLauncher {
         fixtureSeed: Int = 42001,
         fixedTheme: String = "afternoon"
     ) {
-        app.launchArguments = [
-            "-performance-testing",
-            "-fixture-profile", fixtureProfile,
-            "-fixture-seed", "\(fixtureSeed)",
-            "-fixed-theme", fixedTheme,
-            "-UITestSkipOnboarding",
-            "-UITestResetFilters",
-            "-AppleLanguages", "(en)",
-        ]
+        app.launchArguments = performanceArguments(
+            fixtureProfile: fixtureProfile,
+            fixtureSeed: fixtureSeed,
+            fixedTheme: fixedTheme
+        )
         app.launch()
+    }
+
+    /// Accessibility-audit launch arguments, *without* launching.
+    ///
+    /// `networkProfile` is how a test reaches a deterministic terminal state without connectivity
+    /// (`offline` is the only profile `OfflineNetworkGuard` implements); passing nil keeps the old
+    /// behaviour of a normal networked launch.
+    static func accessibilityArguments(
+        locale: String = "en",
+        showOnboarding: Bool = false,
+        networkProfile: String? = nil
+    ) -> [String] {
+        var args: [String] = [
+            "-ui-testing",
+            "-AppleLanguages", "(\(locale))",
+            showOnboarding ? "-UITestShowOnboarding" : "-UITestSkipOnboarding",
+            "-UITestResetFilters",
+        ]
+        if let net = networkProfile {
+            args.append(contentsOf: ["-network-profile", net])
+        }
+        return args
     }
 
     /// Launch for accessibility audit — respects locale and Dynamic Type.
     static func launchAccessibility(
         app: XCUIApplication,
         locale: String = "en",
-        showOnboarding: Bool = false
+        showOnboarding: Bool = false,
+        networkProfile: String? = nil
     ) {
-        let args: [String] = [
-            "-ui-testing",
-            "-AppleLanguages", "(\(locale))",
-            showOnboarding ? "-UITestShowOnboarding" : "-UITestSkipOnboarding",
-            "-UITestResetFilters",
-        ]
-        app.launchArguments = args
+        app.launchArguments = accessibilityArguments(
+            locale: locale,
+            showOnboarding: showOnboarding,
+            networkProfile: networkProfile
+        )
         app.launch()
     }
 

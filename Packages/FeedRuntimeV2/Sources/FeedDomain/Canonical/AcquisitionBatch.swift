@@ -93,7 +93,13 @@ public enum PrecedenceInstruction: Hashable, Sendable {
     case historicalOnly
     /// Identical to what is already current; do not create a spurious supply change.
     case duplicate
-    /// Make this representation current if and only if the current revision is the expected one.
+    /// Make this representation current, if and only if the current revision is the expected one.
+    ///
+    /// `expectedRevision` is the revision the caller believes is current: when the belief is wrong the
+    /// swap loses and the representation stays history. `nil` means the caller asserts no belief — a
+    /// connector cannot know a revision row identifier — and Admission resolves the expectation against
+    /// the revision that is current when the batch commits, which makes a changed representation of an
+    /// existing object current instead of filing it as invisible history (ADR-006 D3).
     case makeCurrent(expectedRevision: OriginRevisionID?)
 
     public var isCurrentRequest: Bool {

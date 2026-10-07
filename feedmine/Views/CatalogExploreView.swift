@@ -112,11 +112,15 @@ struct CatalogExploreView: View {
                     ForEach(viewModel.sources) { source in
                         sourceRow(source)
                     }
-                    if viewModel.canLoadMoreBrowse {
-                        loadMoreButton {
-                            Task { await viewModel.loadNextPage() }
-                        }
-                    }
+                }
+            }
+
+            // The control belongs to the list, not to the Sources section: browse orders every node
+            // of the level before its first source, so a full page of nodes with the cursor still
+            // open would otherwise leave the rest of the level unreachable.
+            if viewModel.canLoadMoreBrowse {
+                loadMoreButton {
+                    Task { await viewModel.loadNextPage() }
                 }
             }
 

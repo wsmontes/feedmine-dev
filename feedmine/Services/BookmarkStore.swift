@@ -1,6 +1,14 @@
 import Foundation
 import GRDB
 
+/// Typed shape of `user_operation.payload_json` for `bookmark.set` operations.
+/// Decoding it as JSON — instead of scanning the payload text for a substring —
+/// keeps `listID` correct regardless of field order.
+private struct BookmarkOperationPayload: Codable {
+    let listID: Int64
+    let wanted: Bool
+}
+
 @MainActor
 final class BookmarkStore {
     /// Bookmark identity database (user.sqlite). Owns `bookmark_list` and
@@ -382,14 +390,16 @@ final class BookmarkStore {
 
     private nonisolated static func operationRecord(from row: Row) -> BookmarkOperationRecord {
         let payload = row["payload_json"] as String
-        let wanted = payload.contains("\"wanted\":true")
-        let listID = Int64(payload.split(separator: ":").last?.prefix(while: { $0.isNumber }) ?? "") ?? 0
+        let decoded: BookmarkOperationPayload? = {
+            guard let data = payload.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(BookmarkOperationPayload.self, from: data)
+        }()
         return BookmarkOperationRecord(
             operationID: row["operation_id"],
             kind: row["kind"],
             subjectID: row["subject_id"],
-            wanted: wanted,
-            listID: listID,
+            wanted: decoded?.wanted ?? false,
+            listID: decoded?.listID ?? 0,
             state: BookmarkOperationState(rawValue: row["state"]) ?? .pending,
             createdAt: Date(timeIntervalSince1970: row["created_at"]),
             appliedAt: (row["applied_at"] as Int64?).map { Date(timeIntervalSince1970: Double($0)) },
@@ -502,6 +512,10 @@ final class BookmarkStore {
                 """, arguments: [listID, record.id, now])
             }
         }
+        // An automatic match is a membership mutation like any other: project it into the
+        // content database's pin table, which is what keeps the matched articles from being
+        // evicted before the next reconcile runs.
+        try await synchronizeRetentionPins()
     }
 
     // MARK: - Composite Search Feed
@@ -581,6 +595,7 @@ final class BookmarkStore {
         }
         guard !searches.isEmpty else { return }
 
+        var insertedMatches = false
         for search in searches {
             guard let query = search.searchQuery else { continue }
             guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else { continue }
@@ -617,8 +632,20 @@ final class BookmarkStore {
                         """, arguments: [search.id!, id, now])
                     }
                 }
+                insertedMatches = true
             } catch {
                 Log.db.error("Persistent search bookmark insert failed for '\(search.name)': \(error.localizedDescription)")
+            }
+        }
+        // An automatic match is a membership mutation like any other: project the new rows
+        // into the content database's pin table, which is what keeps the matched articles
+        // from being evicted before the next reconcile runs. Best-effort, like the rest of
+        // this path — a failure is logged, not propagated to the fetch that called it.
+        if insertedMatches {
+            do {
+                try await synchronizeRetentionPins()
+            } catch {
+                Log.db.error("Persistent search retention projection failed: \(error.localizedDescription)")
             }
         }
     }

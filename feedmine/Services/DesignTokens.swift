@@ -48,27 +48,27 @@ extension Color {
 enum PrimitiveColor {
     // Neutral gray scale (chroma ~0, just lightness)
     static func neutral(_ level: Int) -> Color {
-        let l = Double(100 - level) / 100.0  // 50 → 0.50, 950 → 0.05
+        let l = scaleLightness(level)
         return Color(oklchL: l, chroma: 0, hue: 0)
     }
 
     // Warm scale (amber, h=50)
     static func warm(_ level: Int) -> Color {
-        let l = Double(100 - level) / 100.0
+        let l = scaleLightness(level)
         let c = min(0.15, Double(level) / 600.0)
         return Color(oklchL: l, chroma: c, hue: 50)
     }
 
     // Cool scale (blue, h=260)
     static func cool(_ level: Int) -> Color {
-        let l = Double(100 - level) / 100.0
+        let l = scaleLightness(level)
         let c = min(0.15, Double(level) / 600.0)
         return Color(oklchL: l, chroma: c, hue: 260)
     }
 
     // Brand accent scale (matches Warm Earth brand gradient)
     static func accent(_ level: Int) -> Color {
-        let l = Double(100 - level) / 100.0
+        let l = scaleLightness(level)
         let c = min(0.20, Double(level) / 500.0)
         let h = lerp(from: 50, to: 25, t: Double(level) / 1000.0)  // amber → deeper coral
         return Color(oklchL: l, chroma: c, hue: h)
@@ -170,6 +170,17 @@ enum ComponentToken {
 }
 
 // MARK: - Math Helper
+
+/// OKLCH lightness for one step of the `100…950` primitive scales.
+///
+/// OKLCH `L` runs 0 (black) to 1 (white), and the scale is its inverse: step 100 is the lightest
+/// (L = 0.90), step 950 the darkest (L = 0.05). The previous `(100 - level) / 100` only agreed with that
+/// domain below step 100 — it produced 0 at step 100 and negative values above it, which
+/// `Color(oklchL:)` clamps to black, so every neutral from 100 up (borders, elevated surface, muted text,
+/// the `categoryColor` fallback) rendered black (S13).
+private func scaleLightness(_ level: Int) -> Double {
+    Double(1000 - level) / 1000.0
+}
 
 private func lerp(from a: Double, to b: Double, t: Double) -> Double {
     a + (b - a) * max(0, min(1, t))

@@ -264,6 +264,21 @@ public struct RetentionCoordinator: Sendable {
         var ageCutoffMilliseconds: Int64? {
             policy?.ageCutoffMilliseconds(now: nowMilliseconds)
         }
+
+        /// The age bound this run may apply: `nil` when the class declares none, or when a rewound wall
+        /// clock suspends it. A rewind suspends age-based collection rather than loosening it, exactly as
+        /// the age-based SQL classes decide it (ADR-004 D8).
+        var appliedAgeCutoffMilliseconds: Int64? {
+            clockRewound ? nil : ageCutoffMilliseconds
+        }
+
+        /// Whether a class that collects by age alone has to stand down for this run.
+        ///
+        /// A rewound clock with no byte bound means the only limit declared cannot be applied, and
+        /// collecting anyway would take bytes the policy still protects (ADR-004 D8; V2-17).
+        var ageBoundSuspendedWithoutByteBound: Bool {
+            clockRewound && policy?.maxBytes == nil && policy?.maxAgeSeconds != nil
+        }
     }
 
     private struct ClassOutcome {
@@ -347,6 +362,14 @@ public struct RetentionCoordinator: Sendable {
         default:
             // Unpublished downloads are bytes, not cache entries: the orphan temporary files of an
             // interrupted commit, plus the versions this database just marked unreleased.
+            if context.ageBoundSuspendedWithoutByteBound {
+                return ClassOutcome(
+                    result: GCRunClassResult(
+                        retentionClass: .unpublishedDownloads,
+                        skipped: "wall clock rewound: age-based collection suspended"
+                    )
+                )
+            }
             var combined = await media.collectOrphanAssetFiles()
             let keys = try takeUnreleasedAssets(storageClass: "cached", policy: policy, context: context)
             if !keys.isEmpty {
@@ -387,6 +410,17 @@ public struct RetentionCoordinator: Sendable {
                 )
             )
         }
+        guard !context.ageBoundSuspendedWithoutByteBound else {
+            return ClassOutcome(
+                result: GCRunClassResult(
+                    retentionClass: .publishedAssetBytes,
+                    skipped: "wall clock rewound: age-based collection suspended"
+                )
+            )
+        }
+        // A declared age bounds what may be taken: an age-only policy used to take every unreferenced
+        // version, however recently it was written (ADR-004 D8; V2-17).
+        let ageCutoff = context.appliedAgeCutoffMilliseconds
         // One transaction decides and marks: the roots are read from the same snapshot the rows are
         // taken from, so a pin cannot appear between the two.
         let taken = try database.write { database -> (keys: [MediaAssetKey], blockedByPin: Int) in
@@ -400,20 +434,26 @@ public struct RetentionCoordinator: Sendable {
                 SELECT a.asset_version_id, a.content_digest, a.recipe_version, a.byte_count
                 FROM asset_version a
                 WHERE a.durability_state = 'committed'
+                  AND (? IS NULL OR a.created_at_ms < ?)
                   AND a.asset_version_id NOT IN (
                         SELECT asset_version_id FROM media_preparation
                         WHERE asset_version_id IS NOT NULL
                   )
                 ORDER BY a.created_at_ms, a.asset_version_id
-                """)
+                """, arguments: StatementArguments([ageCutoff, ageCutoff] as [(any DatabaseValueConvertible)?]))
             let blockedByPin = candidates.filter { row in
                 protection.protectedAssetVersions.contains(row["asset_version_id"] as Int64)
             }.count
+            // A pinned version cannot be taken, so it must not consume the byte budget either: counting
+            // it made the run stop short of the limit it was collecting towards (ADR-004 D8).
+            let collectable = candidates.filter {
+                !protection.protectedAssetVersions.contains($0["asset_version_id"] as Int64)
+            }
             let selected = Self.underByteBudget(
-                candidates.map { (id: $0["asset_version_id"] as Int64, bytes: $0["byte_count"] as Int64) },
+                collectable.map { (id: $0["asset_version_id"] as Int64, bytes: $0["byte_count"] as Int64) },
                 maxBytes: policy.maxBytes,
                 totalBytes: try committedAssetBytes(in: database)
-            ).filter { !protection.protectedAssetVersions.contains($0) }
+            )
             let eligible = candidates.filter { selected.contains($0["asset_version_id"] as Int64) }
             return (try Self.markBytesRemoved(eligible, in: database), blockedByPin)
         }
@@ -483,7 +523,11 @@ public struct RetentionCoordinator: Sendable {
                 )
             )
         }
-        guard !context.clockRewound, let cutoff = context.ageCutoffMilliseconds else {
+        let ageCutoff = context.appliedAgeCutoffMilliseconds
+        // A class may declare either bound, or both. A policy that declared only the byte limit used to
+        // be skipped for ever — a limit nobody executes — and the byte pass does not need an age to be
+        // meaningful (ADR-004 D8; V2-17).
+        guard ageCutoff != nil || policy.maxBytes != nil else {
             return ClassOutcome(
                 result: GCRunClassResult(
                     retentionClass: .connectorEvidence,
@@ -494,18 +538,22 @@ public struct RetentionCoordinator: Sendable {
             )
         }
         let collected = try database.write { database -> (rows: Int, bytes: Int64) in
-            let bytes = try Int64.fetchOne(database, sql: """
-                SELECT COALESCE(SUM(COALESCE(length(bytes), 0)), 0)
-                FROM connector_evidence WHERE created_at < ?
-                """, arguments: [cutoff]) ?? 0
-            try database.execute(
-                sql: "DELETE FROM connector_evidence WHERE created_at < ?",
-                arguments: [cutoff]
-            )
-            var rows = database.changesCount
-            var released = bytes
-            // The byte limit is applied after the age limit, oldest first, and only when the class
-            // still exceeds it: evidence is advisory, so it may expire ahead of supply (D8).
+            var rows = 0
+            var released: Int64 = 0
+            // Evidence older than the declared age is advisory, so it may expire ahead of supply.
+            if let ageCutoff {
+                released = try Int64.fetchOne(database, sql: """
+                    SELECT COALESCE(SUM(COALESCE(length(bytes), 0)), 0)
+                    FROM connector_evidence WHERE created_at < ?
+                    """, arguments: [ageCutoff]) ?? 0
+                try database.execute(
+                    sql: "DELETE FROM connector_evidence WHERE created_at < ?",
+                    arguments: [ageCutoff]
+                )
+                rows = database.changesCount
+            }
+            // The byte limit runs after the age limit, oldest first, and only while the class still
+            // exceeds it.
             if let maxBytes = policy.maxBytes {
                 var held = try Int64.fetchOne(
                     database,
@@ -552,7 +600,11 @@ public struct RetentionCoordinator: Sendable {
                 )
             )
         }
-        guard !context.clockRewound, let cutoff = context.ageCutoffMilliseconds else {
+        let ageCutoff = context.appliedAgeCutoffMilliseconds
+        // Either bound is a reason to run. The class used to require an age and ignore the byte limit
+        // entirely, so a byte-only policy was skipped for ever and a two-dimensional one never executed
+        // its byte half (ADR-004 D8; V2-17).
+        guard ageCutoff != nil || policy.maxBytes != nil else {
             return ClassOutcome(
                 result: GCRunClassResult(
                     retentionClass: .canonicalSupply,
@@ -562,25 +614,37 @@ public struct RetentionCoordinator: Sendable {
                 )
             )
         }
-        _ = policy
         let outcome = try database.write { database -> (rows: Int, bytes: Int64, protected: Int) in
             let protection = try roots.roots(in: database)
+            // Revisions, not records, and never the current one: the identity continuity of an external
+            // object is not this class's to take.
             let candidates = try Row.fetchAll(database, sql: """
-                SELECT v.id,
-                       COALESCE(length(COALESCE(v.headline, ''))
-                                + length(COALESCE(v.summary, ''))
-                                + length(COALESCE(v.body_text, '')), 0) AS bytes
+                SELECT v.id, v.created_at, \(Self.revisionByteExpression) AS bytes
                 FROM origin_revision v
-                WHERE v.created_at < ?
-                  AND v.id NOT IN (SELECT current_revision_id FROM origin_record
+                WHERE v.id NOT IN (SELECT current_revision_id FROM origin_record
                                    WHERE current_revision_id IS NOT NULL)
                 ORDER BY v.created_at, v.id
-                """, arguments: [cutoff])
+                """)
+            // A pinned revision cannot be taken, so it must not consume the byte budget either.
+            var selectedByBytes: Set<Int64> = []
+            if let maxBytes = policy.maxBytes {
+                let collectable = candidates
+                    .filter { !protection.protectedRevisions.contains($0["id"] as Int64) }
+                    .map { (id: $0["id"] as Int64, bytes: $0["bytes"] as Int64) }
+                selectedByBytes = Set(Self.underByteBudget(
+                    collectable,
+                    maxBytes: maxBytes,
+                    totalBytes: try revisionBytes(in: database)
+                ))
+            }
             var rows = 0
             var bytes: Int64 = 0
             var protected = 0
             for candidate in candidates {
                 let id: Int64 = candidate["id"]
+                let created: Int64 = candidate["created_at"]
+                let olderThanPolicy = ageCutoff.map { created < $0 } ?? false
+                guard olderThanPolicy || selectedByBytes.contains(id) else { continue }
                 if protection.protectedRevisions.contains(id) {
                     protected += 1
                     continue
@@ -878,6 +942,18 @@ public struct RetentionCoordinator: Sendable {
 
     // MARK: - Asset byte helpers
 
+    /// What one revision's payload weighs in the same shape the canonical-supply class deletes: the text
+    /// columns it holds. Declared once so the candidate query and the class total cannot drift apart.
+    private static let revisionByteExpression =
+        "COALESCE(length(COALESCE(v.headline, '')) + length(COALESCE(v.summary, '')) "
+        + "+ length(COALESCE(v.body_text, '')), 0)"
+
+    private func revisionBytes(in database: Database) throws -> Int64 {
+        try Int64.fetchOne(database, sql: """
+            SELECT COALESCE(SUM(\(Self.revisionByteExpression)), 0) FROM origin_revision v
+            """) ?? 0
+    }
+
     private func committedAssetBytes(in database: Database) throws -> Int64 {
         try Int64.fetchOne(
             database,
@@ -893,6 +969,9 @@ public struct RetentionCoordinator: Sendable {
         policy: RetentionPolicy,
         context: ClassContext
     ) throws -> [MediaAssetKey] {
+        // A declared age bounds what may be taken: an age-only policy used to take every unreferenced
+        // version, however recently it was written (ADR-004 D8; V2-17).
+        let ageCutoff = context.appliedAgeCutoffMilliseconds
         return try database.write { database -> [MediaAssetKey] in
             let protection = try roots.roots(in: database)
             let rows = try Row.fetchAll(database, sql: """
@@ -900,6 +979,7 @@ public struct RetentionCoordinator: Sendable {
                 FROM asset_version a
                 WHERE a.durability_state = 'committed'
                   AND a.storage_class = ?
+                  AND (? IS NULL OR a.created_at_ms < ?)
                   AND NOT EXISTS (
                     SELECT 1 FROM published_asset_ref r WHERE r.asset_version_id = a.asset_version_id
                   )
@@ -908,12 +988,16 @@ public struct RetentionCoordinator: Sendable {
                     WHERE asset_version_id IS NOT NULL
                   )
                 ORDER BY a.created_at_ms, a.asset_version_id
-                """, arguments: [storageClass])
+                """, arguments: StatementArguments([storageClass, ageCutoff, ageCutoff] as [(any DatabaseValueConvertible)?]))
+            // A pinned version cannot be taken, so it must not consume the byte budget either.
+            let collectable = rows.filter {
+                !protection.protectedAssetVersions.contains($0["asset_version_id"] as Int64)
+            }
             let ids = Self.underByteBudget(
-                rows.map { (id: $0["asset_version_id"] as Int64, bytes: $0["byte_count"] as Int64) },
+                collectable.map { (id: $0["asset_version_id"] as Int64, bytes: $0["byte_count"] as Int64) },
                 maxBytes: policy.maxBytes,
                 totalBytes: try committedAssetBytes(in: database)
-            ).filter { !protection.protectedAssetVersions.contains($0) }
+            )
             return try Self.markBytesRemoved(rows.filter { ids.contains($0["asset_version_id"] as Int64) }, in: database)
         }
     }
@@ -935,9 +1019,9 @@ public struct RetentionCoordinator: Sendable {
         return keys
     }
 
-    /// The oldest versions whose bytes bring the total under `maxBytes`. No limit declared means
-    /// every candidate is eligible: the age of the class is then the only bound, and the run reports
-    /// what it took.
+    /// The oldest versions whose bytes bring the total under `maxBytes`. No byte limit declared means
+    /// every candidate the caller already selected is eligible: the age bound of the class is then the
+    /// only limit, and the run reports what it took.
     private static func underByteBudget(
         _ candidates: [(id: Int64, bytes: Int64)],
         maxBytes: Int64?,

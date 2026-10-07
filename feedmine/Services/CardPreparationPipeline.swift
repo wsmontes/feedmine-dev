@@ -156,32 +156,42 @@ actor CardPreparationPipeline {
 
 // MARK: - Deadline Helper
 
-/// Race an async operation against a deadline. Uses TaskGroup so the first
-/// to complete wins — the deadline is a hard guarantee, not a cooperative
-/// cancellation request. If the deadline fires first, the operation's
-/// TaskGroup child is cancelled (but the actual download may continue in
-/// shared ImageLoader state — that's fine; this caller abandons the wait
-/// and returns nil, which the caller converts to a placeholder).
+/// Race an async operation against a deadline by bounding the **wait**, not the
+/// work.
 ///
-/// Mirrors CardPreparationCoordinator's deadline pattern so every network
-/// hop in the card pipeline is bounded.
+/// A task group cannot return before every child finishes, and `cancelAll()` is
+/// only a request: a child sitting in a retry sleep, a detached decode, or a
+/// URLSession call that has not noticed yet kept the group — and therefore this
+/// "hard guarantee" — alive until the work was done. Measured on the isolated
+/// proof in `deadline-evidence.txt`: 30 ms deadline, 268 ms to return, because
+/// the child awaited 250 ms of work that ignores cancellation.
+///
+/// So the operation runs as an unstructured task and only the *wait* is
+/// abandoned at the deadline: the caller gets its answer (nil → placeholder) on
+/// time, and the late result still belongs to whoever can use it — the
+/// resolution keeps writing the shared image caches, which is what the next
+/// composition reads. The abandoned task owns its own completion; nothing here
+/// waits for it. Cancelling the *caller* still cancels the work, which keeps the
+/// old behaviour for a batch that is no longer wanted.
 private func raceWithDeadline<T: Sendable>(
     deadline: ContinuousClock.Instant,
     operation: @escaping @Sendable () async -> T?
 ) async -> T? {
-    await withTaskGroup(of: T?.self) { group in
-        // Runner: the actual operation
-        group.addTask {
-            return await operation()
-        }
-        // Timer: fires at deadline, returns nil
-        group.addTask {
-            try? await Task.sleep(until: deadline, clock: .continuous)
-            return nil
-        }
-        // First to complete wins; cancel the other
-        let result = await group.next() ?? nil
-        group.cancelAll()
+    // First completion wins; later ones are dropped (`SharedWait` cannot resume
+    // a continuation twice).
+    let box = SharedWait<T?>()
+    // `nil` is a legitimate outcome (no image usable) and has to be able to win
+    // the race exactly like a value, which is why both sides report success.
+    let work = Task { box.complete(.success(await operation())) }
+    let timer = Task {
+        try? await Task.sleep(until: deadline, clock: .continuous)
+        box.complete(.success(nil))
+    }
+    return await withTaskCancellationHandler {
+        let result = try? await box.value()
+        timer.cancel()
         return result
+    } onCancel: {
+        work.cancel()
     }
 }

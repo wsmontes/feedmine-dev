@@ -501,6 +501,64 @@ final class SelectionEngineTests: SelectionTestCase {
         XCTAssertEqual(after["content_relation"], 0)
     }
 
+    /// A relation whose two ends fall into consecutive page windows still collapses. The page only
+    /// requires the subject to be inside its window and resolves the object's durable key whether or not
+    /// it read that record, and the engine accumulates the edges until the pool is assembled — so the
+    /// same editorial object cannot reach the draft twice across a keyset boundary (ADR-003 D13; V2-13).
+    func testClusterCollapsesAcrossTwoPages() throws {
+        let source = try insertSource("catalog:cluster-pages")
+        let key = try sourceKey("catalog:cluster-pages")
+        try admit([
+            SelectionFeedObject(objectKey: "story", observedAt: SelectionInstant.offset(0)),
+            SelectionFeedObject(
+                objectKey: "repost-1",
+                observedAt: SelectionInstant.offset(1),
+                relations: [(verb: "repostOf", target: "story")]
+            ),
+            SelectionFeedObject(
+                objectKey: "repost-2",
+                observedAt: SelectionInstant.offset(2),
+                relations: [(verb: "repostOf", target: "story")]
+            ),
+        ], source: source)
+
+        // A one-row first window reads the story alone and a two-row second window reads the two
+        // reposts: the two ends of every `repostOf` edge land on different pages on purpose. The pool
+        // (4) is larger than the supply (3), so the walk runs its steps and stops on the scan budget.
+        let tinyWindow = try SelectionBudget(
+            cardLimit: 1,
+            oversampleFactor: 1,
+            poolLimit: 4,
+            scanRowsPerStep: 1,
+            maxScanSteps: 2,
+            providerQuota: 4,
+            diversityTarget: 1
+        )
+        let plan = try makePlan(
+            sourceSelection: [SourceSelection(sourceKey: key, enabled: true)],
+            budget: tinyWindow,
+            applySeen: false,
+            repetition: try RepetitionPolicy(window: 48, limit: 1, allowsDistinctOccurrence: true)
+        )
+        let projections = projections(catalogKeys: [key])
+        let (_, draft) = try select(plan, projections: projections)
+
+        XCTAssertEqual(draft.readReport.stepWindowRows, [1, 2], "the story and its reposts were read apart")
+        XCTAssertEqual(draft.readReport.pages, 2)
+        XCTAssertEqual(draft.choices.count, 3, "the pool keeps every record: clustering is a relation")
+        XCTAssertEqual(draft.clusters.count, 1, "the relation survives the page boundary")
+        let cluster = try XCTUnwrap(draft.clusters.first)
+        XCTAssertEqual(cluster.members.count, 3)
+        XCTAssertEqual(cluster.representative, stableKey("repost-1"), "the smallest durable key represents")
+        for choice in draft.choices {
+            XCTAssertEqual(
+                choice.clusterKey,
+                cluster.representative,
+                "every member's clusterKey is the representative's stable key"
+            )
+        }
+    }
+
     // MARK: - Ties and order
 
     func testTiesBreakOnScoreThenTimestampThenStableKey() throws {

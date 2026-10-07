@@ -90,16 +90,31 @@ final class LocaleManager {
     /// 2. System preferred languages chain
     /// 3. English fallback
     private static func resolveLanguage() -> Language {
+        // Exact match before the prefix fallback. `supportedLanguages` holds `en` before `en-AU`/`en-GB`/
+        // `en-IN` (and `fr` before `fr-CA`), so a first-match prefix scan turned a saved regional choice
+        // into its base language on the next launch — en-AU came back as en, fr-CA as fr (S10). The
+        // comparison normalizes the separator (`en_AU` == `en-AU`) and case, because the value reaches
+        // here from AppleLanguages, not from a validated list.
+        func resolved(_ preference: String) -> Language? {
+            let normalized = preference.replacingOccurrences(of: "_", with: "-").lowercased()
+            if let exact = supportedLanguages.first(where: {
+                $0.code.replacingOccurrences(of: "_", with: "-").lowercased() == normalized
+            }) {
+                return exact
+            }
+            return supportedLanguages.first(where: { $0.matches(preference) })
+        }
+
         // 1. Explicit user choice (saved via AppleLanguages)
         if let saved = UserDefaults.standard.stringArray(forKey: "AppleLanguages")?.first {
-            if let match = supportedLanguages.first(where: { $0.matches(saved) }) {
+            if let match = resolved(saved) {
                 return match
             }
         }
 
         // 2. System preferred languages chain
         for pref in Locale.preferredLanguages {
-            if let match = supportedLanguages.first(where: { $0.matches(pref) }) {
+            if let match = resolved(pref) {
                 return match
             }
         }

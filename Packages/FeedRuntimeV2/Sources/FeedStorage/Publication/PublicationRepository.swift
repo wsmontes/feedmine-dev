@@ -528,13 +528,13 @@ public struct PublicationRepository: Sendable {
     /// The one visible edition for a context, when there is one (the active-edition pointer).
     public func activeEdition(for context: ContextKey) throws -> EditionSnapshot? {
         try database.read { db in
-            try Self.editionRow(
+            try Self.contextRow(
                 db,
                 sql: """
                     SELECT * FROM feed_edition
                     WHERE context_key = ? AND state = 'active'
                     """,
-                arguments: [context.canonicalSerialization]
+                context: context
             ).map(Self.snapshot(of:))
         }
     }
@@ -543,14 +543,14 @@ public struct PublicationRepository: Sendable {
     /// flight. Never returns a superseded edition as if it were visible.
     public func latestEdition(for context: ContextKey) throws -> EditionSnapshot? {
         try database.read { db in
-            try Self.editionRow(
+            try Self.contextRow(
                 db,
                 sql: """
                     SELECT * FROM feed_edition
                     WHERE context_key = ? AND state IN ('active','draft')
                     ORDER BY epoch DESC, edition_id DESC LIMIT 1
                     """,
-                arguments: [context.canonicalSerialization]
+                context: context
             ).map(Self.snapshot(of:))
         }
     }
@@ -660,10 +660,10 @@ public struct PublicationRepository: Sendable {
         supportedSchemaVersions: Set<Int> = PublicationSchema.supportedVersions
     ) throws -> EditionRestoreOutcome {
         try database.read { db in
-            guard let row = try Self.editionRow(
+            guard let row = try Self.contextRow(
                 db,
                 sql: "SELECT * FROM feed_edition WHERE context_key = ? AND state = 'active'",
-                arguments: [context.canonicalSerialization]
+                context: context
             ) else {
                 return .noEdition(context)
             }
@@ -1119,7 +1119,11 @@ public struct PublicationRepository: Sendable {
             }
             if let successorOf {
                 let previous = try edition(db, successorOf)
-                guard previous?.contextKey == contextKey else {
+                // The successor of an edition written under the older spelling is still a successor of this
+                // context: comparing the two texts would call one context two (V2-12).
+                guard let previousContext = previous?.contextKey,
+                      Self.namesSameContext(previousContext, contextKey)
+                else {
                     throw PublicationFailure.invalidComposition(
                         "the successor names an edition of another context"
                     )
@@ -1140,6 +1144,20 @@ public struct PublicationRepository: Sendable {
                     arguments: [existing.rawValue]
                 )
             }
+            // The same context may still have a visible edition under the text it used before the fields
+            // were escaped. Leaving it active would keep two visible editions for one context, and nothing
+            // else would ever retire it: the successor path names editions, not spellings (ADR-002 D1;
+            // V2-12).
+            try db.execute(
+                sql: """
+                    UPDATE feed_edition SET state = 'superseded'
+                    WHERE context_key = ? AND state = 'active' AND edition_id <> ?
+                    """,
+                arguments: [
+                    ContextKey.preEscapeText(ofCanonicalText: contextKey),
+                    token.editionID.rawValue,
+                ]
+            )
             if interrupted(.beforeActivation) {
                 throw PublicationStorageError.interrupted(interruptionProbe)
             }
@@ -1256,6 +1274,46 @@ public struct PublicationRepository: Sendable {
         arguments: StatementArguments
     ) throws -> Row? {
         try Row.fetchOne(db, sql: sql, arguments: arguments)
+    }
+
+    /// The row one context is stored in, whichever text a build wrote it under.
+    ///
+    /// Contexts whose fields contain no separator spell both forms the same way, so this is one lookup for
+    /// every context but the main feed's. The older spelling is read, never parsed: it is the same
+    /// context's row because the caller asked for that context (ADR-002 D1; V2-12).
+    private static func contextRow(
+        _ db: Database,
+        sql: String,
+        context: ContextKey
+    ) throws -> Row? {
+        for key in storedContextKeys(for: context) {
+            if let row = try editionRow(db, sql: sql, arguments: [key]) { return row }
+        }
+        return nil
+    }
+
+    /// The texts one context has been stored under, newest spelling first.
+    private static func storedContextKeys(for context: ContextKey) -> [String] {
+        let canonical = context.canonicalSerialization
+        let preEscape = context.legacySerialization
+        return preEscape == canonical ? [canonical] : [canonical, preEscape]
+    }
+
+    /// Whether two stored context texts name one context.
+    ///
+    /// A row written before the fields were escaped carries the older spelling of one context, so
+    /// comparing the two texts would call one context two — and the successor of an edition read from such
+    /// a row is still a successor of the same context (ADR-002 D1; V2-12).
+    private static func namesSameContext(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+        if let canonical = ContextKey(canonicalText: lhs) {
+            return canonical.canonicalSerialization == rhs
+                || ContextKey.preEscapeText(ofCanonicalText: canonical.canonicalSerialization) == rhs
+        }
+        if let canonical = ContextKey(canonicalText: rhs) {
+            return ContextKey.preEscapeText(ofCanonicalText: canonical.canonicalSerialization) == lhs
+        }
+        return false
     }
 
     private static func edition(_ db: Database, _ editionID: EditionID) throws -> EditionSnapshot? {

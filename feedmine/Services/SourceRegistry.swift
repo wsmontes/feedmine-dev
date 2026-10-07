@@ -565,6 +565,13 @@ final class SourceRegistry {
     func resetAllToggles() {
         disabled.removeAll()
         enabledOverrides.removeAll()
+        // `ensureActiveCounts()` alone no-ops while `activeCountsAreCurrent` is
+        // already true — the common state right after a previous change settled —
+        // which would leave `_enabledSources`, the counts and `enablementRevision`
+        // describing the authority from *before* the reset. Invalidate first so the
+        // recompute below actually runs and publishes a revision that matches the
+        // cleared sets.
+        invalidateActiveCounts()
         ensureActiveCounts()
         scheduleSaveState()
     }
@@ -667,7 +674,13 @@ final class SourceRegistry {
         var keys = [Self.regionKey(source.region), Self.categoryKey(source.category)]
         let parts = source.region.split(separator: "/").map(String.init)
         if parts.count >= 2, parts[0] == "countries" {
-            keys.append(Self.regionKey(parts.prefix(2).joined(separator: "/")))
+            // A source whose own region *is* the country (e.g. `countries/brazil`)
+            // derives the same key twice; the delta must land once per key or the
+            // country's active count depends on how deep the classification is.
+            let countryKey = Self.regionKey(parts.prefix(2).joined(separator: "/"))
+            if countryKey != keys[0] {
+                keys.append(countryKey)
+            }
         }
         return keys
     }
@@ -841,13 +854,22 @@ final class SourceRegistry {
         // `sources` assignment, which installs them without recomputing.
         let parsedSources = result.sources
         let parsedSharedURLs = result.sharedCountrySourceURLs
+        let deriveStarted = ContinuousClock().now
         let prepared = await Task.detached(priority: .userInitiated) {
             SourceRegistry.deriveCaches(
                 from: parsedSources,
                 sharedCountrySourceURLs: parsedSharedURLs
             )
         }.value
+        let deriveElapsed = ContinuousClock().now - deriveStarted
+        let deriveMs = Int(deriveElapsed.components.seconds * 1_000
+            + deriveElapsed.components.attoseconds / 1_000_000_000_000_000)
         preparedCaches = prepared
+        // This block is the prime suspect for the ~8,6 s that `OPML.load` spends *after* its cache read. It is
+        // separated here because "I/O under a full volume" does not only show up in a file read: decoding and
+        // deriving 77 443 objects allocates heavily and can spend its time in VM/page faults, which looks like
+        // slow CPU. Measured beside `[PerfEnv] freeImportant=…` this line says which one it was.
+        Log.feed.info("[PerfEnv] deriveCaches sources=\(parsedSources.count) ms=\(deriveMs)")
         sources = result.sources   // didSet installs the prepared caches
         opmlFileCount = result.fileCount
         opmlErrorCount = result.failedFileCount
@@ -864,9 +886,16 @@ final class SourceRegistry {
             }
             saveState()
             Settings.hasInitializedSourceDefaults = true
+            // Only this branch needs a second pass: it changes `disabled` *after* `loadState()` already
+            // published its counts, and publishing a stale count is a real defect (a source reads "off"
+            // while the list says on). On every other launch the call here was a full walk of 77 443 sources
+            // for nothing — `loadState()` ends in exactly this call, and it leaves
+            // `activeCountsAreCurrent == true`.
+            recomputeActiveCounts()
         }
 
-        recomputeActiveCounts()
+        // `prepareFilterCaches()` warms the filter caches and calls `ensureActiveCounts()`, which is a
+        // no-op when the counts are already current.
         prepareFilterCaches()
     }
 }

@@ -177,16 +177,19 @@ public struct SelectionSupplyRepository: Sendable {
                 )
             }
 
+            // The subject has to be a candidate of this page; the object does not. A relation whose ends
+            // fell into two consecutive pages is a real relation, and dropping it here let the same
+            // editorial object reach the draft twice (ADR-003 D13; V2-13). The engine intersects the
+            // edges it accumulated with the pool it actually assembled, so an object that never becomes
+            // a candidate is still ignored where the cluster is decided.
             let edges = try Self.clusterEdges(recordIDs: recordIDs, in: database)
             var candidatesByRecord: [Int64: SupplyStableKey] = [:]
             for candidate in candidates {
                 candidatesByRecord[candidate.originRecordID.rawValue] = candidate.stableKey
             }
             let resolvedEdges = edges.compactMap { edge -> SupplyClusterEdge? in
-                guard let subject = candidatesByRecord[edge.subject],
-                      let object = candidatesByRecord[edge.object]
-                else { return nil }
-                return SupplyClusterEdge(subject: subject, object: object, verb: edge.verb)
+                guard let subject = candidatesByRecord[edge.subject] else { return nil }
+                return SupplyClusterEdge(subject: subject, object: edge.object, verb: edge.verb)
             }
 
             return SupplyPage(
@@ -440,31 +443,48 @@ public struct SelectionSupplyRepository: Sendable {
         return result
     }
 
-    /// The declared syndication edges among the page's records (ADR-003 D13). Both endpoints must be in
-    /// the page: the grouping is pool-local and never invents a member it did not read.
+    /// The declared syndication edges *leaving* the page's records (ADR-003 D13).
+    ///
+    /// Only the subject has to be in the page. The object is resolved to its durable stable key by the
+    /// same statement, whether or not this page read the record, so a relation that spans two pages —
+    /// an article and the repost of it, split by the keyset window — is still visible to a caller that
+    /// accumulates pages. The key comes from the object's own primary identity when it has a record, and
+    /// from the identity the relation already names otherwise, which is the same key a candidate of that
+    /// record would carry.
     static func clusterEdges(
         recordIDs: [Int64],
         in database: Database
-    ) throws -> [(subject: Int64, object: Int64, verb: SupplyClusterEdge.Verb)] {
+    ) throws -> [(subject: Int64, object: SupplyStableKey, verb: SupplyClusterEdge.Verb)] {
         guard !recordIDs.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: recordIDs.count).joined(separator: ", ")
         let verbs = SupplyClusterEdge.Verb.allCases.map(\.rawValue)
         let verbPlaceholders = Array(repeating: "?", count: verbs.count).joined(separator: ", ")
         let arguments = StatementArguments(
             (verbs as [(any DatabaseValueConvertible)?]) + (recordIDs as [(any DatabaseValueConvertible)?])
-                + (recordIDs as [(any DatabaseValueConvertible)?])
         )
         let rows = try Row.fetchAll(database, sql: """
-            SELECT c.subject_origin_record_id, c.object_origin_record_id, c.relation
+            SELECT c.subject_origin_record_id, c.relation, i.connector_namespace, i.scope_key,
+                   i.external_key
             FROM content_relation c
+            LEFT JOIN origin_record r ON r.id = c.object_origin_record_id
+            JOIN external_identity i
+                ON i.id = COALESCE(r.primary_identity_id, c.object_external_identity_id)
             WHERE c.relation IN (\(verbPlaceholders))
               AND c.subject_origin_record_id IN (\(placeholders))
-              AND c.object_origin_record_id IN (\(placeholders))
-            ORDER BY c.subject_origin_record_id, c.object_origin_record_id, c.relation
+            ORDER BY c.subject_origin_record_id, i.connector_namespace, i.scope_key,
+                     i.external_key, c.relation
             """, arguments: arguments)
         return rows.compactMap { row in
             guard let verb = SupplyClusterEdge.Verb(rawValue: row["relation"]) else { return nil }
-            return (row["subject_origin_record_id"], row["object_origin_record_id"], verb)
+            return (
+                subject: row["subject_origin_record_id"],
+                object: SupplyStableKey(
+                    namespace: ConnectorNamespace(row["connector_namespace"]),
+                    scopeKey: row["scope_key"],
+                    objectKeyBytes: row["external_key"]
+                ),
+                verb: verb
+            )
         }
     }
 

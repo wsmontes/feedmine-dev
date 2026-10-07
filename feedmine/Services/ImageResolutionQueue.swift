@@ -78,8 +78,20 @@ actor ImageResolutionQueue {
     /// Maximum number of retries before marking as failed.
     private static var maxRetries: Int { backoffDelays.count }
 
-    /// Interval between poll cycles.
-    private static let pollInterval: Duration = .seconds(15)
+    /// Upper bound on how long the poll loop may sleep before it looks again.
+    /// A newly enqueued item is picked up within this interval even when the
+    /// retry it was enqueued next to is hours away.
+    private static let pollInterval: TimeInterval = 15
+
+    /// Floor on the sleep so an immediately eligible backlog (more than
+    /// ``batchSize`` rows at once) cannot spin the loop.
+    private static let minimumWakeDelay: TimeInterval = 0.25
+
+    /// How long an `in_progress` claim is honoured before the loop takes it
+    /// back. A row is written `in_progress` before its resolution starts; if
+    /// nothing ever writes the outcome, no query selects it again — see
+    /// ``recoverExpiredLeases(reclaimAll:)``.
+    private static let inProgressLeaseTimeout: TimeInterval = 300
 
     /// Maximum items processed per poll cycle.
     private static let batchSize = 10
@@ -106,7 +118,19 @@ actor ImageResolutionQueue {
     /// Wire the delegate and start processing. Call once after FeedStore.init.
     func configure(delegate: ImageResolutionQueueDelegate) {
         self.delegate = delegate
-        Task { await loadPendingFromSQLite() }
+        Task { await start() }
+    }
+
+    /// Recover abandoned claims, learn the rows already queued, then poll.
+    ///
+    /// Recovery runs *before* the loop: at this point no resolution of this
+    /// actor can be in flight (the actor was just created for this process), so
+    /// every `in_progress` row is a leftover from a run that died between the
+    /// claim and the outcome. Without this, those rows are never selected by any
+    /// query and the item never gets its retry.
+    private func start() async {
+        await recoverExpiredLeases(reclaimAll: true)
+        await loadPendingFromSQLite()
         startPolling()
     }
 
@@ -177,16 +201,23 @@ actor ImageResolutionQueue {
         guard pollTask == nil else { return }
         pollTask = Task {
             while !Task.isCancelled {
+                await self.recoverExpiredLeases()
                 await self.processBatch()
 
-                // If nothing left, stop polling to conserve resources.
-                // We'll restart when the next enqueue arrives.
-                if await self.countPending() == 0 {
+                // Existence of work and immediate eligibility are different
+                // questions. The loop used to exit here on "no row is eligible
+                // right now", which counted only rows whose `next_retry_at` had
+                // already passed: a resolution that failed and rescheduled
+                // itself 30 s (up to 6 h) into the future left rows that no
+                // query selected and no task woke up for, so the retries that
+                // the backoff schedule promised simply never happened. Wait for
+                // the next date instead of stopping; the loop only ends when
+                // there is no row left in the table.
+                guard let wait = await self.nextWakeDelay() else {
                     await self.clearPollTask()
                     return
                 }
-
-                try? await Task.sleep(for: Self.pollInterval)
+                try? await Task.sleep(for: .seconds(wait))
             }
             await self.clearPollTask()
         }
@@ -311,7 +342,7 @@ actor ImageResolutionQueue {
                             next_retry_at = ?,
                             last_error = ?,
                             updated_at = ?
-                        WHERE item_id = ?
+                        WHERE item_id = ? AND state = 'in_progress'
                         """,
                     arguments: [newRetryCount, nextRetryAt, error, now, itemID]
                 )
@@ -330,7 +361,7 @@ actor ImageResolutionQueue {
                 sql: """
                     UPDATE image_retry_queue
                     SET state = 'failed', last_error = ?, updated_at = ?
-                    WHERE item_id = ?
+                    WHERE item_id = ? AND state = 'in_progress'
                     """,
                 arguments: [error, now, itemID]
             )
@@ -339,26 +370,77 @@ actor ImageResolutionQueue {
 
     // MARK: - SQLite Helpers
 
-    private func countPending() async -> Int {
+    /// How long the loop may sleep before its next look, or `nil` when the
+    /// table holds neither a `pending` row nor an `in_progress` claim.
+    ///
+    /// The delay is the time until the earliest scheduled retry (or until the
+    /// oldest claim's lease expires), capped by ``pollInterval``: capping keeps
+    /// the latency of a *newly* enqueued item bounded — a fresh row next to a
+    /// six-hour backoff must not wait six hours — and keeps the query cost at
+    /// the four-per-minute the loop always had while work was eligible.
+    private func nextWakeDelay() async -> TimeInterval? {
+        let now = Date().timeIntervalSince1970
+        let snapshot = try? await db.read { db -> (pending: Int, nextAt: Int?, inProgress: Int, leaseAt: Int?)? in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT
+                  (SELECT COUNT(*) FROM image_retry_queue WHERE state = 'pending') AS pending,
+                  (SELECT MIN(next_retry_at) FROM image_retry_queue WHERE state = 'pending') AS next_at,
+                  (SELECT COUNT(*) FROM image_retry_queue WHERE state = 'in_progress') AS in_progress,
+                  (SELECT MIN(updated_at) FROM image_retry_queue WHERE state = 'in_progress') AS lease_at
+                """) else { return nil }
+            let pending: Int = row["pending"]
+            let nextAt: Int? = row["next_at"]
+            let inProgress: Int = row["in_progress"]
+            let leaseAt: Int? = row["lease_at"]
+            return (pending, nextAt, inProgress, leaseAt)
+        }
+
+        guard let snapshot, snapshot.pending > 0 || snapshot.inProgress > 0 else { return nil }
+
+        var wait = Self.pollInterval
+        if let nextAt = snapshot.nextAt {
+            wait = min(wait, max(0, Double(nextAt) - now))
+        }
+        if let leaseAt = snapshot.leaseAt {
+            wait = min(wait, max(0, Double(leaseAt) + Self.inProgressLeaseTimeout - now))
+        }
+        return max(Self.minimumWakeDelay, wait)
+    }
+
+    /// Return claims whose resolution never wrote an outcome to `pending` so a
+    /// later cycle selects them again.
+    ///
+    /// `reclaimAll` is used by ``start()`` (a fresh actor owns no live lease, so
+    /// every `in_progress` row is a leftover from a previous run); the poll loop
+    /// passes `false` and takes back only leases older than
+    /// ``inProgressLeaseTimeout``.
+    private func recoverExpiredLeases(reclaimAll: Bool = false) async {
         let now = Int(Date().timeIntervalSince1970)
-        return (try? await db.read { db in
-            try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM image_retry_queue
-                WHERE state = 'pending' AND next_retry_at <= ?
-                """, arguments: [now]
+        let cutoff = reclaimAll ? Int.max : now - Int(Self.inProgressLeaseTimeout)
+        try? await db.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE image_retry_queue
+                    SET state = 'pending', next_retry_at = ?, updated_at = ?
+                    WHERE state = 'in_progress' AND updated_at <= ?
+                    """,
+                arguments: [now, now, cutoff]
             )
-        }) ?? 0
+        }
     }
 
     private func loadPendingFromSQLite() async {
-        let now = Int(Date().timeIntervalSince1970)
+        // Everything that is not terminal: `pending` rows are work by
+        // definition (whatever their retry date) and `in_progress` rows are
+        // claims that are about to be processed or recovered. The old query
+        // loaded only rows eligible at this instant, so a row that was waiting
+        // out its backoff was not even known to the in-memory de-duplication set.
         let ids: [String] = (try? await db.read { db in
             try String.fetchAll(db, sql: """
                 SELECT item_id FROM image_retry_queue
-                WHERE state = 'pending' AND next_retry_at <= ?
+                WHERE state IN ('pending', 'in_progress')
                 ORDER BY next_retry_at ASC
-                """, arguments: [now]
-            )
+                """)
         }) ?? []
         pendingIDs.formUnion(ids)
     }

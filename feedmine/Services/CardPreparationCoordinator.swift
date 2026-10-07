@@ -16,6 +16,19 @@ actor CardPreparationCoordinator {
     private var resolvedByID: [String: ResolvedCardAsset] = [:]
     private var renderReadyByID: [String: PreparedFeedCard] = [:]
 
+    /// IDs of the items still waiting to be published, i.e. the ones that are in
+    /// `orderedItems`. Kept as a set so `storeResolved`/`storeRenderReady` can
+    /// answer "is this ID still part of the runway?" in O(1): an ID that was
+    /// published (and dropped from `orderedItems` by ``trimToPublishedIndex()``)
+    /// must never re-enter the maps. A late deferred retry used to do exactly
+    /// that, and `fillRunway` counted those orphans as ready depth — supply stopped
+    /// early on a number that did not correspond to any card that could be
+    /// published (S06).
+    ///
+    /// Every mutation of `orderedItems` keeps this in step: replacement and
+    /// append assign/union, `trimToPublishedIndex()` subtracts.
+    private var editorialIDs: Set<String> = []
+
     /// IDs of items whose prepare task is still running, keyed by a per-dispatch
     /// token. `handleMemoryPressure` resets `nextPrepareIndex` backward so
     /// demoted items can be re-decoded; without this set, `fillRunway` would
@@ -28,6 +41,23 @@ actor CardPreparationCoordinator {
     /// Active deferred-retry tasks, keyed by item ID. Cancelled on context
     /// change so stale upgrades can't mutate a newer coordinator state.
     private var deferredRetryTasks: [String: Task<Void, Never>] = [:]
+
+    /// Per-ID token for the retry in `deferredRetryTasks`, for the same reason
+    /// `inFlightIDs` is token-keyed: the retry's `defer` runs after the body, and
+    /// a newer retry for the same ID can already be installed by then. Removing
+    /// by ID alone dropped the *new* task, which then survived the next context
+    /// switch uncancelled (review finding).
+    private var deferredRetryTokens: [String: UUID] = [:]
+
+    /// Called when artwork that missed its deadline finally resolves and the card has been refreshed in
+    /// the render-ready store. The store uses it to heal the *published* card in place; without a
+    /// consumer the image waits for the next composition, which on a stalled feed is never.
+    private var mediaUpgradeHandler: (@MainActor (PreparedFeedCard) async -> Void)?
+
+    /// Install the media-upgrade consumer. Called once by `FeedStore` when the pipeline is wired.
+    func setMediaUpgradeHandler(_ handler: @escaping @MainActor (PreparedFeedCard) async -> Void) {
+        mediaUpgradeHandler = handler
+    }
 
     /// Index of the next item that hasn't started preparation.
     private var nextPrepareIndex: Int = 0
@@ -95,6 +125,7 @@ actor CardPreparationCoordinator {
         var seenIDs = Set<String>()
         let uniqueItems = items.filter { seenIDs.insert($0.id).inserted }
         orderedItems = uniqueItems
+        editorialIDs = Set(uniqueItems.map(\.id))
         stateByID.removeAll()
         resolvedByID.removeAll()
         renderReadyByID.removeAll()
@@ -105,6 +136,7 @@ actor CardPreparationCoordinator {
         // Cancel any in-progress deferred retries and clear their state.
         for (_, task) in deferredRetryTasks { task.cancel() }
         deferredRetryTasks.removeAll()
+        deferredRetryTokens.removeAll()
         nextPrepareIndex = 0
         nextPublishIndex = 0
         activeContext = context
@@ -135,6 +167,7 @@ actor CardPreparationCoordinator {
         let newItems = items.filter { seenIDs.insert($0.id).inserted }
         guard !newItems.isEmpty else { return }
         orderedItems.append(contentsOf: newItems)
+        editorialIDs.formUnion(newItems.map(\.id))
     }
 
     /// Fill the runway up to the specified target count of render-ready cards.
@@ -325,6 +358,9 @@ actor CardPreparationCoordinator {
             stateByID.removeValue(forKey: item.id)
             resolvedByID.removeValue(forKey: item.id)
             renderReadyByID.removeValue(forKey: item.id)
+            // The item stops being part of the runway here: from now on a write
+            // for this ID is a write for a card the reader already has.
+            editorialIDs.remove(item.id)
         }
         orderedItems.removeFirst(trimmed)
         nextPublishIndex = 0
@@ -373,6 +409,12 @@ actor CardPreparationCoordinator {
         return count
     }
 
+    /// Why a scheduled publication had nothing to promote. A page that is handed to the pipeline and never
+    /// appears leaves no other trace, so the sequence's own numbers have to be readable.
+    var editorialDiagnostics: String {
+        "ordered=\(orderedItems.count) nextPublish=\(nextPublishIndex) nextPrepare=\(nextPrepareIndex) ready=\(renderReadyByID.count) resolved=\(resolvedByID.count) inFlight=\(inFlightIDs.count) activeEpoch=\(activeContext.map { String($0.epoch) } ?? "-")"
+    }
+
     /// Number of resolved (disk-level) cards ahead of the publish index.
     var resolvedCount: Int {
         var count = 0
@@ -403,6 +445,7 @@ actor CardPreparationCoordinator {
 
         Task { [weak self] in
             guard let self else { return }
+            let startedAt = ContinuousClock().now
             defer {
                 // Only remove if this dispatch's token still matches — stale
                 // tasks from old contexts must not strip a new context's marker.
@@ -424,9 +467,20 @@ actor CardPreparationCoordinator {
                 resolved = .none
             }
 
+            let outcome: String
+            switch resolved {
+            case .image: outcome = "image"
+            case .placeholder: outcome = "placeholder"   // deadline miss or failure — the card goes out without its artwork
+            case .none: outcome = "none"
+            }
+            let elapsed = ContinuousClock().now - startedAt
+            let elapsedMs = Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
+            ImageLog.prepareOutcome(itemID: item.id, outcome: outcome, ms: elapsedMs, index: index)
+
             // Atomic guard+write — no suspension between check and write
             // so a context change can't sneak in (TOCTOU fix).
-            guard await self.storeResolved(item.id, asset: resolved, context: context) else { return }
+            guard await self.storeResolved(item.id, asset: resolved, context: context,
+                                           dispatchToken: dispatchToken) else { return }
 
             // Decode to render-ready
             await self.setState(item.id, to: .decoding)
@@ -435,7 +489,8 @@ actor CardPreparationCoordinator {
             )
 
             // Atomic guard+write — context-validated in one actor transaction.
-            guard await self.storeRenderReady(item.id, card: renderReady, context: context) else { return }
+            guard await self.storeRenderReady(item.id, card: renderReady, context: context,
+                                              dispatchToken: dispatchToken) else { return }
 
             // If image missed the deadline, start a deferred retry. The card goes
             // out as text-only and **stays that way for this session**: the retry
@@ -469,27 +524,39 @@ actor CardPreparationCoordinator {
     }
 
     /// Atomic guard+write: stores the resolved asset only if the context is
-    /// still active. Callers suspended between their last context check and
-    /// the write are protected — the check and write happen in one actor
-    /// transaction with no suspension point between them (TOCTOU fix).
+    /// still active **and the ID is still waiting to be published**. Callers
+    /// suspended between their last context check and the write are protected —
+    /// the check and write happen in one actor transaction with no suspension
+    /// point between them (TOCTOU fix). The membership check is what keeps a
+    /// late retry for an already-published card out of the runway.
+    ///
+    /// `dispatchToken` is the token of the prepare dispatch this write belongs
+    /// to, when there is one: it prevents a superseded task from clearing a
+    /// newer dispatch's in-flight marker (and thus from letting `fillRunway`
+    /// dispatch the same ID a third time).
     @discardableResult
     private func storeResolved(_ id: String, asset: ResolvedCardAsset,
-                                context: FeedPresentationContext) -> Bool {
+                                context: FeedPresentationContext,
+                                dispatchToken: UUID? = nil) -> Bool {
         guard context == activeContext else { return false }
+        guard editorialIDs.contains(id) else { return false }
         resolvedByID[id] = asset
         stateByID[id] = .resolved(asset)
-        inFlightIDs.removeValue(forKey: id)
+        markPrepareFinished(id, token: dispatchToken)
         return true
     }
 
-    /// Atomic guard+write for render-ready cards. Same TOCTOU fix as above.
+    /// Atomic guard+write for render-ready cards. Same TOCTOU fix, same
+    /// "still waiting to be published" rule, same dispatch-token rule as above.
     @discardableResult
     private func storeRenderReady(_ id: String, card: PreparedFeedCard,
-                                   context: FeedPresentationContext) -> Bool {
+                                   context: FeedPresentationContext,
+                                   dispatchToken: UUID? = nil) -> Bool {
         guard context == activeContext else { return false }
+        guard editorialIDs.contains(id) else { return false }
         renderReadyByID[id] = card
         stateByID[id] = .renderReady(card)
-        inFlightIDs.removeValue(forKey: id)
+        markPrepareFinished(id, token: dispatchToken)
 
         // Wake any callers suspended in waitForContiguousPrefix so they
         // can re-evaluate whether the prefix is now long enough.
@@ -520,25 +587,59 @@ actor CardPreparationCoordinator {
         context: FeedPresentationContext,
         deadline: ContinuousClock.Instant
     ) async -> ResolvedImageAsset? {
-        guard let imageURL = item.bestImageURL.flatMap(URL.init(string:)) else {
-            return nil
-        }
+        if let imageURL = item.bestImageURL.flatMap(URL.init(string:)) {
+            let request = ImageResolutionRequest(
+                itemID: item.id,
+                url: imageURL,
+                cacheKey: ImageCacheKey.forURL(imageURL),
+                source: .directImageURL
+            )
 
-        let request = ImageResolutionRequest(
-            itemID: item.id,
-            url: imageURL,
-            cacheKey: ImageCacheKey.forURL(imageURL),
-            source: .directImageURL
-        )
-
-        // Race: resolution vs deadline. withSlot throws CancellationError
-        // when the caller was cancelled while queued — degrade to nil
-        // (placeholder) exactly like a deadline miss.
-        return try? await raceWithDeadline(deadline: deadline) {
-            try await self.limiter.withSlot(category: "direct_image") {
-                await self.mediaStore.resolve(request: request)
+            // Race: resolution vs deadline. withSlot throws CancellationError
+            // when the caller was cancelled while queued — degrade to nil
+            // (placeholder) exactly like a deadline miss.
+            return try? await raceWithDeadline(deadline: deadline) {
+                try await self.limiter.withSlot(category: "direct_image") {
+                    await self.mediaStore.resolve(request: request)
+                }
             }
         }
+
+        // An item whose artwork lives only on its article page had no path here at all: this returned nil at
+        // once, the deferred retry re-ran the very same function and returned in 1 ms, and the card kept its
+        // placeholder for the whole session — measured on one fast scroll: 168 `deferred-retry … image=0
+        // ms=1`, not one image, on a feed where every card carried `canResolveArticleImage`. The resolver the
+        // legacy path already uses is called here too, under the same deadline and the same slot budget; the
+        // candidate lookup happens before a slot is taken, so an article page never occupies a download slot.
+        guard item.canResolveArticleImage, let articleURL = URL(string: item.url) else {
+            // Why a card ends with a stand-in and never gets art: the direct URL is absent or unparsable and
+            // there is no article page to ask. Measured on a fast scroll: 224 such retries in one session,
+            // every one `image=0 ms=1` — the retry is instantaneous because there is nothing to try.
+            let raw = item.bestImageURL
+            let rawState = raw == nil ? "absent" : (URL(string: raw!) == nil ? "unparsable" : "present")
+            Log.feed.info("[Media] unresolved item=\(item.id) rawImage=\(rawState) canResolveArticle=\(item.canResolveArticleImage ? 1 : 0) — no artwork source for this item")
+            return nil
+        }
+        let candidates = await ArticleImageResolver.shared.imageURLs(for: articleURL)
+        if candidates.isEmpty {
+            Log.feed.info("[Media] unresolved item=\(item.id) rawImage=\((item.bestImageURL ?? "nil") == "nil" ? "absent" : "present") articleHost=\(articleURL.host ?? "-") — the article page yielded no candidates")
+        }
+        for candidate in candidates.prefix(3) {
+            guard !Task.isCancelled, ContinuousClock().now < deadline else { return nil }
+            let request = ImageResolutionRequest(
+                itemID: item.id,
+                url: candidate,
+                cacheKey: ImageCacheKey.forURL(candidate),
+                source: .articleOpenGraph
+            )
+            let resolved: ResolvedImageAsset? = try? await raceWithDeadline(deadline: deadline) {
+                try await self.limiter.withSlot(category: "direct_image") {
+                    await self.mediaStore.resolve(request: request)
+                }
+            }
+            if let resolved { return resolved }
+        }
+        return nil
     }
 
     /// Start a deferred image retry with an extended deadline. The card is
@@ -556,22 +657,29 @@ actor CardPreparationCoordinator {
         // Cancel any prior retry for this ID.
         deferredRetryTasks[item.id]?.cancel()
         let retryDeadline = ContinuousClock().now.advanced(by: .seconds(12))
+        let retryToken = UUID()
+        deferredRetryTokens[item.id] = retryToken
 
         let task = Task { [weak self] in
             guard let self else { return }
             defer {
-                Task { await self.cleanupDeferredRetry(item.id) }
+                Task { await self.cleanupDeferredRetry(item.id, token: retryToken) }
             }
 
+            let retryStartedAt = ContinuousClock().now
             let asset = await self.resolveImageAsset(
                 for: item, context: context,
                 deadline: retryDeadline
             )
+            let retryElapsed = ContinuousClock().now - retryStartedAt
+            let retryMs = Int(retryElapsed.components.seconds * 1_000 + retryElapsed.components.attoseconds / 1_000_000_000_000_000)
 
             guard !Task.isCancelled, let asset else {
                 // Timeout or cancellation — card stays text-only (already OK).
+                ImageLog.deferredRetry(itemID: item.id, ms: retryMs, gotImage: false)
                 return
             }
+            ImageLog.deferredRetry(itemID: item.id, ms: retryMs, gotImage: true)
 
             // Image arrived! Upgrade the card to hero.
             await self.upgradeDeferredToHero(
@@ -601,15 +709,29 @@ actor CardPreparationCoordinator {
         )
         guard !Task.isCancelled, case .image = renderReady.media else { return }
 
-        // The published presentation is immutable, so the decoded card only
-        // refreshes the runway entry: the next composition publishes it with
-        // the image already in place, instead of the card growing a hero slot
-        // under a reader who is mid-scroll.
+        // The published presentation is immutable in the sense that matters: a card never grows a hero
+        // slot under a reader who is mid-scroll. What is not immutable is the *frame that was already
+        // reserved* — a card showing a stand-in at the layout it will keep can take the real image
+        // without moving anything below it. So the runway entry is refreshed first — while the ID is
+        // still waiting to be published; a card that was already published has been trimmed out of the
+        // sequence and must not be re-inserted into the maps (S06) — and the media-upgrade consumer
+        // (the store) then heals the published card when the layout allows it.
         _ = await storeRenderReady(item.id, card: renderReady, context: context)
+        if let handler = mediaUpgradeHandler {
+            await handler(renderReady)
+        }
     }
 
-    /// Remove tracking state for a completed deferred retry.
-    private func cleanupDeferredRetry(_ id: String) {
+    /// Remove tracking state for a completed deferred retry. Token-checked:
+    /// this runs from the retry's own `defer`, so by the time an older retry
+    /// unwinds a newer one for the same ID can already own the slot — removing
+    /// by ID alone would drop the new task, which would then survive the next
+    /// `replaceEditorialSequence` uncancelled.
+    private func cleanupDeferredRetry(_ id: String, token: UUID? = nil) {
+        if let token {
+            guard deferredRetryTokens[id] == token else { return }
+        }
+        deferredRetryTokens.removeValue(forKey: id)
         deferredRetryTasks.removeValue(forKey: id)
     }
 

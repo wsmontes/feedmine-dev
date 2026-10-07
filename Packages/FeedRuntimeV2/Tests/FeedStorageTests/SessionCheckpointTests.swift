@@ -191,6 +191,88 @@ final class SessionCheckpointTests: RuntimeV2TestCase {
         XCTAssertNotNil(try reopenedStore.load(context: published.context))
     }
 
+    /// A context whose scope key contains the separator is stored and read back as itself, and two
+    /// different contexts never share one key (ADR-002 D1; V2-12).
+    func testAContextWhoseScopeContainsTheSeparatorRoundTripsAndNeverCollides() throws {
+        // The main feed's scope key is `preset=…|box=…`. Joining the three fields raw made the key
+        // ambiguous: a lookup decoded part of the scope into the plan.
+        let piped = try planContext("preset=home|box=-")
+        XCTAssertEqual(piped.scopeKey, "preset=home|box=-")
+        XCTAssertEqual(ContextKey(canonicalText: piped.canonicalSerialization), piped)
+
+        // The two contexts the raw join spelled identically are two keys now.
+        let split = try ContextKey(
+            surface: .main,
+            scopeKey: "preset=home",
+            planIdentity: "box=-|MainFeedPlan"
+        )
+        XCTAssertNotEqual(piped.canonicalSerialization, split.canonicalSerialization)
+        XCTAssertEqual(ContextKey(canonicalText: split.canonicalSerialization), split)
+
+        let published = try publishEdition(cardCount: 2, scopeKey: "preset=home|box=-")
+        let store = SessionCheckpointStore(database: database)
+        let saved = try checkpoint(
+            context: published.context,
+            edition: published.edition.editionID,
+            card: published.cards[1].payload.cardID,
+            ordinal: 1
+        )
+        XCTAssertTrue(try store.save(saved))
+
+        let loaded = try XCTUnwrap(try store.load(context: published.context))
+        XCTAssertEqual(loaded, saved)
+        XCTAssertEqual(loaded.context, published.context, "every field comes back as it went in")
+        XCTAssertEqual(loaded.context.scopeKey, "preset=home|box=-")
+        XCTAssertEqual(loaded.context.planIdentity, published.context.planIdentity)
+    }
+
+    /// A row written before context fields were escaped is still that context's cursor: it is read, and the
+    /// next save retires it in favour of the unambiguous key (ADR-002 D1; V2-12).
+    func testALegacyContextKeyRowIsStillReadAndRetiredByTheNextSave() throws {
+        let published = try publishEdition(cardCount: 1, scopeKey: "preset=home|box=-")
+        let legacy = try checkpoint(
+            context: published.context,
+            edition: published.edition.editionID,
+            card: published.cards[0].payload.cardID,
+            ordinal: 0,
+            fraction: 0.5
+        )
+        XCTAssertNotEqual(legacy.context.legacySerialization, legacy.context.canonicalSerialization)
+
+        try database.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO session_checkpoint (
+                        context_key, edition_id, publication_card_id, absolute_ordinal,
+                        anchor_offset_fraction, render_environment_revision, policy_version, updated_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                arguments: [
+                    legacy.context.legacySerialization,
+                    legacy.editionID.rawValue,
+                    legacy.anchor.cardID.rawValue,
+                    legacy.anchor.absoluteOrdinal,
+                    legacy.anchor.offsetFraction,
+                    legacy.renderEnvironmentRevision.canonicalSerialization,
+                    legacy.policyVersion,
+                    legacy.updatedAtMs,
+                ]
+            )
+        }
+
+        let store = SessionCheckpointStore(database: database)
+        let loaded = try XCTUnwrap(try store.load(context: published.context))
+        XCTAssertEqual(loaded, legacy, "the row is this context's cursor, whichever text names it")
+        XCTAssertEqual(loaded.context, published.context, "the context that was asked for is the authority")
+
+        // Saving under the escaped key retires the ambiguous row: one context, one row.
+        XCTAssertTrue(try store.save(legacy))
+        let keys = try database.read { db in
+            try String.fetchAll(db, sql: "SELECT context_key FROM session_checkpoint")
+        }
+        XCTAssertEqual(keys, [published.context.canonicalSerialization])
+    }
+
     /// The cursor names a card of its own edition: the composite foreign key refuses anything else, so a
     /// stale ordinal from another edition cannot become a cursor.
     func testCheckpointRefusesACardOfAnotherEdition() throws {

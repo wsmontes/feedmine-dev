@@ -8,7 +8,7 @@ import FeedRuntime
 /// `SyndicationConnector` already owns everything the wire needs — the conditional request, the byte
 /// ceilings, the redirect ceiling, the translation, the proposed checkpoint — and it reports its own
 /// outcome taxonomy. What it does not know is the acquisition layer's vocabulary: an opaque
-/// `ConnectorCheckpoint` blob, the four `AcquisitionSourceEvent` cases, and the stamps a batch must
+/// `ConnectorCheckpoint` blob, the `AcquisitionSourceEvent` cases, and the stamps a batch must
 /// carry. This type is that translation and nothing else:
 ///
 /// * it decodes the durable checkpoint blob into the connector's own `SyndicationCheckpoint` and
@@ -17,11 +17,13 @@ import FeedRuntime
 /// * it stamps the batch with the target generation, binding revision, lease epoch and checkpoint
 ///   revision the pull was made under, which is what Admission's compare-and-swap validates
 ///   (ADR-006 D1, D5);
-/// * it maps the connector's non-batch outcomes onto the acquisition layer's: a `304` is the end of
-///   this stream (nothing changed, nothing to admit, nothing to commit), a transport failure is thrown
-///   so the coordinator reports it as one, and everything else — throttling, policy refusal, a
-///   malformed document, an unhandled status, an exhausted deadline — is a discontinuity that admits
-///   nothing and leaves the durable checkpoint as the resume point (ADR-005 D8, D15).
+/// * it maps the connector's non-batch outcomes onto the acquisition layer's: a `304` says the
+///   checkpoint this pull resumed from is still current (nothing to admit, nothing to commit, and the
+///   target stays eligible for a later demand instead of being reported as a stream that ended); a
+///   transport failure is thrown so the coordinator reports it as one; and everything else —
+///   throttling, policy refusal, a malformed document, an unhandled status, an exhausted deadline — is
+///   a discontinuity that admits nothing and leaves the durable checkpoint as the resume point
+///   (ADR-005 D8, D15).
 ///
 /// It holds no canonical state and writes no database.
 struct SyndicationAcquisitionSource: AcquisitionSource {
@@ -48,7 +50,12 @@ struct SyndicationAcquisitionSource: AcquisitionSource {
             // The endpoint confirmed the baseline the conditional request was built on: no
             // representation changed and no batch may be admitted. The confirmed checkpoint is
             // byte-identical to the one Admission already holds, so there is nothing to commit either.
-            return .finished
+            //
+            // It is not `.finished`: that event says the finite stream has no more work, and the
+            // coordinator marks the target exhausted for the whole binding revision when it hears it —
+            // which froze a renewable feed at its first `304` until the app was relaunched (V2-01).
+            // This pull is over; the source is not.
+            return .upToDate
 
         case .transportFailure(let failureClass, let retryable, _):
             // A transport failure is retryable work, not a broken stream: the coordinator reports it as
