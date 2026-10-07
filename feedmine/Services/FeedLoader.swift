@@ -1483,6 +1483,8 @@ final class FeedLoader {
     func emergencyTrim() { store.emergencyTrim() }
 
     var reservoirCount: Int { store.reservoirCount }
+    /// The page is at the end of what this composition has — the surface draws its footer for this.
+    var hasReachedTheEnd: Bool { store.hasReachedTheEnd }
     var lastRefreshDate: Date? { store.lastRefreshDate }
 
     // MARK: - Source helpers

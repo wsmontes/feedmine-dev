@@ -95,6 +95,10 @@ final class FeedStore {
     /// read/bookmark state always re-renders.
     var readStateRevision: UInt64 { display.readStateRevision }
     private(set) var reservoirCount: Int = 0
+    /// The reader is at the end of what this composition has: the page stopped growing, the reservoir is
+    /// empty and no source was eligible. The app said nothing there — a feed that ends in silence reads as
+    /// a broken feed, not as a feed that finished. The surface has a footer for this and nothing else.
+    private(set) var hasReachedTheEnd = false
     var lastToggleMessage: String?
     var loadingState: FeedLoadingState { display.loadingState }
     /// Current display phase — governs what the feed UI shows (loading, ready, empty, failed).
@@ -1022,6 +1026,8 @@ final class FeedStore {
         trimDebounceTask?.cancel()
         coverageMiningTask?.cancel()
         firstLaunchBootstrapTask?.cancel()
+        tailTopUpTask?.cancel()
+        tailTopUpAttempts = 0
         // Every task this store owns, not only the pipeline's. Both maintenance loops hold `self` for the
         // life of the loop (`guard let self` inside the task), so leaving their handles out kept the store —
         // and its DB, preparation and network work — alive after "cancel all": the loop only stops by
@@ -2701,6 +2707,8 @@ final class FeedStore {
             let slice = Array(items[start..<min(start + Self.coldStartPersistChunk, items.count)])
             persisted.append(contentsOf: await persistFetchedItems(slice))
         }
+        // New supply means the feed is not at its end any more, whatever it said before.
+        if !persisted.isEmpty { hasReachedTheEnd = false }
         return persisted
     }
 
@@ -3208,6 +3216,12 @@ final class FeedStore {
                     await self.cardPreparationTask?.value
                     if self.display.visibleItems.count == publishedBefore {
                         Log.feed.info("[Append] no-growth moved=\(upcoming.count) filtered=\(filtered.count) published=\(self.display.visibleItems.count) reservoir=\(self.reservoir.reservoirCount) — nothing reached the page")
+                        // The page did not move while the reservoir still has items: the batch's cards are
+                        // not render-ready yet, and nothing else will ask again — a reader sitting at the
+                        // end of the list produces no further viewport change. Measured: `published=237`
+                        // with `reservoir=450` and twenty seconds of continuous swiping that produced no
+                        // request at all: the feed simply ended.
+                        self.scheduleTailTopUp()
                     }
                 } else {
                     // Legacy pipeline: ReadyCardQueue + CardPreparationPipeline.
@@ -3325,6 +3339,16 @@ final class FeedStore {
     private var lastTailFetchAt: Date?
     /// Minimum spacing between the fetches a stalled tail issues.
     private static let tailFetchInterval: TimeInterval = 10
+    /// The tail's own top-up. Load-more is edge-driven — a viewport change asks for the next page — and a
+    /// reader sitting at the end of the list produces no further change, so a batch whose cards were not
+    /// render-ready never got asked about again. Measured on a warm relaunch: `published=237` with
+    /// `reservoir=450`, and twenty seconds of continuous swiping afterwards produced *no* request at all —
+    /// the feed ended with the supply still there. The top-up publishes what the coordinator already has,
+    /// without moving another page out of the reservoir, until the page stops growing.
+    private var tailTopUpTask: Task<Void, Never>?
+    private var tailTopUpAttempts = 0
+    private static let tailTopUpInterval: Duration = .milliseconds(1200)
+    private static let tailTopUpMaxAttempts = 20
     private var trimDebounceTask: Task<Void, Never>?
 
     /// User-initiated refresh (pull-to-refresh, retry, empty-state button).
@@ -3449,6 +3473,54 @@ final class FeedStore {
                 lastTailFetchAt = Date()
                 Log.feed.info("[LoadMore] fetch from tail grew=\(grew ? 1 : 0) reservoir=\(self.reservoir.reservoirCount) sinceLast=\(String(format: "%.1f", sinceFetch))s")
                 await fetchNextBatch()
+            }
+        }
+        // A serve that published only part of what it moved (the coordinator promotes the contiguous
+        // render-ready prefix, so a batch with slow media publishes one card and keeps the rest in its
+        // runway) leaves the page short of the end again on the *next* append — and if the reader is
+        // already at the end, there is no next append. Keep publishing what is already prepared.
+        scheduleTailTopUp()
+    }
+
+    /// Publish what the coordinator already has, on a clock, while the reader's page stays at the tail.
+    ///
+    /// The missing half of load-more. The trigger is a viewport change; a reader sitting at the end of the
+    /// list generates none, so a batch whose cards were not render-ready (media still resolving) was never
+    /// asked about again — measured on a warm relaunch: `published=237 release reservoir=450`, then twenty
+    /// seconds of continuous swiping with no request at all. This promotes from the coordinator's own
+    /// runway, so it never moves another page out of the reservoir to show nothing, and it stops by itself:
+    /// bounded when nothing is ready, reset whenever the page grows.
+    private func scheduleTailTopUp() {
+        guard usePreparedPipeline else { return }
+        guard tailTopUpAttempts < Self.tailTopUpMaxAttempts else {
+            Log.feed.info("[LoadMore] top-up stopped attempt=\(self.tailTopUpAttempts) published=\(self.display.visibleItems.count) reservoir=\(self.reservoir.reservoirCount)")
+            if self.reservoir.reservoirCount == 0, !self.visibleItems.isEmpty {
+                self.hasReachedTheEnd = true
+            }
+            return
+        }
+        tailTopUpTask?.cancel()
+        tailTopUpTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.tailTopUpInterval)
+            guard !Task.isCancelled, let self else { return }
+            let ctx = self.display.activePresentationContext
+            let before = self.display.visibleItems.count
+            self.tailTopUpAttempts += 1
+            await self.promotePreparedCards(
+                context: ctx,
+                isAppend: true,
+                maxCount: Reservoir.pageSize
+            )
+            let grew = self.display.visibleItems.count > before
+            Log.feed.info("[LoadMore] top-up attempt=\(self.tailTopUpAttempts) grew=\(grew ? 1 : 0) published=\(self.display.visibleItems.count) reservoir=\(self.reservoir.reservoirCount)")
+            if grew {
+                self.tailTopUpAttempts = 0
+                let ahead = await self.preparationCoordinator.editorialAheadCount
+                if self.reservoir.reservoirCount > 0 || ahead > 0 {
+                    self.scheduleTailTopUp()
+                }
+            } else if self.reservoir.reservoirCount > 0 {
+                self.scheduleTailTopUp()
             }
         }
     }
@@ -5369,6 +5441,11 @@ final class FeedStore {
             // The silent dead end the reader reports as "the feed ends and loads nothing": the scheduler
             // refused every candidate (min-interval cooldown / backoff / skip window) and nothing said so.
             Log.feed.info("[Fetch] batch empty pool=\(sourcePool.count) region=\(self.activeRegion ?? "-") type=\(String(describing: self.activeContentType)) runway=\(needsInitialRunway) filtered=\(needsFilteredRunway) visible=\(self.visibleItems.count) reservoir=\(self.reservoir.reservoirCount) — no source was eligible, so no request was issued")
+            // Nothing eligible and nothing left in the reservoir: this composition is at its end, and the
+            // surface may say so. An empty feed is not this case — an empty feed has its own surface.
+            if self.reservoir.reservoirCount == 0, !self.visibleItems.isEmpty {
+                self.hasReachedTheEnd = true
+            }
             return
         }
         let coldStartTargetSourceCount = min(

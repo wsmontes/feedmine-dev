@@ -1019,6 +1019,13 @@ struct FeedScreen: View {
                         if legacyPageFallback && runtime.presentation.sections.isEmpty {
                             EmptyFilterView(category: loader.selectedNodeNames.joined(separator: ", "))
                         }
+
+                        // A feed that ends in silence reads as a broken feed. When the page really is at
+                        // the end — nothing more to publish, nothing left in the reservoir, no source
+                        // eligible — say so, once, at the bottom.
+                        if loader.hasReachedTheEnd, !runtime.presentation.sections.isEmpty {
+                            EndOfFeedFooterView(accent: engine.accent)
+                        }
                     }
                     // Cards that arrive after the first page — the cold start's starter slice, the runway
                     // that lands behind it, a load-more — *enter* instead of appearing. Without a transaction
@@ -2377,6 +2384,35 @@ struct EmptyFilterView: View {
     let category: String
     var body: some View {
         ContentUnavailableView("No \(category) articles", systemImage: "rectangle.stack.fill", description: Text("This category has articles in the feed, but they may have been trimmed from the visible buffer. Try scrolling through All first.")).padding(.top, 80)
+    }
+}
+
+/// The bottom of a feed that really did end.
+///
+/// The app used to stop in silence: nothing more to publish, nothing in the reservoir, no source eligible,
+/// and the surface said nothing — which reads as a feed that broke, not as one that finished. This is the
+/// whole of what it says, and the surface shows it only when the store is sure (`hasReachedTheEnd`).
+struct EndOfFeedFooterView: View {
+    let accent: Color
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.title3)
+                .foregroundStyle(accent.opacity(0.8))
+            Text("You're all caught up")
+                .font(.subheadline.weight(.medium))
+            Text("Nothing left to show here right now. New articles arrive as the sources publish them.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 28)
+        .padding(.bottom, 44)
+        .padding(.horizontal, 32)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("end-of-feed")
     }
 }
 
